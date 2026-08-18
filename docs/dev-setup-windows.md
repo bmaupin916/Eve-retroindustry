@@ -43,13 +43,9 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-PyQt6 + QtWebEngine account for most of the ~150 MB and several minutes — they're only needed for the
-desktop-window mode in step 6. For browser-only use you can skip them:
-
-```powershell
-Get-Content requirements.txt | Where-Object { $_ -notmatch '^(pywebview|PyQt6|QtPy)' } | Set-Content requirements-web.txt
-pip install -r requirements-web.txt
-```
+Small and quick now — the desktop GUI stack (pywebview, PyQt6, QtWebEngine) was
+retired in v0.9.28 along with the desktop app, and it accounted for most of the
+old ~150 MB install.
 
 > You don't need to run `import_sde.py` for normal development. `sde_base.db` is committed at the repo
 > root and the app copies the SDE tables out of it into `eve_cache.db` automatically on first startup.
@@ -87,30 +83,37 @@ Equivalent, if you prefer the explicit form:
 uvicorn app.web.main:app --reload --port 8000
 ```
 
-## 6. Optional — run as the desktop app
+## 6. Log in to EVE
+
+Open <http://localhost:8000/> and you will be redirected to EVE SSO, then back to
+`/callback` — a route on this app, which is where the session cookie is set.
+
+For local development a fallback SSO client ID is built in, so there is nothing
+to register. It applies **only** when the callback is on `localhost`; any other
+callback requires the deployment to name its own application via `EVE_CLIENT_ID`,
+because an EVE application has exactly one registered callback URL and CCP
+matches it as an exact string.
+
+The one thing that can block it:
+
+- **The registered callback must be exactly `http://localhost:8000/callback`.**
+  If you run the dev server on another port, or the built-in application's
+  registration has moved, the token exchange fails. Set `EVE_CALLBACK_URL` to
+  whatever is actually registered.
+
+If you cannot log in at all, mint a session without SSO:
 
 ```powershell
-python launcher.py
+python -m app.web.bootstrap
 ```
 
-Same FastAPI server, wrapped in a pywebview window with the system tray icon — the way the packaged
-release behaves. Requires the PyQt6 packages from step 4.
+It prints a single-use link valid for ten minutes.
 
-## 7. Log in to EVE
+Add alts with **+ Add Character** in the character dropdown. Note that only the
+instance owner can hold a session — adding a character stores its tokens but is
+not a second way to log in.
 
-Click **Log In** in the top right. A default SSO client ID is compiled into
-`app/auth/token_store.py`, so there's no need to register an application at
-developers.eveonline.com.
-
-Two things that can block the callback:
-
-- **Port 5173 must be free.** The OAuth callback server binds `http://localhost:5173/callback`
-  (`CALLBACK_PORT` in `app/auth/esi_oauth.py`). Vite dev servers commonly squat there.
-- **Allow Python through the Windows Firewall** if a prompt appears.
-
-Add alts with **+ Add Character** in the character dropdown.
-
-## 8. Run the tests
+## 7. Run the tests
 
 ```powershell
 pip install -r requirements-dev.txt
@@ -122,7 +125,7 @@ needed.
 
 ## Local data files
 
-All written next to the repo root in dev mode (the frozen builds use a per-user app dir instead):
+All written next to the repo root in dev mode, or into `EVE_APP_DIR` when it is set:
 
 | File | Contents |
 |---|---|
@@ -131,7 +134,8 @@ All written next to the repo root in dev mode (the frozen builds use a per-user 
 | `icon_cache/` | Item icons, portraits and corp logos |
 
 They're all in `.gitignore`. Deleting `eve_cache.db` resets the app to a first-run state — it will
-rebuild from `sde_base.db` and you'll need to log in again.
+rebuild from `sde_base.db` and you'll need to log in again. That also drops your session and the
+owner claim, so the first character to log in afterwards takes the instance.
 
 ## Next time
 

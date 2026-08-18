@@ -52,11 +52,11 @@ Thumbs.db
 # Local type-icon cache (populated at runtime from images.evetech.net)
 icon_cache/
 
-# pywebview/QtWebEngine browser profile — created next to the app in dev runs.
-# Holds cookies and localStorage, so it must never be committed.
-webview_data/
-webview_data-2/
-webview_data.broken*
-
 # Local reference material (third-party spreadsheets — see docs/design-hosted-v2.md 9.2/9.3)
 docs/reference/
+
+# Deployment configuration. .env.example is the committed template; a real .env
+# names your EVE application and belongs on the server, not in the repo.
+.env
+.env.*
+!.env.example

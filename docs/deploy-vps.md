@@ -80,7 +80,17 @@ to do.
 ## 5. Configuration
 
 Everything that differs between a laptop and a server is an environment
-variable. Put them in `/etc/eve-retroindustry.env`, owned by root, mode 0600:
+variable. [`.env.example`](../.env.example) in the repo root is the annotated
+template — copy it to `/etc/eve-retroindustry.env`, owned by root, mode 0600,
+and fill in the blanks:
+
+```bash
+sudo cp /opt/eve-retroindustry/.env.example /etc/eve-retroindustry.env
+sudo chown root:root /etc/eve-retroindustry.env && sudo chmod 600 /etc/eve-retroindustry.env
+sudo nano /etc/eve-retroindustry.env
+```
+
+The values it asks for:
 
 ```ini
 # Where the app is reachable. The Host header is checked against this, which is

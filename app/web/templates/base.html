@@ -298,7 +298,8 @@ window.escHtml = function (s) {
       </ul>
       <ul class="navbar-nav ms-auto align-items-center gap-2">
         <li class="nav-item">
-          <a class="nav-link d-flex align-items-center" href="#" onclick="kofiOpen(event)"
+          <a class="nav-link d-flex align-items-center" href="https://ko-fi.com/retrovisor"
+             target="_blank" rel="noopener noreferrer"
              style="font-size:.85rem;opacity:.7" title="Support me on Ko-fi">
             <i class="bi bi-cup-hot-fill" style="color:#e3b341"></i><span class="nav-label">Support me</span>
           </a>
@@ -400,14 +401,6 @@ async function removeChar(charId, name) {
   const r = await fetch(`/api/characters/${charId}`, {method: 'DELETE'});
   if (r.ok) location.reload();
 }
-// External links open in a new tab, the ordinary way. These used to route
-// through a server-side opener because target=_blank does not work inside the
-// Android WebView; there is no WebView any more, and a hosted server has no
-// business spawning browser processes. Kept as functions because call sites
-// pass them to onclick — they now simply let the anchor do its job.
-function kofiOpen(ev) { return true; }
-function openExternal(url, ev) { return true; }
-
 // Navbar fit: switch to icon-only the instant the full-text bar would overflow.
 // We measure the real overflow instead of guessing a width breakpoint, so every
 // control stays visible at any window width (below 992px Bootstrap's hamburger
