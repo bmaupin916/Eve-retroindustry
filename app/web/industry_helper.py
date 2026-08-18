@@ -152,7 +152,7 @@ def populate_rig_bonuses(conn: sqlite3.Connection) -> None:
         entries.append((type_id, name, set_size, category, me_bonus, te_bonus))
 
     conn.executemany(
-        "INSERT OR REPLACE INTO rig_bonuses (type_id, name, set_size, category, me_bonus, te_bonus) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO rig_bonuses (type_id, name, set_size, category, me_bonus, te_bonus) VALUES (?,?,?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET name=excluded.name, set_size=excluded.set_size, category=excluded.category, me_bonus=excluded.me_bonus, te_bonus=excluded.te_bonus",
         entries,
     )
     conn.commit()
@@ -192,9 +192,9 @@ def save_station_rigs_full(
         me_bonus += sum(bonus_map.get(rid, 0.0) for rid in rig_ids)
 
     conn.execute(
-        """INSERT OR REPLACE INTO station_rigs
+        """INSERT INTO station_rigs
            (location_id, me_bonus_pct, updated_at, structure_type, rig1_type_id, rig2_type_id, rig3_type_id)
-           VALUES (?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?) ON CONFLICT (location_id) DO UPDATE SET me_bonus_pct=excluded.me_bonus_pct, updated_at=excluded.updated_at, structure_type=excluded.structure_type, rig1_type_id=excluded.rig1_type_id, rig2_type_id=excluded.rig2_type_id, rig3_type_id=excluded.rig3_type_id""",
         (location_id, me_bonus, int(time.time()), structure_type or None,
          rig1_type_id or None, rig2_type_id or None, rig3_type_id or None),
     )
@@ -377,7 +377,7 @@ def get_station_me_bonus(conn: sqlite3.Connection, location_id: int) -> float:
 def save_station_me_bonus(conn: sqlite3.Connection, location_id: int, me_bonus_pct: float):
     ensure_industry_tables(conn)
     conn.execute(
-        "INSERT OR REPLACE INTO station_rigs (location_id, me_bonus_pct, updated_at) VALUES (?,?,?)",
+        "INSERT INTO station_rigs (location_id, me_bonus_pct, updated_at) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET me_bonus_pct=excluded.me_bonus_pct, updated_at=excluded.updated_at",
         (location_id, max(0.0, min(25.0, me_bonus_pct)), int(time.time()))
     )
     conn.commit()
@@ -434,7 +434,7 @@ async def get_adjusted_prices(conn: sqlite3.Connection) -> dict[int, float]:
                 if item.get("adjusted_price") is not None
             ]
             conn.executemany(
-                "INSERT OR REPLACE INTO adjusted_price_cache (type_id, adjusted, cached_at) VALUES (?,?,?)",
+                "INSERT INTO adjusted_price_cache (type_id, adjusted, cached_at) VALUES (?,?,?) ON CONFLICT (type_id) DO UPDATE SET adjusted=excluded.adjusted, cached_at=excluded.cached_at",
                 entries,
             )
             conn.commit()
@@ -479,8 +479,8 @@ async def get_sci_for_system(
                 for idx in sys.get("cost_indices", [])
             ]
             conn.executemany(
-                "INSERT OR REPLACE INTO sci_cache"
-                " (solar_system_id, activity, cost_index, cached_at) VALUES (?,?,?,?)",
+                "INSERT INTO sci_cache"
+                " (solar_system_id, activity, cost_index, cached_at) VALUES (?,?,?,?) ON CONFLICT (solar_system_id, activity) DO UPDATE SET cost_index=excluded.cost_index, cached_at=excluded.cached_at",
                 entries,
             )
             conn.commit()

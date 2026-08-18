@@ -44,9 +44,9 @@ def _store(conn: sqlite3.Connection, region_id: int, contracts: list[dict],
         ph = ",".join("?" * len(cids))
         conn.execute(f"DELETE FROM public_contract_items WHERE contract_id IN ({ph})", cids)
     conn.executemany(
-        "INSERT OR REPLACE INTO public_contracts (contract_id, region_id, type, price, "
+        "INSERT INTO public_contracts (contract_id, region_id, type, price, "
         "reward, collateral, buyout, volume, date_expired, title, start_location_id, "
-        "end_location_id, issuer_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "end_location_id, issuer_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (contract_id) DO UPDATE SET region_id=excluded.region_id, type=excluded.type, price=excluded.price, reward=excluded.reward, collateral=excluded.collateral, buyout=excluded.buyout, volume=excluded.volume, date_expired=excluded.date_expired, title=excluded.title, start_location_id=excluded.start_location_id, end_location_id=excluded.end_location_id, issuer_id=excluded.issuer_id",
         [(c.get("contract_id"), region_id, c.get("type"), c.get("price") or 0,
           c.get("reward") or 0, c.get("collateral") or 0, c.get("buyout") or 0,
           c.get("volume") or 0, c.get("date_expired", ""), c.get("title") or "",
@@ -64,8 +64,8 @@ def _store(conn: sqlite3.Connection, region_id: int, contracts: list[dict],
             "INSERT INTO public_contract_items (contract_id, type_id, quantity, is_included) "
             "VALUES (?,?,?,?)", item_rows)
     conn.execute(
-        "INSERT OR REPLACE INTO public_contract_meta (region_id, indexed_at, contract_count) "
-        "VALUES (?,?,?)", (region_id, time.time(), len(contracts)))
+        "INSERT INTO public_contract_meta (region_id, indexed_at, contract_count) "
+        "VALUES (?,?,?) ON CONFLICT (region_id) DO UPDATE SET indexed_at=excluded.indexed_at, contract_count=excluded.contract_count", (region_id, time.time(), len(contracts)))
     conn.commit()
 
 

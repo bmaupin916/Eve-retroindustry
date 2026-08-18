@@ -129,7 +129,7 @@ def _save_cache(conn: sqlite3.Connection, character_id: int, skills: dict[int, i
         "skills": {str(k): int(v) for k, v in skills.items()},
     })
     conn.execute(
-        "INSERT OR REPLACE INTO char_skills_cache (character_id, data_json, cached_at) VALUES (?,?,?)",
+        "INSERT INTO char_skills_cache (character_id, data_json, cached_at) VALUES (?,?,?) ON CONFLICT (character_id) DO UPDATE SET data_json=excluded.data_json, cached_at=excluded.cached_at",
         (character_id, blob, time.time())
     )
     conn.commit()

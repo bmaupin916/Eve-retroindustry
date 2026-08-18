@@ -102,7 +102,7 @@ def _save_cached_price(
     jita_available: int | None = None,
 ):
     conn.execute(
-        "INSERT OR REPLACE INTO market_price_cache (type_id, sell_price, buy_price, volume, jita_available, cached_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO market_price_cache (type_id, sell_price, buy_price, volume, jita_available, cached_at) VALUES (?,?,?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET sell_price=excluded.sell_price, buy_price=excluded.buy_price, volume=excluded.volume, jita_available=excluded.jita_available, cached_at=excluded.cached_at",
         (type_id, sell, buy, volume, jita_available, time.time())
     )
     conn.commit()
@@ -191,8 +191,8 @@ def flush_hist_etags(conn: sqlite3.Connection) -> int:
             continue
         rows.append((key[0], key[1], entry[0], json.dumps(entry[1]), now, entry[2]))
     conn.executemany(
-        "INSERT OR REPLACE INTO market_hist_etag "
-        "(region_id, type_id, etag, days_json, cached_at, expires_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO market_hist_etag "
+        "(region_id, type_id, etag, days_json, cached_at, expires_at) VALUES (?,?,?,?,?,?) ON CONFLICT (region_id, type_id) DO UPDATE SET etag=excluded.etag, days_json=excluded.days_json, cached_at=excluded.cached_at, expires_at=excluded.expires_at",
         rows,
     )
     conn.commit()
@@ -724,7 +724,7 @@ async def fetch_structure_market(
         rows.append((structure_id, tid, vol, sell, traded, now))
 
     conn.executemany(
-        "INSERT OR REPLACE INTO station_volume_cache (location_id, type_id, volume, best_sell, traded_volume, cached_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO station_volume_cache (location_id, type_id, volume, best_sell, traded_volume, cached_at) VALUES (?,?,?,?,?,?) ON CONFLICT (location_id, type_id) DO UPDATE SET volume=excluded.volume, best_sell=excluded.best_sell, traded_volume=excluded.traded_volume, cached_at=excluded.cached_at",
         rows,
     )
     conn.commit()
@@ -836,7 +836,7 @@ async def fetch_station_volumes(
         result_map[tid] = (vol, sell, traded)
 
     conn.executemany(
-        "INSERT OR REPLACE INTO station_volume_cache (location_id, type_id, volume, best_sell, traded_volume, cached_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO station_volume_cache (location_id, type_id, volume, best_sell, traded_volume, cached_at) VALUES (?,?,?,?,?,?) ON CONFLICT (location_id, type_id) DO UPDATE SET volume=excluded.volume, best_sell=excluded.best_sell, traded_volume=excluded.traded_volume, cached_at=excluded.cached_at",
         rows,
     )
     conn.commit()

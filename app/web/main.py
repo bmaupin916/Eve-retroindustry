@@ -877,7 +877,7 @@ async def _fetch_wallet_balance(
             if r.status_code == 200:
                 balance = float(r.json())
                 conn.execute(
-                    "INSERT OR REPLACE INTO char_wallet_cache (character_id, balance, cached_at) VALUES (?,?,?)",
+                    "INSERT INTO char_wallet_cache (character_id, balance, cached_at) VALUES (?,?,?) ON CONFLICT (character_id) DO UPDATE SET balance=excluded.balance, cached_at=excluded.cached_at",
                     (char_id, balance, now),
                 )
                 conn.commit()
@@ -1125,7 +1125,7 @@ async def _ensure_groups_populated(conn: sqlite3.Connection) -> None:
 
     for row in results:
         if row:
-            conn.execute("INSERT OR REPLACE INTO sde_groups VALUES (?,?)", row)
+            conn.execute("INSERT INTO sde_groups VALUES (?,?) ON CONFLICT (group_id) DO UPDATE SET name=excluded.name", row)
     conn.commit()
 
 
@@ -4671,7 +4671,7 @@ async def add_station(request: Request, raw: str = Form(...)):
         resolved_name = f"[Structure {structure_id}]"
 
     conn.execute(
-        "INSERT OR REPLACE INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?)",
+        "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
         (structure_id, resolved_name, sys_id),
     )
     conn.commit()
@@ -4690,7 +4690,7 @@ async def location_rename(request: Request):
     conn = get_conn()
     ensure_location_name_table(conn)
     conn.execute(
-        "INSERT OR REPLACE INTO location_name_cache (location_id, name) VALUES (?,?)",
+        "INSERT INTO location_name_cache (location_id, name) VALUES (?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name",
         (location_id, name),
     )
     conn.commit()
@@ -4716,7 +4716,7 @@ async def location_resolve(request: Request, location_id: int):
     if resolved:
         ensure_location_name_table(conn)
         conn.execute(
-            "INSERT OR REPLACE INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?)",
+            "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
             (location_id, name, sys_id),
         )
         conn.commit()
@@ -4783,7 +4783,7 @@ async def my_location(request: Request):
             pass
 
         conn.execute(
-            "INSERT OR REPLACE INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?)",
+            "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
             (structure_id, resolved_name, sys_id),
         )
         conn.commit()
@@ -7064,7 +7064,7 @@ def save_route_jumps(conn: sqlite3.Connection, origin: int, jumps: dict[int, int
         return
     now = _time.time()
     conn.executemany(
-        "INSERT OR REPLACE INTO route_jump_cache (sys_a, sys_b, jumps, cached_at) VALUES (?,?,?,?)",
+        "INSERT INTO route_jump_cache (sys_a, sys_b, jumps, cached_at) VALUES (?,?,?,?) ON CONFLICT (sys_a, sys_b) DO UPDATE SET jumps=excluded.jumps, cached_at=excluded.cached_at",
         [(min(origin, d), max(origin, d), j, now) for d, j in jumps.items()],
     )
     conn.commit()
@@ -7224,7 +7224,7 @@ async def _resolve_planet_names(conn: sqlite3.Connection, planet_ids) -> dict[in
                 for pid, nm in await asyncio.gather(*[_p(client, p) for p in miss]):
                     if nm:
                         names[pid] = nm
-                        conn.execute("INSERT OR REPLACE INTO planet_name_cache (planet_id, name) VALUES (?,?)", (pid, nm))
+                        conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?) ON CONFLICT (planet_id) DO UPDATE SET name=excluded.name", (pid, nm))
             conn.commit()
         except Exception:
             pass
@@ -7242,9 +7242,9 @@ def _store_pi_cache_for_chars(conn: sqlite3.Connection, char_ids, entries) -> No
     if entries:
         now = _time.time()
         conn.executemany(
-            "INSERT OR REPLACE INTO pi_extractor_cache "
+            "INSERT INTO pi_extractor_cache "
             "(char_id,char_name,planet_id,planet_name,product_id,product,expiry_iso,cached_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (char_id, planet_id, product_id) DO UPDATE SET char_name=excluded.char_name, planet_name=excluded.planet_name, product=excluded.product, expiry_iso=excluded.expiry_iso, cached_at=excluded.cached_at",
             [(e["char_id"], e["char_name"], e["planet_id"], e["planet_name"],
               e["product_id"], e["product"], e["expiry_iso"], now) for e in entries])
     conn.commit()

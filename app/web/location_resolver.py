@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import sqlite3
+import time
 import httpx
 from app.esi.client import esi_client
 from app.db.schema import ensure_schema as ensure_db_schema
@@ -30,7 +31,6 @@ def _is_error_limited() -> bool:
 
 def _set_error_limited(seconds: float = 60.0) -> None:
     global _error_limited_until
-    import time
     _error_limited_until = max(_error_limited_until, time.monotonic() + seconds)
 
 
@@ -64,8 +64,9 @@ async def get_security_status(
             sec = r.json().get("security_status")
             if sec is not None:
                 conn.execute(
-                    "INSERT OR REPLACE INTO solar_system_cache (system_id, security_status) VALUES (?,?)",
-                    (system_id, float(sec)),
+                    "INSERT INTO solar_system_cache "
+                    "(system_id, security_status, cached_at) VALUES (?,?,?) ON CONFLICT (system_id) DO UPDATE SET security_status=excluded.security_status, cached_at=excluded.cached_at",
+                    (system_id, float(sec), int(time.time())),
                 )
                 conn.commit()
                 return float(sec)
@@ -205,7 +206,7 @@ def locations_in_system(conn: sqlite3.Connection, solar_system_id: int) -> list[
 def save_location_names_to_db(conn: sqlite3.Connection, entries: dict[int, tuple[str, int | None]]):
     """entries: {location_id: (name, solar_system_id | None)}"""
     conn.executemany(
-        "INSERT OR REPLACE INTO location_name_cache (location_id, name, solar_system_id) VALUES (?, ?, ?)",
+        "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?, ?, ?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
         [(lid, name, sys_id) for lid, (name, sys_id) in entries.items()]
     )
     conn.commit()

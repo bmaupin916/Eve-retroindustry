@@ -176,7 +176,7 @@ def get_owner_id(conn: sqlite3.Connection) -> int | None:
 
 def claim_owner(conn: sqlite3.Connection, character_id: int) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO app_owner (id, character_id, claimed_at) VALUES (1, ?, ?)",
+        "INSERT INTO app_owner (id, character_id, claimed_at) VALUES (1, ?, ?) ON CONFLICT (id) DO UPDATE SET character_id=excluded.character_id, claimed_at=excluded.claimed_at",
         (character_id, time.time()),
     )
     conn.commit()

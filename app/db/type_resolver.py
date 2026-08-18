@@ -19,7 +19,7 @@ def resolve_name_sync(conn: sqlite3.Connection, type_id: int) -> str | None:
 def _save_to_sde(conn: sqlite3.Connection, type_id: int, name: str,
                  group_id: int | None, published: bool):
     conn.execute(
-        "INSERT OR REPLACE INTO sde_types (type_id, name, group_id, published) VALUES (?,?,?,?)",
+        "INSERT INTO sde_types (type_id, name, group_id, published) VALUES (?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET name=excluded.name, group_id=excluded.group_id, published=excluded.published",
         (type_id, name, group_id, 1 if published else 0)
     )
     conn.commit()

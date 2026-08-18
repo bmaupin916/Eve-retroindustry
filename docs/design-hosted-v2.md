@@ -1460,7 +1460,7 @@ worker~~; split `main.py` into routers while every route is being touched anyway
 |---|---|
 | **Schema declared once** | ✅ **done.** `app/db/schema.py` holds all 51 tables as SQLAlchemy Core metadata. It replaced 34 DDL statements in 14 modules, 20 `ensure_*()` functions, 8 `ALTER TABLE` probes and a second copy of the SDE schema in `import_sde.py` — 549 lines deleted. Pinned by a call-site scan: no DDL may exist outside that module. |
 | **Migrations** | ✅ **done.** Alembic, baseline `5c9156e72c43`, run at startup. Pre-Alembic databases are stamped rather than rebuilt. `test_the_migrations_match_the_declaration` fails if the declaration and the history drift. |
-| **Postgres itself** | ⬜ not started. The declaration already emits Postgres DDL and `EVE_DATABASE_URL` is the seam, but ~316 hand-written queries still assume SQLite — 26 `INSERT OR REPLACE` chief among them. |
+| **Postgres itself** | 🟡 **started.** The declaration emits Postgres DDL and `EVE_DATABASE_URL` is the seam. All 38 `INSERT OR REPLACE` statements are now `ON CONFLICT ... DO UPDATE`, which runs on both dialects; `strftime` is gone from queries and the pragma set is pinned. What remains is the connection layer: ~316 statements use `?` placeholders and a raw `sqlite3.Connection`, and psycopg wants `%s`. |
 | **Async token refresh** (W9) | ⬜ not started |
 | **Background sync worker** | ⬜ not started. Must emit events, not just fill caches — §9.5 depends on it. |
 | **Cache-only routes** | ⬜ not started |

@@ -109,11 +109,11 @@ def import_types(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
             skills.append((type_id, name, float(m.group(1))))
 
     conn.executemany(
-        "INSERT OR REPLACE INTO sde_types "
+        "INSERT INTO sde_types "
         "(type_id, name, group_id, published, market_group_id, packaged_volume, "
-        "portion_size) VALUES (?,?,?,?,?,?,?)", rows)
+        "portion_size) VALUES (?,?,?,?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET name=excluded.name, group_id=excluded.group_id, published=excluded.published, market_group_id=excluded.market_group_id, packaged_volume=excluded.packaged_volume, portion_size=excluded.portion_size", rows)
     conn.execute("DELETE FROM sde_skill_time_bonus")
-    conn.executemany("INSERT OR REPLACE INTO sde_skill_time_bonus VALUES (?,?,?)", skills)
+    conn.executemany("INSERT INTO sde_skill_time_bonus VALUES (?,?,?) ON CONFLICT (skill_type_id) DO UPDATE SET skill_name=excluded.skill_name, time_bonus_pct=excluded.time_bonus_pct", skills)
     conn.commit()
     console.print(f"[green]  types: {len(rows):,}[/] "
                   f"[dim]({len(skills)} with a manufacturing/reaction time bonus)[/]")
@@ -130,7 +130,7 @@ def import_groups(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
     """
     rows = [(int(r["_key"]), feed.en(r.get("name")) or f"Group {r['_key']}")
             for r in feed.records(z, "groups")]
-    conn.executemany("INSERT OR REPLACE INTO sde_groups (group_id, name) VALUES (?,?)", rows)
+    conn.executemany("INSERT INTO sde_groups (group_id, name) VALUES (?,?) ON CONFLICT (group_id) DO UPDATE SET name=excluded.name", rows)
     conn.commit()
     console.print(f"[green]  groups: {len(rows):,}[/]")
     return len(rows)
@@ -165,11 +165,11 @@ def import_blueprints(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
                 skill_rows.append((bp_id, activity_name,
                                    int(skill["typeID"]), int(skill.get("level", 1))))
 
-    conn.executemany("INSERT OR REPLACE INTO sde_blueprints VALUES (?,?,?,?)", bp_rows)
-    conn.executemany("INSERT OR REPLACE INTO sde_blueprint_materials VALUES (?,?,?,?)", mat_rows)
-    conn.executemany("INSERT OR REPLACE INTO sde_blueprint_products VALUES (?,?,?,?,?)", prod_rows)
+    conn.executemany("INSERT INTO sde_blueprints VALUES (?,?,?,?) ON CONFLICT (blueprint_type_id) DO UPDATE SET max_production_limit=excluded.max_production_limit, manufacturing_time=excluded.manufacturing_time, reaction_time=excluded.reaction_time", bp_rows)
+    conn.executemany("INSERT INTO sde_blueprint_materials VALUES (?,?,?,?) ON CONFLICT (blueprint_type_id, activity, material_type_id) DO UPDATE SET quantity=excluded.quantity", mat_rows)
+    conn.executemany("INSERT INTO sde_blueprint_products VALUES (?,?,?,?,?) ON CONFLICT (blueprint_type_id, activity, product_type_id) DO UPDATE SET quantity=excluded.quantity, probability=excluded.probability", prod_rows)
     conn.execute("DELETE FROM sde_blueprint_skills")
-    conn.executemany("INSERT OR REPLACE INTO sde_blueprint_skills VALUES (?,?,?,?)", skill_rows)
+    conn.executemany("INSERT INTO sde_blueprint_skills VALUES (?,?,?,?) ON CONFLICT (blueprint_type_id, activity, skill_type_id) DO UPDATE SET required_level=excluded.required_level", skill_rows)
     conn.commit()
     console.print(f"[green]  blueprints: {len(bp_rows):,}[/] [dim]({len(mat_rows):,} materials, "
                   f"{len(prod_rows):,} products, {len(skill_rows):,} skills)[/]")
@@ -234,8 +234,8 @@ def import_dogma(conn: sqlite3.Connection, z: zipfile.ZipFile) -> tuple[int, int
         if bare in skill_ids_by_name:
             links[type_id] = skill_ids_by_name[bare]
 
-    conn.executemany("INSERT OR REPLACE INTO sde_decryptors VALUES (?,?,?,?,?,?)", decryptors)
-    conn.executemany("INSERT OR REPLACE INTO sde_datacore_skills VALUES (?,?)",
+    conn.executemany("INSERT INTO sde_decryptors VALUES (?,?,?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET name=excluded.name, probability_mult=excluded.probability_mult, me_modifier=excluded.me_modifier, te_modifier=excluded.te_modifier, run_modifier=excluded.run_modifier", decryptors)
+    conn.executemany("INSERT INTO sde_datacore_skills VALUES (?,?) ON CONFLICT (type_id) DO UPDATE SET skill_type_id=excluded.skill_type_id",
                      sorted(links.items()))
     conn.commit()
     console.print(f"[green]  decryptors: {len(decryptors)}[/] "
@@ -255,7 +255,7 @@ def import_type_materials(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
         for r in feed.records(z, "typeMaterials")
         for m in (r.get("materials") or [])
     ]
-    conn.executemany("INSERT OR REPLACE INTO sde_type_materials VALUES (?,?,?)", rows)
+    conn.executemany("INSERT INTO sde_type_materials VALUES (?,?,?) ON CONFLICT (type_id, material_type_id) DO UPDATE SET quantity=excluded.quantity", rows)
     conn.commit()
     console.print(f"[green]  type materials: {len(rows):,}[/] "
                   f"[dim](reprocessing yields)[/]")
@@ -273,7 +273,7 @@ def import_market_groups(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
          1 if r.get("hasTypes") else 0, r.get("iconID"))
         for r in feed.records(z, "marketGroups")
     ]
-    conn.executemany("INSERT OR REPLACE INTO sde_market_groups VALUES (?,?,?,?,?)", rows)
+    conn.executemany("INSERT INTO sde_market_groups VALUES (?,?,?,?,?) ON CONFLICT (market_group_id) DO UPDATE SET parent_group_id=excluded.parent_group_id, name=excluded.name, has_types=excluded.has_types, icon_id=excluded.icon_id", rows)
     conn.commit()
     roots = sum(1 for r in rows if r[1] is None)
     console.print(f"[green]  market groups: {len(rows):,}[/] [dim]({roots} roots)[/]")
@@ -301,8 +301,8 @@ def import_planet_schematics(conn: sqlite3.Connection, z: zipfile.ZipFile) -> in
         sch_rows.append((sid, feed.en(r.get("name")), int(r.get("cycleTime") or 0),
                          out_id, out_qty))
 
-    conn.executemany("INSERT OR REPLACE INTO sde_planet_schematics VALUES (?,?,?,?,?)", sch_rows)
-    conn.executemany("INSERT OR REPLACE INTO sde_planet_schematic_materials VALUES (?,?,?)", mat_rows)
+    conn.executemany("INSERT INTO sde_planet_schematics VALUES (?,?,?,?,?) ON CONFLICT (schematic_id) DO UPDATE SET name=excluded.name, cycle_time=excluded.cycle_time, output_type_id=excluded.output_type_id, output_qty=excluded.output_qty", sch_rows)
+    conn.executemany("INSERT INTO sde_planet_schematic_materials VALUES (?,?,?) ON CONFLICT (schematic_id, type_id) DO UPDATE SET quantity=excluded.quantity", mat_rows)
     conn.commit()
     console.print(f"[green]  planet schematics: {len(sch_rows):,}[/] "
                   f"[dim]({len(mat_rows):,} inputs)[/]")

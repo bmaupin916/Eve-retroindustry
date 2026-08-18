@@ -747,6 +747,51 @@ def apply_sde_schema(conn: sqlite3.Connection) -> None:
     _apply(conn, SDE_TABLES)
 
 
+def upsert(table: str, columns, update=None) -> str:
+    """`INSERT ... ON CONFLICT (pk) DO UPDATE SET ...` for one table.
+
+    Replaces `INSERT OR REPLACE`, which was both SQLite-only and quietly
+    destructive. The two are not equivalent: `OR REPLACE` deletes the existing
+    row and inserts a new one, so **every column the statement does not name is
+    reset to NULL**. Eight call sites were doing that:
+
+    * `station_rigs` — saving an ME bonus wiped the structure type and all
+      three rig slots, so adjusting a number un-configured the station.
+    * `location_name_cache` — five writers reset `region_id`, which is filled
+      in by two ESI calls in `get_region_for_location()` and then thrown away
+      by the next asset refresh.
+    * `sde_types` — caching an ESI-resolved name nulled `packaged_volume`,
+      the figure that decides what a hauler carries. That column exists
+      because using the assembled volume instead was a real bug once already.
+
+    `ON CONFLICT DO UPDATE` writes only what it is given, so the class of bug
+    goes away with the dialect problem. The conflict target is read from the
+    declared primary key rather than repeated at the call site — there is
+    already one source of truth for that.
+
+    Placeholders are `?`. When the store moves to Postgres this is the single
+    function that has to start emitting `%s`.
+    """
+    t = metadata.tables[table]
+    pk = [c.name for c in t.primary_key.columns]
+    if not pk:
+        raise ValueError(f"{table} has no primary key, so it cannot upsert")
+    cols = list(columns)
+    missing = set(pk) - set(cols)
+    if missing:
+        raise ValueError(
+            f"{table} upsert must supply its whole key; missing {sorted(missing)}")
+
+    assignments = list(update) if update is not None else [c for c in cols if c not in pk]
+    placeholders = ",".join("?" * len(cols))
+    sql = (f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
+           f"ON CONFLICT ({', '.join(pk)}) DO ")
+    if not assignments:
+        # Key-only table: the row's existence is the whole of its content.
+        return sql + "NOTHING"
+    return sql + "UPDATE SET " + ", ".join(f"{c}=excluded.{c}" for c in assignments)
+
+
 def sde_index_ddl(tables=None) -> list[str]:
     """The SDE index statements, for `tables` (default: all of them).
 
