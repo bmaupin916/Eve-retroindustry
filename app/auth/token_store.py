@@ -22,6 +22,8 @@ import os
 import sqlite3
 import threading
 import time
+from urllib.parse import urlparse
+
 import httpx
 
 from app.version import USER_AGENT
@@ -31,7 +33,16 @@ _APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.join(
 )
 CONFIG_PATH = os.path.join(_APP_DIR, ".eve_config.json")
 TOKEN_ENDPOINT = "https://login.eveonline.com/v2/oauth/token"
-_DEFAULT_CLIENT_ID = "50cc73daf13d4109a06821c143cb5ca4"
+# The reference deployment's EVE application. Usable for local development only
+# — see get_client_id().
+#
+# An EVE application has exactly one registered callback URL, and CCP compares
+# redirect_uri against it as an exact string. So the client ID *owns* the
+# callback URL. A second deployment falling back to this one would send its users
+# to a consent screen naming somebody else's application and then fail the token
+# exchange against a callback it does not control. Anyone deploying a copy
+# registers their own application and sets EVE_CLIENT_ID.
+_DEV_CLIENT_ID = "50cc73daf13d4109a06821c143cb5ca4"
 
 # Per-character refresh locks. EVE rotates the refresh token on every use, so two
 # concurrent refreshes with the same token invalidate each other (one gets
@@ -91,7 +102,27 @@ def _save_json(data: dict) -> None:
 
 
 def get_client_id() -> str | None:
-    return _load_json().get("client_id") or _DEFAULT_CLIENT_ID
+    """The EVE application this deployment authenticates as.
+
+    Precedence: EVE_CLIENT_ID, then whatever was saved through the settings page,
+    then the development fallback — and that last one only when the callback is
+    on localhost. A real deployment must bring its own application, because the
+    callback URL is a property of the application registration rather than of
+    this code. Returning None makes /auth/login say so instead of starting a
+    flow that could only ever fail.
+    """
+    from_env = os.environ.get("EVE_CLIENT_ID", "").strip()
+    if from_env:
+        return from_env
+
+    saved = _load_json().get("client_id")
+    if saved:
+        return saved
+
+    from app.auth.esi_oauth import callback_url
+    if urlparse(callback_url()).hostname in ("localhost", "127.0.0.1", "::1"):
+        return _DEV_CLIENT_ID
+    return None
 
 
 def save_client_id(client_id: str) -> None:

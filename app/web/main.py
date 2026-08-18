@@ -37,7 +37,7 @@ from app.auth.token_store import (
     update_corporation_id,
     update_last_sync,
 )
-from app.auth.esi_oauth import begin_login, complete_login, LoginError
+from app.auth.esi_oauth import begin_login, complete_login, callback_url, LoginError
 from app.character.blueprints import fetch_blueprints, ensure_bp_table
 from app.character import wallet as wallet_api
 from app.character import orders as orders_api
@@ -1123,7 +1123,7 @@ _CORP_DIV_ORDER = list(_CORP_DIV_LABEL.keys())
 # ---------------------------------------------------------------------------
 
 @app.get("/auth/login")
-async def auth_login():
+async def auth_login(request: Request):
     """Send the browser to EVE SSO.
 
     A plain redirect. The desktop build opened SSO in the system browser and
@@ -1134,7 +1134,14 @@ async def auth_login():
     _sync_state["done"] = False
     url = begin_login()
     if not url:
-        return RedirectResponse("/settings?msg=Set+a+client+ID+first")
+        # No client ID, and the callback is not localhost — so this deployment has
+        # not registered its own EVE application. Starting the flow anyway would
+        # fail at the token exchange with a far less obvious message.
+        return _tr("auth_failed.html", request, {
+            "reason": "This deployment has no EVE application configured. Register "
+                      f"one with the callback URL {callback_url()} and set "
+                      "EVE_CLIENT_ID to its client ID.",
+        })
     return RedirectResponse(url, status_code=303)
 
 

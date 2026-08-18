@@ -21,12 +21,23 @@ tokens and Host validation, so it can be.
 This is the one step that will bite you, so do it deliberately.
 
 EVE compares the `redirect_uri` against your application's registration **as an
-exact string**, and an application has **one** registered URI. So moving the app
-is a cutover, not an addition:
+exact string**, and an application has **one** registered URI. The consequence
+is worth stating plainly: **the client ID owns the callback URL.** You cannot
+share an application with another deployment, and this repository does not ship
+one you can borrow — a fallback client ID exists for `localhost` development
+only, and the app refuses to start a login without a configured one otherwise.
 
-1. Go to <https://developers.eveonline.com/> → your application.
+So every deployment registers its own application:
+
+1. Go to <https://developers.eveonline.com/> and create an application.
+   Connection type: *Authentication & API Access*. Request the full scope list —
+   an application can only ever request scopes assigned at registration.
 2. Set the callback URL to `https://YOUR-DOMAIN/callback`.
-3. Set `EVE_CALLBACK_URL` to the identical string (step 5 below).
+3. Set `EVE_CALLBACK_URL` to the identical string, and `EVE_CLIENT_ID` to that
+   application's client ID (step 5 below). There is no client secret: the flow
+   is PKCE.
+
+Moving an existing deployment is therefore a cutover rather than an addition.
 
 Between changing the registration and the app running at the new address, SSO
 login will not work. That is expected, and it is what `python -m app.web.bootstrap`
@@ -78,6 +89,11 @@ EVE_ALLOWED_HOSTS=industry.example.com
 
 # Must match the callback URL registered with CCP, exactly.
 EVE_CALLBACK_URL=https://industry.example.com/callback
+
+# The EVE application this deployment authenticates as. Required for any
+# non-localhost callback — the client ID and the callback URL are two halves of
+# one registration, so a deployment cannot borrow somebody else's.
+EVE_CLIENT_ID=
 
 # Session cookies get the Secure flag. Set this once TLS is terminating, and
 # not before, or you will not be able to log in over plain HTTP.

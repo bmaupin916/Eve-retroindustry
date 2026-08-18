@@ -342,6 +342,9 @@ def test_the_callback_url_is_configuration(monkeypatch):
 
 def test_the_auth_url_carries_the_configured_callback(monkeypatch):
     monkeypatch.setenv("EVE_CALLBACK_URL", "https://industry.example.com/callback")
+    # A non-localhost callback now requires the deployment to name its own EVE
+    # application, so supply one.
+    monkeypatch.setenv("EVE_CLIENT_ID", "a-deployments-own-client-id")
     monkeypatch.setattr(sso_metadata, "_fetch", lambda: {
         "authorization_endpoint": "https://login.test/authorize",
         "token_endpoint": "https://login.test/token",
@@ -355,3 +358,67 @@ def test_the_auth_url_carries_the_configured_callback(monkeypatch):
     assert q["redirect_uri"] == ["https://industry.example.com/callback"]
     assert q["code_challenge_method"] == ["S256"]
     assert q["state"] and len(q["state"][0]) >= 20
+
+
+# --- Deployability: the client ID owns the callback, so it is per-deployment --
+
+def test_a_real_deployment_must_bring_its_own_application(monkeypatch, tmp_path):
+    """The shipped client ID must not be usable by a second deployment.
+
+    An EVE application has one registered callback URL, so falling back to
+    somebody else's client ID means sending users to a consent screen naming
+    their application and then failing the exchange against a callback this
+    deployment does not control. Better to refuse up front.
+    """
+    from app.auth import token_store
+
+    monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
+    monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
+    monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
+
+    monkeypatch.setenv("EVE_CALLBACK_URL", "https://industry.example.com/callback")
+    assert token_store.get_client_id() is None
+
+    monkeypatch.setenv("EVE_CLIENT_ID", "the-deployers-own-id")
+    assert token_store.get_client_id() == "the-deployers-own-id"
+
+
+def test_local_development_still_works_without_configuration(monkeypatch, tmp_path):
+    from app.auth import token_store
+
+    monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
+    monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("EVE_CALLBACK_URL", raising=False)
+    monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
+
+    assert token_store.get_client_id() == token_store._DEV_CLIENT_ID
+
+
+def test_an_unconfigured_deployment_cannot_start_a_login(monkeypatch, tmp_path):
+    from app.auth import token_store
+
+    monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
+    monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
+    monkeypatch.setenv("EVE_CALLBACK_URL", "https://industry.example.com/callback")
+    monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
+
+    assert esi_oauth.begin_login() is None
+
+
+def test_nothing_in_the_app_hardcodes_a_deployment_domain():
+    """Every deployment-specific value must be configuration, not a literal."""
+    import pathlib
+    import re
+
+    allowed = re.compile(
+        r"eveonline\.com|evetech\.net|fuzzwork\.co\.uk|github\.com|ko-fi\.com|"
+        r"localhost|127\.0\.0\.1|example\.(com|test)|w3\.org|"
+        r"schemas\.|json-schema\.org"
+    )
+    offenders = []
+    for path in pathlib.Path("app").rglob("*.py"):
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for url in re.findall(r"https?://[A-Za-z0-9.-]+", line):
+                if not allowed.search(url):
+                    offenders.append(f"{path}:{i}: {url}")
+    assert not offenders, "hardcoded host(s): " + "; ".join(offenders)

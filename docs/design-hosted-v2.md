@@ -291,6 +291,19 @@ buys nothing per character (§3).
 What survives is *self-hosting*: one config value for a deployment, not a per-account
 setting. That delivers the sovereignty story at a fraction of the cost.
 
+**Shipped in v0.9.28** as `EVE_CLIENT_ID`. The framing that makes it obvious: an application
+has exactly one registered callback URL and CCP matches `redirect_uri` as a string, so **the
+client ID owns the callback URL** — the two are halves of one registration and neither is a
+property of this code. A deployment therefore cannot borrow another's application, and the
+repository must not appear to offer one. The old `_DEFAULT_CLIENT_ID` fallback did exactly
+that: a second deployment would have sent its users to a consent screen naming the reference
+application, then failed the exchange against a callback it did not control. It is now
+reachable only when the callback is on `localhost`, and `/auth/login` refuses with an
+actionable message rather than starting a flow that could not succeed.
+
+Nothing else in `app/` contains a deployment-specific literal, and a test enumerates every
+URL in the package to keep it that way.
+
 One registration detail that shapes §5's scope selection: **an application can only request
 scopes assigned to it at registration.** So the registered application declares the full
 superset, and per-user scope selection requests subsets of it. The design works, but the
