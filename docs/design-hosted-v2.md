@@ -507,13 +507,32 @@ skills — it is what caught both bugs above.
 The base probabilities in the SDE match EVE University's published table exactly, which is
 a useful cross-check but never the source.
 
-⚠️ **Known limitation: invention is charged at the root only.** `compute_margin` applies it
-to the product being priced, so `/margins` is correct. It is **not** wired into
-`BOMResolver`, so a T2 *component* nested inside a larger build tree still resolves with a
-free blueprint — and `/plan` therefore still understates any build containing T2 parts.
-Capital builds are the obvious case. Closing this means adding invention as a per-node cost
-in the resolver, which is the shape §8 originally proposed; it was left out of v0.9.25 to
-keep that commit reviewable, not because it is unnecessary.
+✅ **Charged per node since v0.9.29** — and the limitation was worse than this section
+described. `BOMResolver` now applies invention at every manufacturing node, root or nested;
+`build_invention_params` (in `margins.py`, shared with the plan route) turns the stored
+defaults into parameters so both pages price datacores identically.
+
+Two corrections to what was written here before:
+
+* **`/plan` was not "understating builds containing T2 parts" — it was charging invention
+  nowhere at all.** The v0.9.25 work lived in `compute_margin`, and the planner never called
+  it. So every T2 item `/plan` priced had a free blueprint, the product itself included.
+  That is ~1,200 invented products, not an edge case, and it is the larger half of the bug.
+* **"Capital builds are the obvious case" is wrong.** Measured against the SDE: 130 products
+  carry an invented item in their BOM, and **no capital group appears among them**. Capital
+  components are ordinary T1 blueprints, so a capital tree never meets invention. The real
+  set is faction and "Edition" variants built from a T2 item — `'Augmented' Ogre` from
+  `Ogre II`, `Kronos Police Edition` from a `Kronos`, `Dark Blood Dual Giga Beam Laser` from
+  the T2 laser — plus pirate drones like the Aralez. Narrower than claimed, and mostly items
+  a typical industrialist never builds.
+
+Two things the wiring turned up that were not in the plan. The make-vs-buy optimizer had to
+learn the term as well: its `make_cost` already added `job_fee` precisely so a component only
+wins on an all-in comparison, and invention is the same class of term and the *larger* one on
+a T2 item — left out, it would have over-selected "make" on exactly the components this
+change prices. And the datacore price basis was hardcoded to `sell` while every other
+material on the row followed the configured `input_basis`; it now follows `input_basis` too,
+which makes invention slightly cheaper for anyone sourcing from buy orders.
 
 ### Invention specifically
 
@@ -734,12 +753,40 @@ market aggregates (§9.4).
 its own system cost index and facility tax, reaction TE multiplier, reaction ME bonus,
 `reaction_time` from `sde_blueprints`, branching on `node.activity == "reaction"`.
 
-**Key insight: the entire reaction space is 111 published products** — Intermediate
-Materials 41, Composite 17, Biochemical 32, Hybrid Polymers 9, Molecular-Forged 12. Small
-enough to price *the whole board* every refresh. That gives a complete ranked leaderboard
-with unprofitable reactions explicitly marked — the "what NOT to make" half, which a
-curated watchlist structurally cannot provide because you would have to know to add the
-loser first.
+**Key insight: the entire reaction space is ~119 published products** — small enough to
+price *the whole board* every refresh. That gives a complete ranked leaderboard with
+unprofitable reactions explicitly marked — the "what NOT to make" half, which a curated
+watchlist structurally cannot provide because you would have to know to add the loser first.
+
+> **Built — v0.9.29, `/reactions`.** The count above was **111** and is wrong: Intermediate
+> Materials 41, Composite 17, Biochemical 32, Hybrid Polymers 9 and Molecular-Forged 12 sum
+> to 111 and omit the eighth group, the **8 Unrefined Mineral** (alchemy) products. Verified
+> against the SDE at 119. They ship flagged rather than dropped — their output is meant to
+> be reprocessed, so the price shown is not why the reaction is run, and silently removing
+> eight rows would recreate the blind spot the board exists to remove.
+>
+> Three things the build settled that the spec did not anticipate:
+>
+> * **The board must not reuse `compute_margin`.** It resolves to raw, and a Tungsten
+>   Carbide run needs 5 Nitrogen Fuel Blocks against a job that yields 40 — `resolve()`
+>   correctly refuses to run 1/8 of a job, so the tree charges a whole 40-block run *three
+>   times over* (directly, inside Rolled Tungsten Alloy, inside Sulfuric Acid). 120 blocks of
+>   inputs to consume 15, and the row read **-247%** where buying the inputs yields **+14%**
+>   net. Right for a build plan, wrong for a rate — this is the batching/floor caveat, and it
+>   is why §9.2 defines Build Advantage as a *delta between two figures* rather than one
+>   number. The board costs direct inputs at market; build-from-raw is deferred until the
+>   batching question is settled rather than shipped as a known-bad column.
+> * **`find_blueprint()` is the only safe way to reach a reaction's blueprint.** Tungsten
+>   Carbide has two — the real formula (yield 10,000, 10,800 s) and a leftover *Test Reaction
+>   Blueprint* (yield 20, 360 s). A product+blueprint query returns 120 rows with one product
+>   twice, and timing a job with one recipe while costing it with the other is invisible in
+>   the output.
+> * **A ranking is a recommendation, so it has to be earned.** The first working board put
+>   *Pure Strong X-Instinct Booster* on top at 92.9% margin and 24 billion ISK/month — with
+>   one input unpriced (costed at zero) and a sell price of 5.0M against a **34.7k buy**, a
+>   144× spread that is one stale order rather than a market. Rows whose cost is incomplete
+>   or whose output has no real bid are now demoted below fully-priced ones and labelled,
+>   never hidden. Without that the page's headline advice was to react something unsellable.
 
 Missing half: **"what to buy and when"** — the combined moon-goo input list for the
 reactions currently worth running, with each input flagged as historically cheap or dear.
@@ -1176,9 +1223,9 @@ of this work), each mapped to the step that retires it:
 | W3 | OAuth callback binds all interfaces; `state` generated but never validated | **Step 2 — done, v0.9.27** |
 | W4 | Refresh tokens plaintext; no file permissions on `eve_cache.db` | Permissions **done, v0.9.27**; encryption at rest still Step 5 |
 | W5 | Full tracebacks returned to clients on 500 | **Step 2 — done, v0.9.27** |
-| W6 | `main.py` at 7,352 lines / 80 routes | Step 4 |
+| W6 | `main.py` at 7,352 lines / 80 routes | Step 4 — **7,386 / 76 as of v0.9.29; it is still growing** |
 | W7 | Three substantial features sitting uncommitted (PI planner, margins, job splitting) | **Step 0 — done, v0.9.23** |
-| W8 | Invention absent from the data model — every T2 figure optimistic | **Step 1 — done, v0.9.25** |
+| W8 | Invention absent from the data model — every T2 figure optimistic | **Done — root v0.9.25, whole tree v0.9.29** |
 | W9 | Synchronous token refresh blocks the event loop (the v0.9.22 bug class) | Step 4 |
 | W10 | No migration system; SDE refresh decided by row-count comparison | SDE half **done in Step 1** (build numbers, v0.9.24); migrations still Step 4 |
 | W11 | SQLite under a continuously writing sync worker | Step 4 |
@@ -1186,6 +1233,27 @@ of this work), each mapped to the step that retires it:
 Found during the design work itself (same class, listed for completeness): trading
 taxes absent from every profit figure (Step 1), no ESI User-Agent (Step 2), hardcoded SSO
 endpoints (Step 2), deprecated YAML SDE pipeline (Step 1).
+
+**Found in v0.9.29, all in code that had already shipped.** Listed because the pattern
+matters more than any one of them: every single one was in a step marked done, and every one
+was invisible until the app was actually *run*.
+
+| Defect | Shipped in | Effect |
+|---|---|---|
+| Bundled client ID pointed at the retired `:5173` callback | v0.9.28 | **No login was possible at all**, in any environment, since that release |
+| `/settings` offered as the fix for a missing client ID | v0.9.27 | Session required to set the thing that grants sessions — a closed loop |
+| Adding a second character reported "Login failed. Nothing was changed." | v0.9.28 | It had succeeded; the message was wrong twice over |
+| A refused login kept the stranger's refresh token | v0.9.28 | R4 custody with no consent, reachable by anyone with the URL |
+| SDE tables present-but-empty could never self-heal | pre-existing | Sent the user to re-download an SDE already in the repo |
+| 11 CLI call sites bypassing `esi_client()` | pre-existing | Unidentified, unpinned, ungoverned traffic to CCP — Step 2's finding 7 was only half closed |
+| `sales_method: immediate` priced output at the **sell** price | v0.9.26 | Profit overstated twice for anyone selling into buy orders |
+
+**The lesson, stated once so it is not relearned:** three of these survived because a test
+asserted something narrower than its name claimed — `test_esi_client_sends_user_agent` asked
+the wrapper about itself while eleven callers bypassed it;
+`test_local_development_still_works_without_configuration` only checked which constant came
+back; `test_the_page_renders` passed against a board that returned at a guard and never ran a
+query. **A name that claims something about the world needs an assertion about the world.**
 
 ### The steps
 
@@ -1222,9 +1290,10 @@ changed, and four of them were wrong before:
 Not done, and deliberately: the **reactions board**, which was always conditional ("if
 appetite allows"). It belongs with Step 7's feature buildout now that the data exists.
 
-Two threads recorded in §14 rather than closed: invention is charged at the root only, so
-`/plan` still under-costs T2 components inside a tree; and the market tax rates are still
-unconfirmed against the live game. *(W8, and the SDE half of W10)*
+Two threads were recorded in §14 rather than closed. The first — invention charged at the
+root only — is **closed in v0.9.29**, and closing it found that `/plan` had been charging
+invention nowhere at all (§8). The sales tax and broker's fee rates are still unconfirmed
+against the live game. *(W8, and the SDE half of W10)*
 
 **Step 2 — Security baseline + ESI citizenship. ✅ Done — v0.9.27.** All eight items,
 in dependency order. The findings in §4 were re-verified against the tree first; every one
@@ -1261,9 +1330,33 @@ Recorded rather than closed: **owner-on-first-login is trust-on-first-use.** Wit
 fine on a laptop, a real if narrow window between deploying and first login. Step 3 should
 set that variable as part of deploying. *(W1–W5)*
 
-**Step 3 — Go hosted, single-user. Code done — v0.9.28; deployment outstanding.**
-Everything that could be done without the VPS is done; DNS, certificates and the callback
-registration are the remaining work and they are elapsed time rather than coding time.
+**Reopened and closed properly, 2026-08-18: finding 7 was only closed on the paths the
+tests looked at.** Going to answer §14's compatibility-date question, the audit found
+**eleven** `httpx.AsyncClient()` constructions outside `esi_client()` — three in `main.py`,
+eight in `plan.py`, the two CLI entry points. Every call they made reached CCP with no
+`User-Agent`, no `X-Compatibility-Date` and neither rate-limit governor: unidentified
+traffic, unpinned behaviour, and no 420/429 handling on the tools most likely to hammer
+`/universe/names/` in a loop.
+
+The instructive part is why the suite missed it. `test_esi_client_sends_user_agent` asserts
+the wrapper sets the header, and its docstring called that "the path all ESI traffic takes"
+— a claim about the *callers* that the test never checked. A test that interrogates a
+component about itself cannot see who declines to use it. Replaced with a source scan over
+`app/` plus both entry points, exempting only the wrapper and the SDE feed's sync client;
+`_bg_fetch_prices` also lost a dead `import httpx`. Worth carrying into Step 4: "all traffic
+goes through X" is a claim about call sites, and only a call-site check pins it.
+
+**Step 3 — Go hosted, single-user. ⚠️ NOT DONE — code only; still running on localhost.**
+v0.9.28 finished everything that could be done without the VPS. The deployment itself — DNS,
+certificates, the six environment variables, the callback re-registration, pinning
+`EVE_OWNER_CHARACTER_ID` — is still outstanding, deliberately parked on 2026-08-18 to keep a
+day low-friction. **Read this as "the strategic decision is coded but not made real."** The
+hosted-only bet in §1 is not hedged by anything: the desktop app is already deleted, so until
+this step lands the tool runs on one laptop with no fallback. That is R3's failure mode
+described exactly, and it gets more expensive the longer Step 7 items are added ahead of it.
+
+The v0.9.29 session found the cost of shipping code that had never been run end to end: five
+separate defects in this step's own work, none of them in the plan (see the box below).
 
 Deleted: `launcher.py`, `login.py`, the PyInstaller spec, the Inno Setup installer, both
 build scripts, `android-poc/`, the release and Android CI workflows, the in-app updater and
@@ -1296,6 +1389,65 @@ rather than defended)*
 Remaining, for the VPS session: point DNS, run certbot, set the six environment variables,
 change the callback registration, and pin `EVE_OWNER_CHARACTER_ID` after first login.
 
+**Everything above was verified working on localhost on 2026-08-18** — first-run setup, SSO,
+ownership claim, adding alts. That is new: before that session none of Step 3 had ever
+completed a login, in any environment.
+
+⚠️ **The cutover already bit — on localhost, not the VPS. Fixed in v0.9.29.** This section
+treated the callback change as VPS work, but the *default* callback moved too: from the
+`:5173` listener to `http://localhost:8000/callback`. `get_client_id()` fell back to a
+bundled application whenever the callback was on localhost, and an EVE application has
+exactly **one** registered redirect URI — which for the bundled one is still the old value,
+and is not ours to edit. So a plain `python web.py` had been unable to log in since v0.9.28,
+failing at CCP with *"The redirect URL does not match any of the configured values for this
+client"*: an error naming neither the cause nor the fix.
+
+The fallback is removed rather than repointed — it could not be made to work for two
+deployments at once, which is the whole reason §5's "bring-your-own client ID" exists.
+`get_client_id()` now returns `None`, and the settings page no longer claims a built-in
+Client ID means "no setup needed".
+
+**And an unconfigured localhost install gets a form, not an instruction.** Telling a first
+run to set an environment variable and restart is a poor answer when the app is already open
+in front of you, so `/auth/login` redirects to `/setup/client-id`: the registration steps,
+the exact callback URL to copy, the full scope list, and a field that stores the ID. The
+route is **sessionless by necessity** — the client ID is what makes a session possible — so
+it is fenced twice instead, and both fences are tested:
+
+* **Loopback Host only.** An endpoint that skips authentication *and* writes configuration
+  has no business on a public host; a server deployment sets `EVE_CLIENT_ID` and gets a page
+  naming that variable. Note the fence is the Host being loopback, not the allowlist —
+  `testserver` is an allowed Host in the suite and still gets a 404, which is what pins the
+  two checks apart.
+* **Only while unconfigured.** Once an ID exists the route 404s, so it cannot be used to
+  repoint a live install. 404 rather than 403: there is nothing left to do there, and
+  saying "forbidden" invites probing.
+
+Because public paths return before the gate's CSRF check, the POST has no session-bound
+token to verify — so it checks `Origin` instead. A browser always sends it on a cross-origin
+POST and a page cannot forge or suppress it, which is precisely the ambient-authority attack
+that matters for a form reachable at `http://localhost:8000` from any site the user has
+open. An absent `Origin` (curl, tests) is allowed.
+
+**Switching applications invalidates every stored refresh token.** A refresh token is bound
+to the client ID that issued it, so `grant_type=refresh_token` against a different
+application fails — characters authenticated under the bundled ID must be re-added once you
+register your own. This is a property of OAuth, not of the removal: it applies to anyone
+making this switch, and it applies again at the VPS cutover. Removing the fallback surfaced
+it, by breaking `test_token_refresh_is_serialized`, which had been quietly depending on the
+bundled ID to supply *a* client ID at all. Worth stating in the deploy guide before the VPS
+session rather than discovering it there.
+
+Two more things worth carrying forward. **The lockout is real and the settings page is not
+the way out** — `/settings` is behind the session gate, a session needs SSO, so the escape is
+`EVE_CLIENT_ID` in the environment or `python -m app.web.bootstrap`. And the test that
+should have caught the whole thing was named
+`test_local_development_still_works_without_configuration` while only asserting which
+constant came back; the name was a claim about the world that went false without the
+assertion noticing. Same shape as the `esi_client()` docstring in Step 2 — twice in one day,
+so it is worth stating as a rule: **a name that claims something about the world needs an
+assertion about the world.**
+
 **Step 4 — Platform foundations.** Postgres + Alembic (decide once, not hedged); async
 token refresh done properly; background sync worker with delay-after-completion + jitter;
 cache-only routes; ETags on every fetch; 4XX quarantine per character; verify the
@@ -1313,9 +1465,15 @@ ledger; the coarse alliance read model. Joiners grant minimal scopes (identity +
 `read_character_jobs`). **Pilot in own corp and measure the match-correction rate before
 any alliance rollout.**
 
-**Step 7 — Feature buildout.** Market BI rebuild on the group tree; refine calculator;
-mining ledger; appraisal; compression LP. Ordered by appetite — each is independent once
-Steps 1 and 4 exist.
+**Step 7 — Feature buildout. 1 of 8 shipped.** Market BI rebuild on the group tree; refine
+calculator; mining ledger; appraisal; compression LP. Ordered by appetite — each is
+independent once Steps 1 and 4 exist.
+
+**Reactions board — ✅ done, v0.9.29, `/reactions`.** Taken out of order, ahead of Steps 4-6,
+as a low-friction day rather than plan progress. See §9.1 for what the build settled. Note it
+is built on the pre-Step-4 foundations, so it inherits SQLite, the unsplit `main.py` and the
+synchronous refresh; nothing about it blocks Step 4, but it is one more page Step 4 will have
+to move.
 
 ### Why this order
 
@@ -1353,7 +1511,7 @@ calls**, **47 tables**.
 |---|---|
 | Dashboard widgets (§9.6) | 0.5–1 |
 | Refine calculator | 0.5–1 |
-| Reactions board | 1 |
+| ~~Reactions board~~ | ✅ **done v0.9.29** — 1 session, as estimated |
 | Appraisal tool | 1 |
 | Market BI rebuild (§9.4) | 1–2 |
 | Mining ledger (§9.3) | 1–2 |
@@ -1505,7 +1663,14 @@ batch.
 NPC reprocessing tax: 5% at zero standing, falling to 0% at 6.67 standing (higher of
 personal or corp standing).
 
-### Market taxes
+### Sales tax and broker's fees
+
+There is no single "market tax" — these are two separate charges with different trigger
+conditions, and the distinction is the whole reason `SellingCosts` carries them apart.
+**Sales tax** (the wallet journal calls it *transaction tax*) is paid by the seller on every
+completed sale, deducted automatically before the ISK lands. **Broker's fee** is paid only
+when you *place* an order — sell into someone else's buy order and you pay none. So "dump to
+buy orders" and "list and wait" are genuinely different numbers.
 
 ```
 sales_tax%  = 7.5% × (1 − 0.11 × Accounting)
@@ -1517,6 +1682,22 @@ relist      = (100% − (50% + 6%×AdvBrokerRelations)) × broker% × new_value
 
 Minimum broker and relist fee: 100 ISK. Sales tax is always paid to the SCC and appears in
 the wallet as "transaction tax".
+
+Three properties of the broker's fee that are easy to model wrongly:
+
+* **Standings are read unmodified.** The fee ignores Connections, Diplomacy and every other
+  standing skill, while the character sheet shows the *modified* figure by default. Entering
+  the modified number inflates the discount and understates the fee. The settings fields say
+  "(unmodified)" and `taxes.py` carries the same warning at the coefficients.
+* **It is charged on order creation, not on sale**, for any duration longer than "immediate"
+  — and it is **not refunded** if the order is cancelled or expires. So it is sunk at listing
+  time, which is why selling into an existing buy order carries sales tax alone. Buy orders
+  pay it too; the app models the seller's side only.
+* **Upwell structures ignore skills and standings entirely** — owner-set rate plus the SCC
+  surcharge. Applying Broker Relations there would understate the cost of trading in nullsec.
+
+Confirmed against the EVE University *Tax* page, 2026-08-18: the NPC equation and the 1%
+floor at Broker Relations V with maximum standings both match what ships.
 
 ---
 
@@ -1566,10 +1747,12 @@ past the first joiner. Do not.
 5. ~~Does `planetResources` replace the hardcoded matrix in `planet_data.py`?~~ **No — answered 2026-08-18.** `planetResources.jsonl` is 25,798 records keyed by *planet id* carrying `power` and `workforce`: the Equinox sovereignty system, nothing to do with PI extraction. The P0-per-planet-type matrix in `planet_data.py` stays hardcoded.
 6. Reactions board — inside Step 1, or its own step? It is the biggest quick win and the
    most tempting scope creep inside a correctness sprint.
-7. **Wire invention into `BOMResolver`.** v0.9.25 charges it at the root only, so `/plan`
-   still treats T2 components inside a tree as having free blueprints. See the limitation
-   note in §8. This is the last known correctness gap from Step 1.
-8. **Verify the market tax rates in game.** `app/market/taxes.py` ships 7.5% sales tax,
+7. ~~**Wire invention into `BOMResolver`.**~~ **Done 2026-08-18 (v0.9.29).** Charged at
+   every manufacturing node, and the optimizer counts it on the make side. Doing it
+   corrected two claims in §8: `/plan` was charging invention *nowhere*, not merely missing
+   nested components, and the affected nested set is 130 products of which none is a
+   capital. See §8 for both.
+8. **Verify the sales tax and broker's fee rates in game.** `app/market/taxes.py` ships 7.5% sales tax,
    3% NPC broker fee, −11%/level Accounting and −0.3%/level Broker Relations. These come
    from the Version 22.02 patch note and the EVE University *Tax* page, cross-checked
    against the 1% NPC broker floor — but the *Trading* page on the same wiki was found to
@@ -1578,14 +1761,37 @@ past the first joiner. Do not.
    transaction tax and broker fee against what the tool predicts. Re-check after any patch
    touching market fees. Until then every profit figure inherits this assumption.
 
+9. **An uninvited character's refresh token is stored before it is refused.**
+   `complete_login()` calls `save_tokens()` and *then* `/callback` checks
+   `may_sign_in()` — so a stranger who reaches the URL and completes SSO has their
+   character row and refresh token written into the owner's database, and only the
+   session is denied. Found 2026-08-18 while fixing the add-character flow, which
+   relies on exactly that ordering (the alt must be stored for "Add Character" to
+   mean anything).
+
+   Harmless on localhost, and no data flows *to* the stranger. It mattered at Step 3's
+   VPS: **R4 arriving uninvited** — custody of someone else's ESI token with no consent,
+   no policy and no revocation path, obtained by anyone who finds the URL.
+
+   **Closed 2026-08-18.** The refusal branch now discards what `complete_login()` just
+   wrote, so a refused login leaves nothing behind. The subtlety is *which* characters
+   may be deleted: only one this login created. `/callback` snapshots the known
+   character IDs **before** the exchange, because afterwards a first-time arrival and a
+   re-authentication are indistinguishable — and the owner's session can plausibly
+   expire during the round trip to EVE, which would otherwise turn a refused re-auth
+   into silent deletion of a real character. Two tests hold the line apart: an
+   uninvited character must be gone, a previously-added one must survive.
+
 ### Reference material not yet read
 
 Relevant to the plan, unread as of this writing:
 
 * EVE University wiki: **Compression**, **Moon mining**, **Hauling** (freight rates for the
   sell-advantage metric in §9.2), **Reactions**
-* **ESI versioning via compatibility dates** — ESI has moved off Swagger to OpenAPI and
-  versions by compatibility date rather than `/v1/`, `/v2/` route versions. It is not known
-  what the app currently does here. **Check before writing the sync worker in Step 4** — if
-  route pinning has changed it touches every fetcher, and it is far cheaper to know before
-  the rewrite than after.
+* ~~**ESI versioning via compatibility dates**~~ — **answered 2026-08-18, and it was
+  already handled.** `app/esi/client.py` pins `X-Compatibility-Date: 2026-07-17` on every
+  client it builds; URLs stay on `/latest`, where the header takes precedence. So Step 4
+  does *not* touch every fetcher, and the sync worker inherits the pin for free. The date is
+  a deliberate-upgrade knob, not something to discover at runtime.
+
+  Checking it did turn up a real gap, though — see the note below.

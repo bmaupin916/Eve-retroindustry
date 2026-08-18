@@ -383,7 +383,19 @@ def test_a_real_deployment_must_bring_its_own_application(monkeypatch, tmp_path)
     assert token_store.get_client_id() == "the-deployers-own-id"
 
 
-def test_local_development_still_works_without_configuration(monkeypatch, tmp_path):
+def test_localhost_no_longer_falls_back_to_the_bundled_application(monkeypatch, tmp_path):
+    """This test used to be called "local development still works without
+    configuration", and asserted the bundled client ID was handed out on
+    localhost. The name was a claim about the world, and v0.9.28 made it false:
+    moving the callback to :8000 left the bundled application — one registered
+    redirect URI, and not ours to edit — unable to finish a login. The assertion
+    still passed, because it only ever asked which constant came back.
+
+    So an unconfigured localhost run failed at CCP with "The redirect URL does
+    not match any of the configured values for this client", which points at
+    neither the cause nor the fix. None is the honest answer: it routes to
+    /auth/login's message, which quotes the callback URL to register.
+    """
     from app.auth import token_store
 
     monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
@@ -391,7 +403,23 @@ def test_local_development_still_works_without_configuration(monkeypatch, tmp_pa
     monkeypatch.delenv("EVE_CALLBACK_URL", raising=False)
     monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
 
-    assert token_store.get_client_id() == token_store._DEV_CLIENT_ID
+    assert token_store.get_client_id() is None
+
+
+def test_a_configured_client_id_is_still_used(monkeypatch, tmp_path):
+    """Removing the fallback must not disturb the two real sources."""
+    from app.auth import token_store
+
+    monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
+    monkeypatch.delenv("EVE_CALLBACK_URL", raising=False)
+    monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
+
+    monkeypatch.setenv("EVE_CLIENT_ID", "from-the-environment")
+    assert token_store.get_client_id() == "from-the-environment"
+
+    monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
+    token_store.save_client_id("from-the-settings-page")
+    assert token_store.get_client_id() == "from-the-settings-page"
 
 
 def test_an_unconfigured_deployment_cannot_start_a_login(monkeypatch, tmp_path):
@@ -411,7 +439,7 @@ def test_nothing_in_the_app_hardcodes_a_deployment_domain():
     import re
 
     allowed = re.compile(
-        r"eveonline\.com|evetech\.net|fuzzwork\.co\.uk|github\.com|ko-fi\.com|"
+        r"eveonline\.com|evetech\.net|fuzzwork\.co\.uk|github\.com|"
         r"localhost|127\.0\.0\.1|example\.(com|test)|w3\.org|"
         r"schemas\.|json-schema\.org"
     )

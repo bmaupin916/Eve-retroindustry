@@ -160,9 +160,6 @@
     /* Compact dark input (prices, custom overrides…) */
     .input-eve { background: #0d1117; border: 1px solid var(--eve-border); color: #e6edf3; }
 
-    /* Ko-fi brand button (styled locally — no external CDN dependency) */
-    .btn-kofi       { background: #ff5e5b; border: 1px solid #ff5e5b; color: #fff; font-weight: 700; }
-    .btn-kofi:hover { background: #ff4744; border-color: #ff4744; color: #fff; }
 
     /* ── Misc ── */
     .refresh-btn { min-width: 160px; }
@@ -275,6 +272,9 @@ window.escHtml = function (s) {
           <a class="nav-link {% if request.url.path.startswith('/margins') %}active{% endif %}" href="/margins" title="Margin Tracker"><i class="bi bi-graph-up-arrow"></i><span class="nav-label">Margins</span></a>
         </li>
         <li class="nav-item">
+          <a class="nav-link {% if request.url.path.startswith('/reactions') %}active{% endif %}" href="/reactions" title="Reactions Board — every reaction ranked"><i class="bi bi-thermometer-half"></i><span class="nav-label">Reactions</span></a>
+        </li>
+        <li class="nav-item">
           <a class="nav-link {% if request.url.path.startswith('/projects') %}active{% endif %}" href="/projects" title="Projects"><i class="bi bi-kanban"></i><span class="nav-label">Projects</span></a>
         </li>
         <li class="nav-item">
@@ -297,13 +297,6 @@ window.escHtml = function (s) {
         </li>
       </ul>
       <ul class="navbar-nav ms-auto align-items-center gap-2">
-        <li class="nav-item">
-          <a class="nav-link d-flex align-items-center" href="https://ko-fi.com/retrovisor"
-             target="_blank" rel="noopener noreferrer"
-             style="font-size:.85rem;opacity:.7" title="Support me on Ko-fi">
-            <i class="bi bi-cup-hot-fill" style="color:#e3b341"></i><span class="nav-label">Support me</span>
-          </a>
-        </li>
         <li class="nav-item">
           <a class="nav-link {% if request.url.path.startswith('/settings') %}active{% endif %}"
              href="/settings" style="font-size:.85rem;opacity:.7" title="Settings — industry defaults, slots, ESI">

@@ -55,6 +55,11 @@ _PUBLIC_EXACT = frozenset({
     "/auth/login", "/callback", "/favicon.ico",
     # Redeems a token that can only be minted with filesystem access to the DB.
     "/auth/bootstrap",
+    # First-run client ID entry. Must be sessionless — it is what makes a login
+    # possible in the first place — so the route itself is fenced twice: it 404s
+    # unless the Host is loopback AND no client ID is configured yet. See
+    # host_is_loopback() and the route in main.py.
+    "/setup/client-id",
 })
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
@@ -98,6 +103,48 @@ def host_is_allowed(host_header: str | None) -> bool:
 
 def is_public_path(path: str) -> bool:
     return path in _PUBLIC_EXACT or path.startswith(_PUBLIC_PREFIXES)
+
+
+def host_is_loopback(host_header: str | None) -> bool:
+    """True when this request arrived on localhost rather than a real name.
+
+    First-run configuration (`/setup/client-id`) is offered only here. It has to
+    be reachable without a session — configuring the client ID is what makes a
+    session *possible* — and an endpoint that both skips authentication and
+    writes configuration has no business existing on a public host. A real
+    deployment sets EVE_CLIENT_ID in its environment instead; see
+    docs/deploy-vps.md.
+    """
+    if not host_header:
+        return False
+    host = host_header.strip().lower()
+    if host.startswith("["):
+        host = host[: host.index("]") + 1] if "]" in host else host
+    elif ":" in host:
+        host = host.rsplit(":", 1)[0]
+    return host in _LOOPBACK_HOSTS
+
+
+def origin_is_allowed(origin_header: str | None) -> bool:
+    """Reject a cross-site POST to an unauthenticated form.
+
+    Public paths return before the CSRF check in the security gate, so a form
+    that needs no session gets no session-bound token either. Origin is what
+    remains: a browser always sends it on a cross-origin POST and a page cannot
+    forge or suppress it, so a submission from evil.com is visible as one. An
+    absent Origin means a non-browser caller (curl, a test) and is allowed —
+    the attack being closed here is specifically the browser's ambient one.
+    """
+    if not origin_header or origin_header == "null":
+        return True
+    origin = origin_header.strip().lower()
+    if "://" in origin:
+        origin = origin.split("://", 1)[1]
+    if origin.startswith("["):
+        origin = origin[: origin.index("]") + 1] if "]" in origin else origin
+    elif ":" in origin:
+        origin = origin.rsplit(":", 1)[0]
+    return origin in allowed_hosts()
 
 
 # ---------------------------------------------------------------------------

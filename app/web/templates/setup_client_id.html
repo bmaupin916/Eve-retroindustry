@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}First-run setup — EVE Retroindustry{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center justify-content-center" style="min-height:80vh">
+  <div class="card p-4" style="max-width:44rem">
+    <h4 class="mb-1" style="color:var(--eve-gold)">Connect your EVE application</h4>
+    <p class="text-secondary small mb-3">
+      One-time setup. This page is only available on localhost, and only until it is done.
+    </p>
+
+    {% if error %}
+      <div class="alert alert-danger py-2 small mb-3">{{ error }}</div>
+    {% endif %}
+
+    <p class="small mb-3">
+      EVE compares the callback URL against your application's registration as an exact
+      string, and an application has exactly one — so no application can be shared between
+      installs. This one needs its own, which takes about a minute to create.
+    </p>
+
+    <ol class="small mb-3 ps-3">
+      <li class="mb-2">
+        Open <a href="https://developers.eveonline.com/applications/create" target="_blank" rel="noopener">the
+        EVE Developer Portal</a> and create an application.
+      </li>
+      <li class="mb-2">
+        Set <strong>Connection Type</strong> to <em>Authentication &amp; API Access</em>.
+        <span class="text-secondary">"Authentication Only" grants no data access.</span>
+      </li>
+      <li class="mb-2">
+        Set the <strong>Callback URL</strong> to exactly this — no trailing slash:
+        <div class="mt-1"><code class="user-select-all">{{ callback_url }}</code></div>
+      </li>
+      <li class="mb-2">
+        Add <strong>all {{ scopes|length }} permissions</strong> below.
+        <details class="mt-1">
+          <summary class="text-secondary" style="cursor:pointer">Show the list</summary>
+          <textarea class="form-control form-control-sm mt-2" rows="6" readonly
+                    onclick="this.select()">{{ scopes|join('\n') }}</textarea>
+        </details>
+        <div class="text-secondary mt-1">
+          Select them all now: an application can only ever request the scopes assigned at
+          registration, so adding one later means a new application — and a new Client ID
+          invalidates every character already added.
+        </div>
+      </li>
+      <li>
+        Copy the <strong>Client ID</strong> and paste it below. Ignore the secret key —
+        this is a PKCE flow and no secret is ever sent.
+      </li>
+    </ol>
+
+    <form method="post" action="/setup/client-id">
+      <label class="form-label small mb-1" for="client-id">Client ID</label>
+      <div class="d-flex gap-2">
+        <input type="text" id="client-id" name="client_id" required autofocus
+               autocomplete="off" spellcheck="false"
+               class="form-control form-control-sm font-monospace"
+               placeholder="e.g. 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d">
+        <button type="submit" class="btn btn-primary btn-sm text-nowrap">Save &amp; sign in</button>
+      </div>
+    </form>
+
+    <p class="text-secondary small mt-3 mb-0">
+      Deploying this on a server instead? Set the <code>EVE_CLIENT_ID</code> environment
+      variable — this page is not served off localhost.
+    </p>
+  </div>
+</div>
+{% endblock %}

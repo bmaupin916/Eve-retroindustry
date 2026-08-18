@@ -368,3 +368,184 @@ def test_the_bootstrap_route_refuses_a_spent_token(app_module, conn):
     r = c2.get(f"/auth/bootstrap?token={token}", follow_redirects=False)
     assert r.status_code == 200
     assert security.SESSION_COOKIE not in r.cookies
+
+
+# ── first-run client ID entry (v0.9.29) ────────────────────────────────────
+# Sessionless by necessity: the client ID is what makes a login possible, so
+# demanding a session to set it is circular — that circle is exactly what the
+# v0.9.28 callback move turned into a lockout. The route is fenced twice
+# instead: loopback Host only, and only while nothing is configured.
+
+@pytest.fixture
+def unconfigured(app_module, monkeypatch, tmp_path):
+    """No client ID from either source, without disturbing the real config."""
+    from app.auth import token_store as ts
+
+    monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
+    monkeypatch.setattr(ts, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
+    return ts
+
+
+def _local(app_module):
+    """TestClient whose Host is loopback rather than the default 'testserver'."""
+    return TestClient(app_module.app, base_url="http://localhost:8000")
+
+
+def test_setup_page_is_served_on_loopback_when_unconfigured(app_module, unconfigured):
+    r = _local(app_module).get("/setup/client-id", headers={"Accept": "text/html"})
+    assert r.status_code == 200
+    # The callback URL is the one thing that must be copied exactly, so the page
+    # is useless if it does not state it.
+    assert "http://localhost:8000/callback" in r.text
+
+
+def test_setup_page_is_not_served_off_loopback(app_module, unconfigured):
+    """An unauthenticated endpoint that writes configuration must not exist on a
+    public host. 'testserver' is an allowed Host here but is not loopback, so
+    this isolates the loopback fence from the Host check."""
+    r = TestClient(app_module.app).get("/setup/client-id", headers={"Accept": "text/html"})
+    assert r.status_code == 404
+    r = TestClient(app_module.app).post("/setup/client-id", data={"client_id": "a" * 32})
+    assert r.status_code == 404
+
+
+def test_setup_page_closes_once_a_client_id_exists(app_module, unconfigured):
+    unconfigured.save_client_id("1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d")
+    r = _local(app_module).get("/setup/client-id", headers={"Accept": "text/html"})
+    assert r.status_code == 404
+
+
+def test_saving_a_client_id_persists_it_and_starts_the_login(app_module, unconfigured):
+    r = _local(app_module).post(
+        "/setup/client-id",
+        data={"client_id": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"] == "/auth/login"
+    assert unconfigured.get_client_id() == "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"
+
+
+def test_a_cross_site_post_is_rejected(app_module, unconfigured):
+    """Public paths return before the gate's CSRF check, so Origin is the only
+    thing standing between this form and a page on another site submitting it."""
+    r = _local(app_module).post(
+        "/setup/client-id",
+        data={"client_id": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"},
+        headers={"Origin": "http://evil.example"},
+    )
+    assert r.status_code == 400
+    assert unconfigured.get_client_id() is None      # nothing was written
+
+
+def test_a_malformed_client_id_is_refused_before_it_reaches_ccp(app_module, unconfigured):
+    """A pasted URL or secret key otherwise fails much later, at CCP, with a
+    message that never mentions this form."""
+    r = _local(app_module).post(
+        "/setup/client-id",
+        data={"client_id": "https://developers.eveonline.com/applications/12345"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/setup/client-id?error=")
+    assert unconfigured.get_client_id() is None
+
+
+def test_login_sends_an_unconfigured_localhost_install_to_setup(app_module, unconfigured):
+    r = _local(app_module).get(
+        "/auth/login", headers={"Accept": "text/html"}, follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/setup/client-id"
+
+
+# ── adding a character is not a failed login (v0.9.29) ─────────────────────
+# "Add Character" and "Log In" are the same link, so /callback cannot read
+# intent from the request. complete_login() has already stored the tokens by
+# the time the owner check runs, so a non-owner arriving there means the
+# character was added and only the session is refused. Whoever already holds a
+# session is the owner doing exactly that.
+
+def test_the_owner_can_add_a_second_character(app_module, monkeypatch, client):
+    """The alt is stored and the owner is returned to the app, not shown a
+    'Login failed. Nothing was changed.' page that is wrong on both counts."""
+    monkeypatch.setattr(app_module, "complete_login",
+                        lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
+
+    r = client.get("/callback?code=x&state=y", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/auth/sync"
+    # The owner's own session must survive: adding an alt does not re-seat who
+    # is signed in, and must not hand the alt one either.
+    assert security.SESSION_COOKIE not in r.cookies
+
+
+def test_adding_a_character_does_not_transfer_ownership(app_module, monkeypatch, client, conn):
+    monkeypatch.setattr(app_module, "complete_login",
+                        lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
+
+    client.get("/callback?code=x&state=y", follow_redirects=False)
+    assert security.get_owner_id(conn) == OWNER_CHARACTER_ID
+
+
+def test_a_stranger_without_a_session_still_gets_the_refusal(app_module, monkeypatch):
+    """The heuristic must not become 'anyone completing SSO is welcome'."""
+    monkeypatch.setattr(app_module, "complete_login",
+                        lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
+
+    c = TestClient(app_module.app)          # no session cookie
+    r = c.get("/callback?code=x&state=y", follow_redirects=False)
+    assert r.status_code == 200
+    assert "is not the owner" in r.text
+    assert security.SESSION_COOKIE not in r.cookies
+
+
+# ── a refused login leaves no token behind (v0.9.29, open question 9) ───────
+
+def test_an_uninvited_character_is_not_left_stored(app_module, monkeypatch, conn):
+    """complete_login() stores tokens before the owner check can refuse, so a
+    stranger who merely found the URL was having their ESI refresh token written
+    into someone else's database. Custody without consent — §13 R4."""
+    from app.auth.token_store import delete_character, get_character_row
+
+    stranger_id = 900000777
+    delete_character(conn, stranger_id)          # start clean
+
+    def _stores_then_returns(code, state):
+        # Stand in for the real complete_login: it saves, then returns.
+        conn2 = app_module.get_conn()
+        try:
+            from app.auth.token_store import save_tokens
+            save_tokens(conn2, "access-tok", "refresh-tok", 1200,
+                        stranger_id, "Passing Stranger")
+        finally:
+            conn2.close()
+        return stranger_id, "Passing Stranger"
+
+    monkeypatch.setattr(app_module, "complete_login", _stores_then_returns)
+
+    c = TestClient(app_module.app)               # no session
+    r = c.get("/callback?code=x&state=y", follow_redirects=False)
+    assert r.status_code == 200
+    assert "is not the owner" in r.text
+    assert get_character_row(conn, stranger_id) is None, \
+        "the refused character's refresh token is still stored"
+
+
+def test_a_known_character_survives_a_refused_reauth(app_module, monkeypatch, conn):
+    """The owner's session can expire during the round trip to EVE. That must
+    refuse the session without destroying a character already added — the
+    difference between 'uninvited' and 'known' is the whole safety margin."""
+    from app.auth.token_store import save_tokens, get_character_row
+
+    save_tokens(conn, "access-tok", "refresh-tok", 1200,
+                OTHER_CHARACTER_ID, "Test Pilot Beta")
+
+    monkeypatch.setattr(app_module, "complete_login",
+                        lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
+
+    c = TestClient(app_module.app)               # session expired -> none sent
+    r = c.get("/callback?code=x&state=y", follow_redirects=False)
+    assert r.status_code == 200
+    assert "is not the owner" in r.text
+    assert get_character_row(conn, OTHER_CHARACTER_ID) is not None, \
+        "a previously-added character was deleted by a refused re-auth"

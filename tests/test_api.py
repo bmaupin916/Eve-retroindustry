@@ -30,6 +30,12 @@ def test_token_refresh_is_serialized(app_module, monkeypatch):
     m = app_module
     cid = 900000001
 
+    # A refresh needs a client ID, and this test is about serialization rather
+    # than where that ID comes from — so state it. Until v0.9.29 the test leaned
+    # on the bundled-application fallback, which meant it also silently asserted
+    # that fallback existed; removing it was what surfaced the dependency.
+    monkeypatch.setenv("EVE_CLIENT_ID", "test-client-id")
+
     c = m.get_conn()
     try:
         c.execute("UPDATE characters SET token_expires_at=0 WHERE character_id=?", (cid,))

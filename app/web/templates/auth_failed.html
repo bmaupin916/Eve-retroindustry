@@ -8,15 +8,44 @@
 
     <p class="mb-3">{{ reason }}</p>
 
-    <p class="text-secondary small mb-4">
-      Nothing was changed. If this keeps happening, the server log records the
-      exact response EVE returned.
-    </p>
+    {% if unconfigured %}
+      <p class="small mb-2">
+        An EVE application has exactly one registered callback URL, so no application
+        can be shared between deployments — this one needs its own.
+      </p>
+      <ol class="small mb-3 ps-3">
+        <li class="mb-2">
+          Create an application at
+          <a href="https://developers.eveonline.com/" target="_blank" rel="noopener">developers.eveonline.com</a>
+          (connection type <em>Authentication &amp; API Access</em>), with the callback URL set
+          to exactly:
+          <div><code class="user-select-all">{{ callback_url }}</code></div>
+        </li>
+        <li>
+          Set <code>EVE_CLIENT_ID</code> to its client ID and restart. There is no client
+          secret — the flow is PKCE.
+        </li>
+      </ol>
+      <p class="text-secondary small mb-4">
+        The Settings page cannot be used for this: it requires a session, and a session
+        requires the login that is failing. If you would rather paste the ID into Settings
+        than set an environment variable, run
+        <code>python -m app.web.bootstrap</code> to mint a one-off sign-in link.
+      </p>
+      <div>
+        <a href="/auth/login" class="btn btn-primary">Try again</a>
+      </div>
+    {% else %}
+      <p class="text-secondary small mb-4">
+        Nothing was changed. If this keeps happening, the server log records the
+        exact response EVE returned.
+      </p>
 
-    <div>
-      <a href="/auth/login" class="btn btn-primary">Try again</a>
-      <a href="/settings" class="btn btn-outline-secondary ms-2">Settings</a>
-    </div>
+      <div>
+        <a href="/auth/login" class="btn btn-primary">Try again</a>
+        <a href="/settings" class="btn btn-outline-secondary ms-2">Settings</a>
+      </div>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

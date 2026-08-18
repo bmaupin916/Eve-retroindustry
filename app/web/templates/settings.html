@@ -14,15 +14,17 @@
     <div class="card mb-4">
       <div class="card-body">
 
-        <div class="alert alert-info py-2 small mb-3">
-          <i class="bi bi-info-circle me-1"></i>
-          EVE Retroindustry ships with a built-in Client ID — <strong>no setup needed</strong>.
-          Use this only if you want to use your own EVE application.
+        <div class="alert alert-warning py-2 small mb-3">
+          <i class="bi bi-exclamation-triangle me-1"></i>
+          <strong>Your own EVE application is required.</strong> An application has exactly one
+          registered callback URL, so it cannot be shared between deployments — there is no
+          built-in Client ID to fall back on.
         </div>
 
         <p class="small text-muted mb-3">
           Register a personal application on the <a href="https://developers.eveonline.com/" target="_blank" rel="noopener">
-          EVE Developer Portal</a> and paste your <strong>Client ID</strong> below to override the default.
+          EVE Developer Portal</a> and paste your <strong>Client ID</strong> below. Its callback
+          URL must match <code>{{ callback_url }}</code> exactly, character for character.
         </p>
 
         {# Step 1 #}
@@ -142,10 +144,59 @@
           </div>
 
           <div class="col-12 col-lg-6">
-            <label class="form-label small" title="How input materials are costed: instant-buy off sell orders, or patiently placing buy orders.">Material pricing</label>
+            <label class="form-label small" title="How input materials are costed: instant-buy off sell orders, or patiently placing buy orders. Used wherever the raw/intermediate split below does not apply.">Material pricing</label>
             <select id="def-input-basis" class="form-select form-select-sm">
               <option value="sell" {% if defaults.input_basis == 'sell' %}selected{% endif %}>Jita sell (instant buy)</option>
               <option value="buy"  {% if defaults.input_basis == 'buy'  %}selected{% endif %}>Jita buy (place orders)</option>
+            </select>
+          </div>
+
+          <div class="col-12">
+            <div class="small text-muted mt-2 mb-1">
+              <strong>Sourcing</strong> — raw materials and intermediates are usually acquired
+              differently: you sit on buy orders for moon goo and wait, but take intermediates
+              off sell orders so a job is not held up. The reactions board costs them separately.
+            </div>
+          </div>
+          <div class="col-12 col-lg-6">
+            <label class="form-label small" title="Moon goo, ice products, PI — the things at the bottom of the chain.">Acquire raw materials by</label>
+            <select id="def-raw-basis" class="form-select form-select-sm">
+              <option value="buy"  {% if defaults.raw_input_basis == 'buy'  %}selected{% endif %}>Buy orders (patient, cheaper)</option>
+              <option value="sell" {% if defaults.raw_input_basis == 'sell' %}selected{% endif %}>Sell orders (instant, dearer)</option>
+            </select>
+          </div>
+          <div class="col-12 col-lg-6">
+            <label class="form-label small" title="Reaction outputs you buy rather than make — the 'buy the intermediates' half of the build-advantage comparison.">Acquire intermediates by</label>
+            <select id="def-int-basis" class="form-select form-select-sm">
+              <option value="sell" {% if defaults.intermediate_input_basis == 'sell' %}selected{% endif %}>Sell orders (instant, dearer)</option>
+              <option value="buy"  {% if defaults.intermediate_input_basis == 'buy'  %}selected{% endif %}>Buy orders (patient, cheaper)</option>
+            </select>
+          </div>
+
+          <div class="col-12">
+            <div class="small text-muted mt-2 mb-1">
+              <strong>Freight</strong> — ISK per m&sup3;, import and export kept apart because
+              jump-freight is priced that way and the legs are rarely the same. Leave at 0 if you
+              build and sell in the same station.
+            </div>
+          </div>
+          <div class="col-6 col-lg-3">
+            <label class="form-label small" title="Cost to bring inputs in, per cubic metre.">Import ISK / m&sup3;</label>
+            <input type="number" min="0" step="1" id="def-freight-import" class="form-control form-control-sm"
+                   value="{{ defaults.freight_import_isk_m3 }}">
+          </div>
+          <div class="col-6 col-lg-3">
+            <label class="form-label small" title="Cost to move finished output to a market hub, per cubic metre. Charged on the output volume over the period.">Export ISK / m&sup3;</label>
+            <input type="number" min="0" step="1" id="def-freight-export" class="form-control form-control-sm"
+                   value="{{ defaults.freight_export_isk_m3 }}">
+          </div>
+          <div class="col-12 col-lg-6">
+            <label class="form-label small" title="Where output is sold. Jita is the baseline every other venue is measured against, so choosing it means there is no sell advantage to report. Other hubs need their prices fetched on the Prices page first.">Sell output at</label>
+            <select id="def-sell-hub" class="form-select form-select-sm">
+              <option value="0" {% if not defaults.sell_hub_region_id %}selected{% endif %}>Jita (baseline)</option>
+              {% for rid, hub in trade_hubs.items() %}
+                <option value="{{ rid }}" {% if defaults.sell_hub_region_id == rid %}selected{% endif %}>{{ hub.name }}</option>
+              {% endfor %}
             </select>
           </div>
           <div class="col-12 col-lg-6">
@@ -235,12 +286,12 @@
           </div>
 
           <div class="col-6 col-lg-3" data-venue="npc">
-            <label class="form-label small" title="Standing with the station owner's faction. Reduces the broker's fee by 0.03% per point.">Faction standing</label>
+            <label class="form-label small" title="Standing with the station owner's faction. Reduces the broker's fee by 0.03% per point. Enter the UNMODIFIED standing: the broker's fee ignores Connections/Diplomacy, so the modified figure shown in game understates the fee.">Faction standing <span class="text-muted">(unmodified)</span></label>
             <input type="number" min="-10" max="10" step="0.01" id="def-faction-standing" oninput="updateSellPreview()"
                    class="form-control form-control-sm" value="{{ defaults.faction_standing }}">
           </div>
           <div class="col-6 col-lg-3" data-venue="npc">
-            <label class="form-label small" title="Standing with the corporation owning the station. Reduces the broker's fee by 0.02% per point.">Corp standing</label>
+            <label class="form-label small" title="Standing with the corporation owning the station. Reduces the broker's fee by 0.02% per point. Enter the UNMODIFIED standing: the broker's fee ignores Connections/Diplomacy, so the modified figure shown in game understates the fee.">Corp standing <span class="text-muted">(unmodified)</span></label>
             <input type="number" min="-10" max="10" step="0.01" id="def-corp-standing" oninput="updateSellPreview()"
                    class="form-control form-control-sm" value="{{ defaults.corp_standing }}">
           </div>
@@ -363,6 +414,11 @@ async function saveDefaults() {
       industry_skill:        num('def-industry'),
       adv_industry_skill:    num('def-adv-industry'),
       input_basis:           num('def-input-basis'),
+      raw_input_basis:          num('def-raw-basis'),
+      intermediate_input_basis: num('def-int-basis'),
+      freight_import_isk_m3:    num('def-freight-import'),
+      freight_export_isk_m3:    num('def-freight-export'),
+      sell_hub_region_id:       num('def-sell-hub'),
       max_job_days:          num('def-max-job-days'),
       manufacturing_slots:   num('def-mfg-slots'),
       reaction_slots:        num('def-rxn-slots'),

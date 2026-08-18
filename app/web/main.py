@@ -9,6 +9,7 @@ import asyncio
 import datetime
 import os
 import json
+import re
 import sqlite3
 import sys as _sys
 import threading
@@ -22,7 +23,9 @@ from app.esi.client import (
     set_market_token_provider as _esi_set_market_token_provider,
 )
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse,
+)
 from urllib.parse import quote
 from fastapi.templating import Jinja2Templates
 
@@ -49,7 +52,9 @@ from app.web import pi_planner_helper
 from app.web import app_defaults
 from app.market.taxes import selling_costs
 from app.manufacturing import invention
+from app.manufacturing.margins import build_invention_params
 from app.web import margins_helper
+from app.web import reactions_helper
 from app.character.assets import (
     fetch_assets, ensure_assets_table, assets_at_location,
     fetch_corp_assets, ensure_corp_assets_table,
@@ -497,11 +502,18 @@ async def _startup_populate_groups():
         except sqlite3.OperationalError:
             count = 0
 
-        if count > 0:
-            try:
-                count = _refresh_sde_from_bundle(conn) or count
-            except Exception as exc:
-                print(f"[sde] refresh failed: {exc}", flush=True)
+        # Attempted even when count == 0. A database whose SDE tables *exist but
+        # are empty* was otherwise stranded: the fresh-install copy above only
+        # fires when `sde_types` is missing entirely, and this refresh used to
+        # require rows to already be there — so nothing could ever fill it, and
+        # the app sent the user to /setup to re-download an SDE that was sitting
+        # in the repo the whole time. The refresh is row-level and touches only
+        # _SDE_TABLES_TO_REFRESH, so the market cache and everything else the
+        # user has accumulated survive it, which the whole-file copy would not.
+        try:
+            count = _refresh_sde_from_bundle(conn) or count
+        except Exception as exc:
+            print(f"[sde] refresh failed: {exc}", flush=True)
 
         _SDE_READY[0] = count > 0
         if _SDE_READY[0]:
@@ -638,6 +650,68 @@ def _tr(name: str, request: Request, context: dict) -> HTMLResponse:
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request):
     return _tr("setup.html", request, {"sde_url": SDE_DOWNLOAD_URL})
+
+
+# CCP issues client IDs as a 32-character hex string. Matched loosely (letters
+# and digits, 20–64) rather than exactly, so a future change of format does not
+# lock anyone out of their own setup page — the check is here to catch a pasted
+# URL or secret key, not to validate CCP's ID scheme.
+_PLAUSIBLE_CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{20,64}")
+
+
+def _first_run_setup_available(request: Request) -> bool:
+    """Whether first-run client ID entry may be served at all.
+
+    Two fences, because this route is deliberately sessionless — asking for a
+    session would be circular, since the client ID is what makes logging in
+    possible. It exists only while there is nothing configured to protect, and
+    only on loopback, where the person reaching it is the person at the keyboard.
+    A hosted deployment sets EVE_CLIENT_ID in its environment instead.
+    """
+    from app.auth.token_store import get_client_id
+    if not security.host_is_loopback(request.headers.get("host")):
+        return False
+    return get_client_id() is None
+
+
+@app.get("/setup/client-id", response_class=HTMLResponse)
+async def setup_client_id_page(request: Request, error: str = ""):
+    from app.auth.esi_oauth import callback_url, SCOPES
+    if not _first_run_setup_available(request):
+        # 404 rather than a redirect: once a client ID exists this route is not
+        # "forbidden", it has nothing left to do, and saying so invites probing.
+        return PlainTextResponse("Not found", status_code=404)
+    return _tr("setup_client_id.html", request, {
+        "callback_url": callback_url(),
+        "scopes": SCOPES.split() if isinstance(SCOPES, str) else list(SCOPES),
+        "error": error,
+    })
+
+
+@app.post("/setup/client-id")
+async def setup_client_id_save(request: Request):
+    from app.auth.token_store import save_client_id
+    if not _first_run_setup_available(request):
+        return PlainTextResponse("Not found", status_code=404)
+    # Public paths skip the gate's CSRF check, so Origin is the guard here.
+    if not security.origin_is_allowed(request.headers.get("origin")):
+        return PlainTextResponse("Cross-site request rejected", status_code=400)
+
+    form = await request.form()
+    client_id = str(form.get("client_id") or "").strip()
+    if not client_id:
+        return RedirectResponse("/setup/client-id?error=Enter+the+Client+ID+from+your+EVE+application.",
+                                status_code=303)
+    if not _PLAUSIBLE_CLIENT_ID.fullmatch(client_id):
+        # A wrong-shaped value fails much later, at CCP, with a message that does
+        # not mention this form — so reject the obvious mistakes (a pasted URL, a
+        # secret key, stray whitespace) while the user is still looking at it.
+        return RedirectResponse(
+            "/setup/client-id?error=That+does+not+look+like+a+Client+ID:+expect+about+32+"
+            "letters+and+digits,+with+no+spaces+or+punctuation.", status_code=303)
+
+    save_client_id(client_id)
+    return RedirectResponse("/auth/login", status_code=303)
 
 
 @app.get("/setup/download")
@@ -1139,10 +1213,17 @@ async def auth_login(request: Request):
         # No client ID, and the callback is not localhost — so this deployment has
         # not registered its own EVE application. Starting the flow anyway would
         # fail at the token exchange with a far less obvious message.
+        # On localhost the fix is a form, not a restart — send them straight to it.
+        if _first_run_setup_available(request):
+            return RedirectResponse("/setup/client-id", status_code=303)
         return _tr("auth_failed.html", request, {
-            "reason": "This deployment has no EVE application configured. Register "
-                      f"one with the callback URL {callback_url()} and set "
-                      "EVE_CLIENT_ID to its client ID.",
+            "reason": "This deployment has no EVE application configured.",
+            # Drives the recovery steps in the template. The Settings button is
+            # hidden in this state on purpose: /settings needs a session, a
+            # session needs SSO, and SSO is the thing that cannot start — so the
+            # button silently round-trips back to this page and reads as broken.
+            "unconfigured": True,
+            "callback_url": callback_url(),
         })
     return RedirectResponse(url, status_code=303)
 
@@ -1157,6 +1238,18 @@ async def auth_callback(request: Request, code: str | None = None,
     state this server issued and has not already spent, or there is no PKCE
     verifier to exchange with and the flow stops here.
     """
+    # Snapshot who was already trusted, BEFORE the exchange. complete_login()
+    # stores the character as part of completing it, so afterwards there is no
+    # way to tell a first-time arrival from a re-authentication of someone
+    # already added — and that difference decides whether a refusal is allowed
+    # to delete the row. Getting it wrong would destroy a known alt whose owner's
+    # session merely expired during the round trip to EVE.
+    conn = get_conn()
+    try:
+        known_before = {cid for cid, _name in list_characters(conn)}
+    finally:
+        conn.close()
+
     try:
         character_id, character_name = complete_login(code, state)
     except LoginError as exc:
@@ -1165,9 +1258,31 @@ async def auth_callback(request: Request, code: str | None = None,
     conn = get_conn()
     try:
         if not security.may_sign_in(conn, character_id):
+            # Not necessarily a failure. "Add Character" and "Log In" are the same
+            # link, so intent is not recorded anywhere — but complete_login() has
+            # already stored this character's tokens, which means the *character*
+            # is added and only the *session* is being refused. An owner who is
+            # signed in and adding an alt is the ordinary case, and telling them
+            # "Login failed. Nothing was changed." is wrong twice over: nothing
+            # failed, and something did change. Whoever already holds a session is
+            # the owner doing exactly that; a stranger who found the URL does not.
+            if security.load_session(conn, request.cookies.get(security.SESSION_COOKIE)):
+                print(f"[auth] added character {character_id} ({character_name}) "
+                      f"to the instance owned by {security.get_owner_id(conn)}", flush=True)
+                return RedirectResponse("/auth/sync", status_code=303)
             owner = security.get_owner_id(conn)
             print(f"[auth] refused session for character {character_id}: this "
                   f"instance belongs to {owner}", flush=True)
+            # Refused, and nobody here vouched for them — so do not keep the
+            # refresh token complete_login() just wrote. Holding a stranger's ESI
+            # credential, obtained because they found the URL, is custody without
+            # consent, policy or a revocation path (§13 R4). Only a character this
+            # login created is removed: one that was already known is a re-auth by
+            # someone previously added, and deleting it would lose real data.
+            if character_id not in known_before:
+                delete_character(conn, character_id)
+                print(f"[auth] discarded the tokens just stored for uninvited "
+                      f"character {character_id}", flush=True)
             return _tr("auth_failed.html", request, {
                 "reason": f"{character_name} is not the owner of this instance.",
             })
@@ -1396,9 +1511,11 @@ async def settings_page(request: Request):
                       if d.name.endswith("Decryptor")]
     finally:
         conn.close()
+    from app.market.prices import TRADE_HUBS
     return _tr("settings.html", request, {
         "client_id": get_client_id() or "",
         "callback_url": callback_url(),
+        "trade_hubs": TRADE_HUBS,
         "scopes": SCOPES,
         "defaults": defaults,
         "station_options": station_options,
@@ -2247,6 +2364,13 @@ async def plan_result(
             finally:
                 probe.close()
 
+        # Invention: a T2 item needs an invented BPC, and until v0.9.29 this page
+        # charged nothing for it — not on nested components and not even on the
+        # product itself, since only the margin tracker ever called that code.
+        # Same builder the tracker uses, so the two pages price datacores alike.
+        inv_params, inv_warnings = build_invention_params(
+            conn, app_defaults.get_defaults(conn), input_basis)
+
         # Pass 2 — the real resolve, with the splits applied. ME rounds once per
         # job, so the splits reach the material totals here and in build_plan
         # below; both resolutions must use them or the two views disagree.
@@ -2254,7 +2378,8 @@ async def plan_result(
         # looked up for each intermediate step (Capital Armor Plates ME may differ from root ME).
         resolver = BOMResolver(DB_ABS, blueprints=blueprints, runs_per_job=rpj_int,
                                adjusted_prices=adj_prices, rate_mfg=rate_mfg, rate_rxn=rate_rxn,
-                               runs_per_job_by_product=_job_splits)
+                               runs_per_job_by_product=_job_splits,
+                               invention=inv_params)
         root = resolver.resolve(type_id, qty, me=me,
                                 mfg_facility=mfg_facility,
                                 rxn_facility=rxn_facility)
@@ -2287,7 +2412,9 @@ async def plan_result(
             # BOM resolutions of the same product).
             me_override=me,
             te_override=te,
+            invention=inv_params,
         )
+        plan.invention_unpriced = inv_warnings + plan.invention_unpriced
         plan_data = _plan_to_dict(plan, prices, type_name, conn=conn, input_basis=input_basis)
         # Override ME/TE in plan_data if entered manually
         if plan_data.get("blueprint"):
@@ -3135,6 +3262,14 @@ def _plan_to_dict(plan, prices, type_name: str, conn: sqlite3.Connection | None 
         "sell_price": sell_p,
         "revenue": revenue,
         "profit": profit,
+        # Expected cost of the invented blueprints in this tree. Deliberately NOT
+        # folded into total_buy or profit: total_buy is the shopping list (what
+        # you still have to acquire) and `profit` above already excludes job fees
+        # for the same reason. Folding invention in alone would make that line
+        # inconsistent in a new way instead of fixing it — see the note in §8 of
+        # the design doc.
+        "invention_cost": plan.invention_cost,
+        "invention_unpriced": plan.invention_unpriced,
     }
 
 
@@ -4923,7 +5058,6 @@ async def suggest(request: Request, q: str = ""):
 
 async def _bg_fetch_prices(type_ids: list[int]) -> None:
     """Fire-and-forget: fetch Jita prices for the given type_ids using a fresh connection."""
-    import httpx as _httpx
     from app.market.prices import fetch_jita_prices_bulk as _bulk
     conn = get_conn()
     try:
@@ -6668,6 +6802,29 @@ async def planets_page(request: Request):
         "total_extractors": total_extractors, "expiring_soon": expiring_soon,
         "needs_relogin": needs_relogin,
     })
+
+
+@app.get("/reactions", response_class=HTMLResponse)
+async def reactions_page(request: Request, sort: str = "", dir: str = "",
+                         group: str = ""):
+    """Reactions board — the whole reaction space, priced and ranked.
+
+    Cache-only like /margins, so a full board costs no ESI calls. Unlike the
+    margin tracker there is no watchlist and no snapshot history: the space is
+    119 products and pricing all of them measured well under a second, so the
+    page just recomputes rather than storing what it last thought.
+    """
+    conn = get_conn()
+    try:
+        view = reactions_helper.build_board(
+            conn, DB_ABS,
+            sort=sort or reactions_helper.DEFAULT_SORT,
+            direction=dir or reactions_helper.DEFAULT_DIR,
+            group=group,
+        )
+    finally:
+        conn.close()
+    return _tr("reactions.html", request, view)
 
 
 @app.get("/margins", response_class=HTMLResponse)

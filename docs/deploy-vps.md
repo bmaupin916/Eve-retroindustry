@@ -24,8 +24,16 @@ EVE compares the `redirect_uri` against your application's registration **as an
 exact string**, and an application has **one** registered URI. The consequence
 is worth stating plainly: **the client ID owns the callback URL.** You cannot
 share an application with another deployment, and this repository does not ship
-one you can borrow — a fallback client ID exists for `localhost` development
-only, and the app refuses to start a login without a configured one otherwise.
+one you can borrow. There is no `localhost` fallback either — there was until
+v0.9.29, but the bundled application's registered URI still pointed at the
+retired `:5173` listener, so it could not complete a login from anywhere.
+
+On **localhost**, an unconfigured install now sends you to `/setup/client-id`, a
+first-run form that walks through registering the application and stores the ID
+for you. That page is deliberately unavailable here: it is sessionless by
+necessity, and an endpoint that skips authentication and writes configuration has
+no place on a public host. **A server deployment sets `EVE_CLIENT_ID` in its
+environment**, and gets a page naming that variable if it is missing.
 
 So every deployment registers its own application:
 
@@ -38,6 +46,12 @@ So every deployment registers its own application:
    is PKCE.
 
 Moving an existing deployment is therefore a cutover rather than an addition.
+
+**And it invalidates every character you have already added.** A refresh token is
+bound to the application that issued it, so once `EVE_CLIENT_ID` changes, every
+stored refresh token stops working — refreshing one against a different client ID
+is rejected. Expect to re-add each character through SSO after the switch. This is
+OAuth behaving correctly, not a bug, and there is no migration for it.
 
 Between changing the registration and the app running at the new address, SSO
 login will not work. That is expected, and it is what `python -m app.web.bootstrap`

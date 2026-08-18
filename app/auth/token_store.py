@@ -42,6 +42,9 @@ TOKEN_ENDPOINT = "https://login.eveonline.com/v2/oauth/token"
 # to a consent screen naming somebody else's application and then fail the token
 # exchange against a callback it does not control. Anyone deploying a copy
 # registers their own application and sets EVE_CLIENT_ID.
+#
+# Retired in v0.9.29 — see get_client_id(). Kept only so the test that pinned the
+# old fallback can assert it is no longer handed out.
 _DEV_CLIENT_ID = "50cc73daf13d4109a06821c143cb5ca4"
 
 # Per-character refresh locks. EVE rotates the refresh token on every use, so two
@@ -119,9 +122,15 @@ def get_client_id() -> str | None:
     if saved:
         return saved
 
-    from app.auth.esi_oauth import callback_url
-    if urlparse(callback_url()).hostname in ("localhost", "127.0.0.1", "::1"):
-        return _DEV_CLIENT_ID
+    # There used to be a localhost fallback to _DEV_CLIENT_ID here. v0.9.28 moved
+    # the callback from the throwaway :5173 listener onto this app at
+    # :8000/callback, and an EVE application has exactly ONE registered redirect
+    # URI — so the bundled application, whose URI is the old one and which nobody
+    # deploying a copy can edit, has been unable to complete a login ever since.
+    # Keeping it turned a missing client ID into CCP's "The redirect URL does not
+    # match any of the configured values for this client", which names neither the
+    # cause nor the fix. Returning None instead reaches the message in
+    # /auth/login, which quotes the exact callback URL to register.
     return None
 
 

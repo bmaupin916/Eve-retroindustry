@@ -45,8 +45,8 @@ A self-hosted industry service for EVE Online — blueprint cost analysis, bill 
 
 - **Contracts** — browse your own **personal + corporation** contracts, plus a **public contract browser**: index a whole region once, then search it locally by item, type, or price (ESI exposes no contract search, so the region is fully indexed into a local cache). Public contract prices can be pulled straight into the Production Planner for a side-by-side profit comparison against market prices
 - **Wallet** — personal and corporation wallet balances
-- **In-app updates** — check for new releases and apply them without leaving the app
-- **System tray** — runs in the system tray; right-click for **Open App** and **Quit**
+- **Margin Tracker** — a watchlist of build margins, priced entirely from cache, with a daily snapshot behind the change and 7-day-average columns. Every figure is net of the install fee, of invention (datacores, decryptor and the failed attempts, amortised over the invented BPC's runs), and of what it costs to sell — sales tax always, broker's fee only when you list an order
+- **Reactions Board** — every published reaction priced and ranked in one page, *including the ones losing money*, which a watchlist structurally cannot show you. Costed on direct inputs at market; rows with an unpriced input or no real bid are demoted and labelled rather than allowed to top the ranking. Filtering to **Composites** switches to a two-model layout — buy the intermediates versus build them from raw — with the Build Advantage between them, export freight, and ISK per slot-hour over a 7-day window
 
 ![Assets — inventory across all characters and corporation hangars](docs/screenshots/assets.png)
 
@@ -87,12 +87,21 @@ Run the dev server:
 uvicorn app.web.main:app --reload --port 8000
 ```
 
-Open [http://localhost:8000](http://localhost:8000). You will be sent to EVE SSO
-and back to `/callback`, which is where the session cookie is set — so the
-callback URL registered for your application at
+Open [http://localhost:8000](http://localhost:8000). On a fresh install you land on a
+one-time setup page that walks through registering your own EVE application and stores
+the Client ID for you — there is no bundled one to borrow, because an application has
+exactly one registered callback URL and so cannot be shared between deployments.
+
+That page is offered on **localhost only**, and only until it is done. A server
+deployment sets `EVE_CLIENT_ID` in its environment instead; see
+[docs/deploy-vps.md](docs/deploy-vps.md).
+
+After setup you are sent to EVE SSO and back to `/callback`, which is where the session
+cookie is set — so the callback URL registered at
 [developers.eveonline.com](https://developers.eveonline.com/) has to be exactly
 `http://localhost:8000/callback`, or set `EVE_CALLBACK_URL` to whatever you did
-register.
+register. **The first character to log in claims the instance**; other characters can be
+added and their data synced, but only the owner holds a session.
 
 If you cannot log in at all — usually because that registration does not match
 yet — mint a session directly:
@@ -156,14 +165,6 @@ would get complete financial and asset intelligence, but could not move ISK,
 assets or jobs. Tokens are not yet encrypted at rest.
 
 Static data is fetched once and kept locally — item icons and portraits, station/planet names, jump distances, and market history (revalidated with ETags, so unchanged data costs no download). Bootstrap and its icon font are bundled, not loaded from a CDN, so the interface renders without a network connection.
-
----
-
-## Support
-
-I develop this in my spare time, primarily for my own EVE career, and share it publicly as-is. If it saves you ISK or time and you'd like to support continued development, you can buy me a coffee — entirely optional, and much appreciated:
-
-[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/retrovisor)
 
 ---
 

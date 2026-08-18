@@ -60,3 +60,14 @@ docs/reference/
 .env
 .env.*
 !.env.example
+
+# Per-deployment configuration. Holds this install's EVE application Client ID,
+# which is a property of *your* registration — committing it would hand every
+# clone a callback URL it does not control. Set EVE_CLIENT_ID instead on a
+# server; the first-run setup page writes this file on localhost.
+.eve_config.json
+
+# Database backups. `*.db` above does not match these, because the timestamp or
+# reason lands after the extension.
+*.db.bak*
+eve_cache.db.bak-*
