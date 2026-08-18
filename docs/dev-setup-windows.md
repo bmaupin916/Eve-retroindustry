@@ -77,8 +77,8 @@ python web.py
 
 Uvicorn starts on `127.0.0.1:8000` with auto-reload. Open **http://localhost:8000**.
 
-The first request populates `eve_cache.db` from the bundled SDE — the app redirects to `/setup` until
-that finishes, which takes a few seconds.
+Every page redirects to `/setup` until you have imported static data — the app no longer copies a
+prebuilt SDE into place. `/setup` tells you the command to run.
 
 Equivalent, if you prefer the explicit form:
 
@@ -136,9 +136,11 @@ All written next to the repo root in dev mode, or into `EVE_APP_DIR` when it is 
 | `.eve_config.json` | SSO client ID |
 | `icon_cache/` | Item icons, portraits and corp logos |
 
-They're all in `.gitignore`. Deleting `eve_cache.db` resets the app to a first-run state — it will
-rebuild from `sde_base.db` and you'll need to log in again. That also drops your session and the
-owner claim, so the first character to log in afterwards takes the instance.
+They're all in `.gitignore`. Deleting `eve_cache.db` resets the app to a first-run state: the schema
+is rebuilt by the baseline migration, but the static data is **not** — re-run `import_sde.py`, or
+point it at an archive already under `data/sde-archives/` with `--zip`, which takes seconds. You'll
+need to log in again, and that drops the owner claim, so the first character to log in afterwards
+takes the instance.
 
 ## Next time
 
