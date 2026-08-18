@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<paths>
-    <!-- The update APK is downloaded here; FileProvider turns it into a content:// URI. -->
-    <external-files-path name="updates" path="updates/" />
-</paths>

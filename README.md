@@ -1,10 +1,16 @@
 # EVE Retroindustry
 
-A local industry calculator for EVE Online. Runs as a web app on your machine — blueprint cost analysis, bill of materials expansion, Jita market pricing, asset tracking, contract browsing, planetary interaction timers, and production project management. Multi-character support: load all your alts and switch between them per page.
+A self-hosted industry service for EVE Online — blueprint cost analysis, bill of materials expansion, Jita market pricing, asset tracking, contract browsing, planetary interaction timers, and production project management. Multi-character support: load all your alts and switch between them per page.
 
 > **Note on the project.** I build this primarily for my own EVE career — features land when I need them, and priorities follow whatever I'm doing in-game. It's shared publicly as-is: if you find it useful, you're welcome to use it. There's no support commitment or roadmap promise, but bug reports and ideas are welcome via [Issues](https://github.com/EVERetroIndustry/Eve-retroindustry/issues).
 
-**[⬇ Downloads and screenshots → everetroindustry.github.io](https://everetroindustry.github.io)**
+> **The desktop app is retired.** Versions up to v0.9.26 shipped as a Windows
+> installer, a Linux AppImage and an experimental APK. Those are gone: there is
+> no installer, no bundled browser, no in-app updater. It is a web service you
+> run yourself, behind your own TLS, reachable from any of your machines.
+> Released desktop builds keep working but receive no updates.
+
+**[Screenshots → everetroindustry.github.io](https://everetroindustry.github.io)**
 
 ![Dashboard — multi-character overview](docs/screenshots/dashboard.png)
 
@@ -46,45 +52,15 @@ A local industry calculator for EVE Online. Runs as a web app on your machine �
 
 ---
 
-## Installation
+## Running it
 
-### Windows
+It runs as one process behind nginx. See **[docs/deploy-vps.md](docs/deploy-vps.md)**
+for the full walkthrough — service user, systemd unit, TLS, and the one step that
+catches everyone: EVE compares the callback URL against your application
+registration as an exact string, and an application has only one, so moving the
+app is a cutover rather than an addition.
 
-Two Windows downloads in every [**release**](https://github.com/EVERetroIndustry/Eve-retroindustry/releases/latest):
-
-| Asset | What it is |
-|---|---|
-| `…-win64-setup.zip` | **Installer.** Extract it and run the `setup.exe` inside |
-| `…-win64-portable.zip` | **Portable.** Extract anywhere and run `EVE_Retroindustry.exe` |
-
-The installer sets the app up **per user** (into `%LOCALAPPDATA%\Programs`), so there's **no admin prompt**, it adds Start Menu (and optionally desktop) shortcuts, and it appears in *Apps & features* with a proper uninstaller. Re-running a newer installer upgrades in place; in-app updates keep working too. Uninstalling leaves your characters, prices and projects alone — they live outside the install directory.
-
-**Requires Windows 10 (1809) or newer** — the bundled Qt/Chromium runtime doesn't support Windows 7/8.1. The installer checks this and tells you rather than failing at launch.
-
-### Linux
-
-1. Download the latest release from [**Releases**](https://github.com/EVERetroIndustry/Eve-retroindustry/releases/latest)
-2. Extract the `-linux-portable.zip` anywhere, or use the single-file `.AppImage`
-3. Run `EVE_Retroindustry`
-
-### First run (both platforms)
-
-1. On first launch the app downloads ~5 MB of game data automatically
-2. Open the system tray icon → **Open App**, then click **Log In** in the top right and authenticate with your EVE character. Add more alts by clicking **+ Add Character** in the character dropdown.
-
-No Python and no dependencies to install.
-
-> **Note:** the app is unsigned, so Windows SmartScreen may warn you the first time you run it — click *More info → Run anyway*. Nothing hides this short of a code-signing certificate, which isn't practical for a hobby project; the releases publish SHA256 checksums so you can verify what you downloaded.
-
-### Android (experimental)
-
-An `EveRetroindustry.apk` is published with each release. It runs the full app on-device (a bundled Python server behind a native WebView). It's **arm64 only** and must be sideloaded:
-
-1. Download `EveRetroindustry.apk` from the [latest release](https://github.com/EVERetroIndustry/Eve-retroindustry/releases/latest)
-2. Allow installation from unknown sources and install it manually
-3. Later updates can be applied from inside the app (**About → Check for updates**)
-
-This build is experimental — treat it as a work in progress rather than a polished release.
+Locally, for development, see below.
 
 ---
 
@@ -111,34 +87,34 @@ Run the dev server:
 uvicorn app.web.main:app --reload --port 8000
 ```
 
-Open [http://localhost:8000](http://localhost:8000).
+Open [http://localhost:8000](http://localhost:8000). You will be sent to EVE SSO
+and back to `/callback`, which is where the session cookie is set — so the
+callback URL registered for your application at
+[developers.eveonline.com](https://developers.eveonline.com/) has to be exactly
+`http://localhost:8000/callback`, or set `EVE_CALLBACK_URL` to whatever you did
+register.
+
+If you cannot log in at all — usually because that registration does not match
+yet — mint a session directly:
+
+```bash
+python -m app.web.bootstrap
+```
+
+It prints a single-use link valid for ten minutes.
 
 ---
 
-## Building a Release
+## Releasing
 
-Releases are built automatically by GitHub Actions when a version tag is pushed:
+There are no build artifacts. Deploying is `git pull`, `pip install -r
+requirements.txt` and a service restart — see
+[docs/deploy-vps.md](docs/deploy-vps.md).
+
+Version tags are still cut for the changelog and to mark what is deployed:
 
 ```bash
 git tag v0.x.y && git push origin v0.x.y
-```
-
-The workflow builds Windows, Linux and Android binaries and creates a GitHub Release with:
-
-- `EVE_Retroindustry-vX.Y.Z-win64-setup.zip` (Windows installer, per-user)
-- `EVE_Retroindustry-vX.Y.Z-win64-portable.zip` (Windows portable)
-- `EVE_Retroindustry-vX.Y.Z-linux-portable.zip` + `EVE_Retroindustry-vX.Y.Z-linux.AppImage`
-- `EveRetroindustry.apk` (Android, arm64 sideload)
-- `sde_base.db` (game data, downloaded by the app on first run)
-- `version.json` (used by the in-app updater)
-
-The Android `versionCode` is derived from the tag (e.g. `v0.8.33` → `833`), and the APK is signed with a release key stored in GitHub Secrets — so releases can be cut from any machine.
-
-To build locally:
-
-```bash
-python scripts/build_sde_base.py
-pyinstaller eve_retroindustry.spec --noconfirm
 ```
 
 ---
@@ -152,25 +128,32 @@ pyinstaller eve_retroindustry.spec --noconfirm
 | Database | SQLite via sqlite3 |
 | EVE API | ESI (esi.evetech.net) |
 | HTTP client | httpx (async) |
-| Tray icon | pystray + Pillow |
-| Desktop shell | pywebview (PyQt6 / QtWebEngine) |
-| Packaging | PyInstaller (onedir) |
-| Android | Chaquopy (on-device CPython) + native WebView |
+| Auth | EVE SSO (OAuth2 PKCE), JWKS-verified tokens, DB-backed sessions |
+| Deployment | nginx + TLS, systemd |
 
 ---
 
 ## Data & Privacy
 
-All data is stored locally on your machine in:
+The desktop app could promise that nothing left your machine. A hosted service
+cannot make that claim, and this README used to lead with it, so here is the
+accurate version: **your data lives on whatever server you deploy this to.**
+Self-hosted, that is a machine you control; it is not the same promise.
 
 | File | Contents |
 |---|---|
 | `eve_cache.db` | Blueprints, assets, prices, projects, OAuth tokens for all characters |
 | `.eve_config.json` | EVE SSO client ID only |
-| `eve_retroindustry.log` | Application log (frozen builds only) |
 | `icon_cache/` | Item icons, portraits and logos, downloaded once from the EVE image server |
 
-Nothing is sent to any third-party server other than the official EVE Online ESI API (`esi.evetech.net`) and the EVE SSO login server (`login.eveonline.com`).
+Nothing is sent anywhere other than the official EVE Online ESI API
+(`esi.evetech.net`), the EVE SSO login server (`login.eveonline.com`) and CCP's
+SDE feed (`developers.eveonline.com`).
+
+The database holds every character's refresh token. The app restricts it to the
+owning user, and all 24 requested scopes are read-only — someone who obtained it
+would get complete financial and asset intelligence, but could not move ISK,
+assets or jobs. Tokens are not yet encrypted at rest.
 
 Static data is fetched once and kept locally — item icons and portraits, station/planet names, jump distances, and market history (revalidated with ETags, so unchanged data costs no download). Bootstrap and its icon font are bundled, not loaded from a CDN, so the interface renders without a network connection.
 

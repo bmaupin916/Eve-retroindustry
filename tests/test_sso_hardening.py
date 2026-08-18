@@ -8,10 +8,8 @@ hermetic.
 from __future__ import annotations
 
 import json
-import socket
-import threading
 import time
-import urllib.request
+import urllib.parse
 
 import jwt
 import pytest
@@ -259,106 +257,101 @@ def test_an_unexpected_subject_is_named_as_such(sub):
 
 
 # --- Findings 4 and 8: the state parameter is checked ------------------------
+#
+# The check is no longer a comparison of two strings. A login in flight is stored
+# as state -> PKCE verifier, and the callback redeems it: a state we did not
+# issue has no verifier behind it, so the exchange cannot even be attempted.
+# Same requirement, expressed as a lookup rather than an `if`.
 
-def test_matching_state_passes():
-    assert esi_oauth._check_state("abc123", "abc123") is True
-
-
-def test_mismatched_state_is_rejected():
-    assert esi_oauth._check_state("abc123", "different") is False
-
-
-def test_missing_state_is_rejected():
-    assert esi_oauth._check_state("abc123", None) is False
-    assert esi_oauth._check_state("abc123", "") is False
-
-
-# --- Finding 3: the callback listens on loopback only ------------------------
-
-@pytest.fixture
-def callback_port(monkeypatch):
-    """Bind the callback group on a free port instead of the real 5173."""
-    probe = socket.socket()
-    probe.bind(("127.0.0.1", 0))
-    port = probe.getsockname()[1]
-    probe.close()
-    monkeypatch.setattr(esi_oauth, "CALLBACK_PORT", port)
-    return port
+@pytest.fixture(autouse=True)
+def clean_pending():
+    esi_oauth.reset_pending()
+    yield
+    esi_oauth.reset_pending()
 
 
-def test_callback_binds_loopback_only(callback_port):
-    group = esi_oauth._make_callback_server()
-    try:
-        hosts = {addr[0] for addr in group.addresses}
-        assert hosts, "no callback socket bound at all"
-        assert hosts <= {"127.0.0.1", "::1"}, f"callback is listening on {hosts}"
-        # The regression this guards: ("::", port) with IPV6_V6ONLY cleared put
-        # the callback on every interface, public IP included.
-        assert "::" not in hosts and "0.0.0.0" not in hosts
-    finally:
-        group.server_close()
+def test_a_state_we_issued_redeems_once():
+    esi_oauth._remember_pending("state-a", "verifier-a")
+    assert esi_oauth._take_pending("state-a") == "verifier-a"
+    assert esi_oauth._take_pending("state-a") is None, "a state must not be reusable"
 
 
-def test_callback_is_reachable_over_both_loopback_families(callback_port):
-    """The reason two sockets exist: "localhost" resolves to either family.
+def test_a_state_we_never_issued_has_nothing_behind_it():
+    assert esi_oauth._take_pending("made-up") is None
 
-    A single socket bound to ``::1`` refuses IPv4 even with IPV6_V6ONLY off, so
-    this is the test that would have caught that mistake.
+
+def test_a_missing_state_is_rejected():
+    assert esi_oauth._take_pending(None) is None
+    assert esi_oauth._take_pending("") is None
+
+
+def test_a_stale_state_is_rejected(monkeypatch):
+    esi_oauth._remember_pending("state-b", "verifier-b")
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(esi_oauth.time, "monotonic",
+                        lambda: real_monotonic() + esi_oauth._PENDING_TTL + 1)
+    assert esi_oauth._take_pending("state-b") is None
+
+
+def test_completing_a_login_with_a_foreign_state_never_reaches_the_token_endpoint(monkeypatch):
+    """The state check must happen before we talk to CCP, not after."""
+    import httpx
+
+    def _boom(*a, **k):
+        raise AssertionError("token endpoint contacted despite an unknown state")
+
+    monkeypatch.setattr(httpx, "post", _boom)
+    with pytest.raises(esi_oauth.LoginError):
+        esi_oauth.complete_login("some-code", "a-state-we-did-not-issue")
+
+
+def test_concurrent_logins_do_not_invalidate_each_other():
+    """The old flow held one global lock, so a second login had to wait it out."""
+    esi_oauth._remember_pending("s1", "v1")
+    esi_oauth._remember_pending("s2", "v2")
+    assert esi_oauth._take_pending("s2") == "v2"
+    assert esi_oauth._take_pending("s1") == "v1"
+
+
+def test_pending_logins_are_bounded():
+    """/auth/login is reachable without a session, so this is attacker-allocated."""
+    for i in range(esi_oauth._PENDING_MAX * 3):
+        esi_oauth._remember_pending(f"state-{i}", f"verifier-{i}")
+    assert esi_oauth.pending_count() <= esi_oauth._PENDING_MAX
+
+
+# --- Finding 3: the callback is a route, not a second listener ---------------
+
+def test_no_local_callback_server_remains():
+    """The loopback sockets are gone; EVE redirects to /callback on this app.
+
+    Finding 3 was that the callback bound every interface. The fix that survived
+    is structural: there is no separate listener left to bind anything.
     """
-    families = {addr[0] for addr in esi_oauth._make_callback_server().addresses}
-    if families != {"127.0.0.1", "::1"}:
-        pytest.skip(f"only {families} available on this machine")
-
-    for host in ("127.0.0.1", "[::1]"):
-        esi_oauth._CallbackHandler.code = None
-        esi_oauth._CallbackHandler.state = None
-        group = esi_oauth._make_callback_server()
-        esi_oauth._active_server = group
-        result: list = []
-
-        def _serve():
-            try:
-                group.serve_forever(poll_interval=0.05)
-            finally:
-                result.append((esi_oauth._CallbackHandler.code,
-                               esi_oauth._CallbackHandler.state))
-
-        t = threading.Thread(target=_serve, daemon=True)
-        t.start()
-        time.sleep(0.2)
-        try:
-            urllib.request.urlopen(
-                f"http://{host}:{callback_port}/callback?code=CODE-{host}&state=STATE",
-                timeout=5,
-            ).read()
-            t.join(timeout=5)
-            assert result and result[0] == (f"CODE-{host}", "STATE"), \
-                f"callback over {host} did not reach the handler"
-        finally:
-            group.shutdown()
-            group.server_close()
-            esi_oauth._active_server = None
+    for gone in ("_make_callback_server", "_CallbackHandler", "_CallbackServerGroup",
+                 "_LoopbackServer", "_wait_for_callback", "cancel_web_login"):
+        assert not hasattr(esi_oauth, gone), f"{gone} should have been removed"
 
 
-def test_one_callback_shuts_down_every_listener(callback_port):
-    """The sibling socket must not keep holding the login open."""
-    families = {addr[0] for addr in esi_oauth._make_callback_server().addresses}
-    if families != {"127.0.0.1", "::1"}:
-        pytest.skip(f"only {families} available on this machine")
+def test_the_callback_url_is_configuration(monkeypatch):
+    monkeypatch.delenv("EVE_CALLBACK_URL", raising=False)
+    assert esi_oauth.callback_url() == esi_oauth.DEFAULT_CALLBACK_URL
+    monkeypatch.setenv("EVE_CALLBACK_URL", "https://industry.example.com/callback")
+    assert esi_oauth.callback_url() == "https://industry.example.com/callback"
 
-    esi_oauth._CallbackHandler.code = None
-    group = esi_oauth._make_callback_server()
-    esi_oauth._active_server = group
-    t = threading.Thread(target=lambda: group.serve_forever(poll_interval=0.05), daemon=True)
-    t.start()
-    time.sleep(0.2)
-    try:
-        urllib.request.urlopen(
-            f"http://127.0.0.1:{callback_port}/callback?code=C&state=S", timeout=5
-        ).read()
-        t.join(timeout=5)
-        assert not t.is_alive(), "a listener stayed up after the callback arrived"
-    finally:
-        group.shutdown()
-        group.server_close()
-        esi_oauth._active_server = None
+
+def test_the_auth_url_carries_the_configured_callback(monkeypatch):
+    monkeypatch.setenv("EVE_CALLBACK_URL", "https://industry.example.com/callback")
+    monkeypatch.setattr(sso_metadata, "_fetch", lambda: {
+        "authorization_endpoint": "https://login.test/authorize",
+        "token_endpoint": "https://login.test/token",
+        "jwks_uri": "https://login.test/jwks",
+    })
+    sso_metadata.reset_cache()
+
+    url = esi_oauth.begin_login()
+    assert url is not None
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert q["redirect_uri"] == ["https://industry.example.com/callback"]
+    assert q["code_challenge_method"] == ["S256"]
+    assert q["state"] and len(q["state"][0]) >= 20

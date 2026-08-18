@@ -78,19 +78,6 @@ def test_security_multiplier():
 
 
 # ── external-link allowlist ──────────────────────────────────────────────────
-def test_external_host_allowed(app_module):
-    f = app_module._external_host_allowed
-    assert f("https://github.com/x")
-    assert f("https://api.github.com/x")           # subdomain of allowed host
-    assert f("https://esi.evetech.net/latest")
-    assert f("https://ko-fi.com/retrovisor")
-    assert not f("https://evil.example.com")
-    assert not f("https://github.com.attacker.com")  # not a real subdomain
-    assert not f("file:///etc/passwd")
-    assert not f("javascript:alert(1)")
-
-
-# ── best public-contract price (single vs bundle) ────────────────────────────
 def _contracts_db():
     from app.web import contracts_helper
     conn = sqlite3.connect(":memory:")
@@ -107,7 +94,6 @@ def _add_contract(conn, cid, price, items):
             "INSERT INTO public_contract_items (contract_id, type_id, quantity, is_included) "
             "VALUES (?,?,?,?)", (cid, type_id, qty, incl))
     conn.commit()
-
 
 def test_best_contract_price_prefers_single():
     conn, helper = _contracts_db()

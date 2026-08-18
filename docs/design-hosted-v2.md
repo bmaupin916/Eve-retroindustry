@@ -1159,7 +1159,7 @@ of this work), each mapped to the step that retires it:
 | # | Worry | Retired in |
 |---|---|---|
 | W1 | No authentication of any kind; the deploy doc itself warns of it | **Step 2 — done, v0.9.27** |
-| W2 | CSRF / DNS-rebinding exposure; `/api/version/apply` executes a downloaded script | Steps 2–3 |
+| W2 | CSRF / DNS-rebinding exposure; `/api/version/apply` executes a downloaded script | **Done — CSRF and Host checks v0.9.27; the endpoint deleted v0.9.28** |
 | W3 | OAuth callback binds all interfaces; `state` generated but never validated | **Step 2 — done, v0.9.27** |
 | W4 | Refresh tokens plaintext; no file permissions on `eve_cache.db` | Permissions **done, v0.9.27**; encryption at rest still Step 5 |
 | W5 | Full tracebacks returned to clients on 500 | **Step 2 — done, v0.9.27** |
@@ -1248,10 +1248,40 @@ Recorded rather than closed: **owner-on-first-login is trust-on-first-use.** Wit
 fine on a laptop, a real if narrow window between deploying and first login. Step 3 should
 set that variable as part of deploying. *(W1–W5)*
 
-**Step 3 — Go hosted, single-user.** Strip the desktop shell (launcher, tray, updater and
-`/api/version/*`, PyInstaller/installer/APK pipeline). Deploy on the VPS behind nginx +
-TLS with the real SSO callback at `https://<domain>/callback`. Desktop dies here; daily
-use moves to the hosted instance. *(W2's worst endpoint deleted rather than defended)*
+**Step 3 — Go hosted, single-user. Code done — v0.9.28; deployment outstanding.**
+Everything that could be done without the VPS is done; DNS, certificates and the callback
+registration are the remaining work and they are elapsed time rather than coding time.
+
+Deleted: `launcher.py`, `login.py`, the PyInstaller spec, the Inno Setup installer, both
+build scripts, `android-poc/`, the release and Android CI workflows, the in-app updater and
+its three `/api/version/*` endpoints, the tray and webview stack from `requirements.txt`,
+and the server-side "open this in your system browser" opener with its host allowlist.
+`main.py` lost ~270 lines; `esi_oauth.py` went from 626 to 260.
+
+**The callback stopped being a second server.** The local listener on port 5173 existed
+because a desktop app has nowhere to receive a redirect. `GET /callback` is now a route on
+the app, which deletes the two loopback sockets Step 2 had just carefully built, the
+15-minute watchdog, the cancel endpoint, the waiting page and the status endpoint it
+polled. The state check survived in a better form: a login in flight is stored as
+`state → PKCE verifier`, so a callback carrying a state we did not issue has nothing to
+exchange with. That also fixed a wart nobody had filed — the old flow held one global lock
+for up to fifteen minutes, so closing the SSO tab blocked the next login attempt.
+
+**`EVE_CALLBACK_URL` is a cutover, not a setting.** CCP compares `redirect_uri` against the
+application registration as an exact string and an application has exactly one. So there is
+an unavoidable window, while the registration and the deployment disagree, in which SSO
+cannot work — and since Step 2 made a session mandatory, that window is a lockout.
+`python -m app.web.bootstrap` mints a single-use ten-minute sign-in link and needs
+filesystem access to the database, which is the property that makes it safe to keep.
+
+`docs/deploy-vps.md` is rewritten: the SSH tunnel is gone, nginx + TLS is the deployment,
+and the section claiming an attacker could "act with your stored ESI tokens" is corrected —
+all 24 scopes are read-only. The README no longer promises that nothing leaves your
+machine, because that is the thing this step trades away. *(W2's worst endpoint deleted
+rather than defended)*
+
+Remaining, for the VPS session: point DNS, run certbot, set the six environment variables,
+change the callback registration, and pin `EVE_OWNER_CHARACTER_ID` after first login.
 
 **Step 4 — Platform foundations.** Postgres + Alembic (decide once, not hedged); async
 token refresh done properly; background sync worker with delay-after-completion + jitter;

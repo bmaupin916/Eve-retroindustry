@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Login failed — EVE Retroindustry{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center justify-content-center" style="min-height:70vh">
+  <div class="card p-4" style="max-width:34rem">
+    <h4 class="mb-3" style="color:var(--eve-gold)">Login failed</h4>
+
+    <p class="mb-3">{{ reason }}</p>
+
+    <p class="text-secondary small mb-4">
+      Nothing was changed. If this keeps happening, the server log records the
+      exact response EVE returned.
+    </p>
+
+    <div>
+      <a href="/auth/login" class="btn btn-primary">Try again</a>
+      <a href="/settings" class="btn btn-outline-secondary ms-2">Settings</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

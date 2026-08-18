@@ -45,13 +45,16 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 # Paths reachable without a session. Deliberately tiny:
 #   /auth/login   starts SSO — must work before you have a session
-#   /auth/sync    consumes the completed login and issues the session
-#   /api/auth/status  polled by the waiting page while SSO is in flight
+#   /callback     where EVE sends the browser back; it issues the session, so it
+#                 cannot require one. The state check in complete_login() is what
+#                 keeps it from being an open door.
 #   /static       CSS and JS, no data
 #   /favicon.ico  requested before anything else
 _PUBLIC_PREFIXES = ("/static/",)
 _PUBLIC_EXACT = frozenset({
-    "/auth/login", "/auth/sync", "/auth/cancel", "/api/auth/status", "/favicon.ico",
+    "/auth/login", "/callback", "/favicon.ico",
+    # Redeems a token that can only be minted with filesystem access to the DB.
+    "/auth/bootstrap",
 })
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})

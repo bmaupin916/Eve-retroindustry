@@ -88,8 +88,6 @@ def app_module():
 
     m.fetch_location = _loc
     m.fetch_skill_queue = _sq
-    # Never actually launch a browser from a test.
-    m._open_in_external_browser = lambda url: True
 
     yield m
     shutil.rmtree(tmp, ignore_errors=True)

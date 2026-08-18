@@ -14,10 +14,3 @@ PyJWT>=2.8
 # trusting the TLS channel to the token endpoint.
 cryptography>=42.0
 Pillow>=10.0
-pywebview>=5.0
-# Qt backend (PyQt6 + QtWebEngine) on both Linux and Windows. Self-contained
-# bundled Chromium; on Windows avoids the pythonnet/.NET path that breaks
-# under PyInstaller. macOS would use its native WKWebView (not packaged here).
-PyQt6>=6.6
-PyQt6-WebEngine>=6.6
-QtPy>=2.4

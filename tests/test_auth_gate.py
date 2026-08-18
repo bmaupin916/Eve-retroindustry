@@ -89,7 +89,12 @@ def test_the_active_char_cookie_is_not_identity(app_module):
 
 
 def test_public_paths_work_without_a_session(anon_client):
-    assert anon_client.get("/api/auth/status").status_code == 200
+    """Only the three the login flow cannot work without."""
+    r = anon_client.get("/callback", follow_redirects=False)
+    assert r.status_code == 200, "the callback must be reachable without a session"
+    assert security.is_public_path("/auth/login")
+    assert security.is_public_path("/auth/bootstrap")
+    assert not security.is_public_path("/api/sync-status")
 
 
 def test_a_valid_session_gets_through(client):
@@ -270,31 +275,96 @@ def test_cookie_secure_is_off_locally_and_on_when_configured(monkeypatch):
 
 
 # --- The login handoff -------------------------------------------------------
+#
+# There is no ticket any more. SSO used to complete on a background thread with
+# no response to attach a cookie to; /callback is a request, so it sets the
+# cookie itself.
 
-def test_the_login_ticket_is_single_use():
+def test_the_callback_issues_a_session(app_module, monkeypatch):
     from app.auth import esi_oauth
 
-    esi_oauth._issue_login_ticket(OWNER_CHARACTER_ID)
-    assert esi_oauth.consume_login_ticket() == OWNER_CHARACTER_ID
-    assert esi_oauth.consume_login_ticket() is None
+    monkeypatch.setattr(esi_oauth, "complete_login",
+                        lambda code, state: (OWNER_CHARACTER_ID, "Test Pilot Alpha"))
+    monkeypatch.setattr(app_module, "complete_login",
+                        lambda code, state: (OWNER_CHARACTER_ID, "Test Pilot Alpha"))
+
+    c = TestClient(app_module.app)
+    r = c.get("/callback?code=x&state=y", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/auth/sync"
+    assert r.cookies.get(security.SESSION_COOKIE), "no session cookie was set"
 
 
-def test_a_stale_login_ticket_is_not_redeemable(monkeypatch):
-    from app.auth import esi_oauth
+def test_a_non_owner_gets_no_session_from_the_callback(app_module, monkeypatch):
+    monkeypatch.setattr(app_module, "complete_login",
+                        lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
 
-    esi_oauth._issue_login_ticket(OWNER_CHARACTER_ID)
-    real_monotonic = time.monotonic  # bind before patching, or the stub recurses
-    monkeypatch.setattr(
-        esi_oauth.time, "monotonic",
-        lambda: real_monotonic() + esi_oauth._TICKET_TTL + 1,
-    )
-    assert esi_oauth.consume_login_ticket() is None
+    c = TestClient(app_module.app)
+    r = c.get("/callback?code=x&state=y", follow_redirects=False)
+    assert r.status_code == 200          # renders the failure page
+    assert security.SESSION_COOKIE not in r.cookies
 
 
-def test_auth_sync_without_a_ticket_does_not_hand_out_a_session(anon_client):
-    from app.auth import esi_oauth
+def test_a_failed_login_sets_no_session(app_module, monkeypatch):
+    from app.auth.esi_oauth import LoginError
 
-    esi_oauth.consume_login_ticket()  # ensure none pending
-    r = anon_client.get("/auth/sync", follow_redirects=False)
-    assert r.status_code in (302, 303, 307)
+    def _fail(code, state):
+        raise LoginError("This login has expired, or was not started here.")
+
+    monkeypatch.setattr(app_module, "complete_login", _fail)
+
+    c = TestClient(app_module.app)
+    r = c.get("/callback?code=x&state=stale", follow_redirects=False)
+    assert r.status_code == 200
+    assert security.SESSION_COOKIE not in r.cookies
+    assert "expired" in r.text
+
+
+# --- The bootstrap escape hatch ---------------------------------------------
+
+def test_a_bootstrap_token_is_single_use(app_module, conn):
+    from app.web.bootstrap import issue_token, redeem_token
+
+    token = issue_token(conn, OWNER_CHARACTER_ID)
+    assert redeem_token(conn, token) == OWNER_CHARACTER_ID
+    assert redeem_token(conn, token) is None
+
+
+def test_an_unknown_bootstrap_token_is_refused(conn):
+    from app.web.bootstrap import redeem_token
+
+    assert redeem_token(conn, "never-issued") is None
+    assert redeem_token(conn, None) is None
+
+
+def test_a_stale_bootstrap_token_is_refused(app_module, conn, monkeypatch):
+    from app.web import bootstrap
+
+    token = bootstrap.issue_token(conn, OWNER_CHARACTER_ID)
+    conn.execute("UPDATE app_bootstrap SET created_at = ? WHERE token = ?",
+                 (time.time() - bootstrap.TOKEN_TTL - 1, token))
+    conn.commit()
+    assert bootstrap.redeem_token(conn, token) is None
+
+
+def test_the_bootstrap_route_signs_you_in(app_module, conn):
+    from app.web.bootstrap import issue_token
+
+    token = issue_token(conn, OWNER_CHARACTER_ID)
+    c = TestClient(app_module.app)
+    r = c.get(f"/auth/bootstrap?token={token}", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.cookies.get(security.SESSION_COOKIE)
+
+
+def test_the_bootstrap_route_refuses_a_spent_token(app_module, conn):
+    from app.web.bootstrap import issue_token
+
+    token = issue_token(conn, OWNER_CHARACTER_ID)
+    c = TestClient(app_module.app)
+    assert c.get(f"/auth/bootstrap?token={token}", follow_redirects=False).status_code == 303
+
+    c2 = TestClient(app_module.app)
+    r = c2.get(f"/auth/bootstrap?token={token}", follow_redirects=False)
+    assert r.status_code == 200
     assert security.SESSION_COOKIE not in r.cookies

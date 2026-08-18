@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Allow cleartext HTTP only on loopback (the app's local uvicorn server).
-     Everything else stays HTTPS-only (ESI API, evetech.net images, CDN). -->
-<network-security-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">localhost</domain>
-    </domain-config>
-</network-security-config>

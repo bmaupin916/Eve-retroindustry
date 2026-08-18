@@ -312,9 +312,6 @@ window.escHtml = function (s) {
         <li class="nav-item">
           <a class="nav-link {% if request.url.path == '/about' %}active{% endif %}"
              href="/about" style="font-size:.85rem;opacity:.7">About
-            <span id="nav-update-dot" class="d-none ms-1 badge rounded-pill"
-                  style="font-size:.6rem;vertical-align:middle;background:#e3b341;color:#0d1117"
-                  title="Update available">&#8226;</span>
           </a>
         </li>
 
@@ -403,29 +400,13 @@ async function removeChar(charId, name) {
   const r = await fetch(`/api/characters/${charId}`, {method: 'DELETE'});
   if (r.ok) location.reload();
 }
-// Open the Ko-fi support page in the system browser (via the server-side
-// opener, so it works on desktop and Android alike). Available on every page.
-async function kofiOpen(ev) {
-  if (ev) ev.preventDefault();
-  try {
-    const d = await fetch('/api/support/open').then(r => r.json());
-    if (!d.ok) window.open(d.url || 'https://ko-fi.com/retrovisor', '_blank', 'noopener');
-  } catch (e) {
-    window.open('https://ko-fi.com/retrovisor', '_blank', 'noopener');
-  }
-}
-
-// Open an allowlisted external URL in the system browser via the server-side
-// opener (target=_blank does not open inside the Android WebView).
-async function openExternal(url, ev) {
-  if (ev) ev.preventDefault();
-  try {
-    const d = await fetch('/api/open-external?url=' + encodeURIComponent(url)).then(r => r.json());
-    if (!d.ok) window.open(url, '_blank', 'noopener');
-  } catch (e) {
-    window.open(url, '_blank', 'noopener');
-  }
-}
+// External links open in a new tab, the ordinary way. These used to route
+// through a server-side opener because target=_blank does not work inside the
+// Android WebView; there is no WebView any more, and a hosted server has no
+// business spawning browser processes. Kept as functions because call sites
+// pass them to onclick — they now simply let the anchor do its job.
+function kofiOpen(ev) { return true; }
+function openExternal(url, ev) { return true; }
 
 // Navbar fit: switch to icon-only the instant the full-text bar would overflow.
 // We measure the real overflow instead of guessing a width breakpoint, so every
@@ -466,29 +447,6 @@ async function syncAll(btn) {
   btn.innerHTML = orig;
 }
 
-// Version check — once per session, show dot if update available.
-// Desktop-only: on Android the native updater handles updates (About → Check for
-// updates); this endpoint compares desktop release tags.
-{% if not IS_ANDROID %}
-(function() {
-  try {
-    const raw = sessionStorage.getItem('versionCheck');
-    if (raw) {
-      const d = JSON.parse(raw);
-      if (d._ts && Date.now() - d._ts < 60 * 60 * 1000 && d.has_update) {
-        document.getElementById('nav-update-dot').classList.remove('d-none');
-      }
-      if (d._ts && Date.now() - d._ts < 60 * 60 * 1000) return; // cached, skip fetch
-    }
-  } catch(e) {}
-  fetch('/api/version/check').then(r => r.json()).then(d => {
-    if (!d.error) {
-      sessionStorage.setItem('versionCheck', JSON.stringify({...d, _ts: Date.now()}));
-      if (d.has_update) document.getElementById('nav-update-dot').classList.remove('d-none');
-    }
-  }).catch(() => {});
-})();
-{% endif %}
 
 // PI extractor alert badge on the Planets nav link. Cache-only count (no ESI),
 // so it's cheap to show on every page; the dashboard tile / a /planets visit

@@ -37,7 +37,7 @@ from app.auth.token_store import (
     update_corporation_id,
     update_last_sync,
 )
-from app.auth.esi_oauth import start_web_login, cancel_web_login
+from app.auth.esi_oauth import begin_login, complete_login, LoginError
 from app.character.blueprints import fetch_blueprints, ensure_bp_table
 from app.character import wallet as wallet_api
 from app.character import orders as orders_api
@@ -195,12 +195,6 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 if STATIC_DIR.is_dir():
     from fastapi.staticfiles import StaticFiles
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-# The Android shell sets EVE_ANDROID=1 — templates then hide the desktop updater
-# (which downloads the desktop zip) and show a native "Check for updates" button
-# that, via the JS bridge AndroidApp.checkForUpdate(), triggers installing the new APK.
-templates.env.globals["IS_ANDROID"] = bool(os.environ.get("EVE_ANDROID"))
-
 
 # Set EVE_DEBUG_ERRORS=1 to put the traceback back in the HTTP response. Off by
 # default: hosted, the response body goes to whoever made the request, and these
@@ -1128,163 +1122,53 @@ _CORP_DIV_ORDER = list(_CORP_DIV_LABEL.keys())
 # Auth
 # ---------------------------------------------------------------------------
 
-# Optional override for opening a URL (SSO login) in an external browser.
-# The Android shell (android_main) sets it to a function that fires an Android
-# Intent — desktop leaves it None and uses subprocess/xdg-open below.
-_EXTERNAL_BROWSER_OPENER = None
-
-
-def set_browser_opener(fn) -> None:
-    """Register a platform-specific URL opener (called by the Android shell)."""
-    global _EXTERNAL_BROWSER_OPENER
-    _EXTERNAL_BROWSER_OPENER = fn
-
-
-def _open_in_external_browser(url: str) -> bool:
-    """Open a URL in the system default browser without inheriting the
-    AppImage / PyInstaller env (LD_LIBRARY_PATH, QT_*…), which would otherwise
-    crash Firefox/Chrome (they'd try to load our bundled Qt libs). Return True
-    if the spawn succeeded.
-
-    The AppImage runtime saves the original values into `APPIMAGE_ORIGINAL_*`
-    and the PyInstaller bootloader into `_PYI_*` — we restore them before
-    calling xdg-open.
-    """
-    # Android: open via the registered Intent opener (subprocess/xdg-open
-    # don't exist on Android).
-    if _EXTERNAL_BROWSER_OPENER is not None:
-        try:
-            _EXTERNAL_BROWSER_OPENER(url)
-            return True
-        except Exception as exc:
-            print(f"[browser] android opener failed: {exc}", flush=True)
-            return False
-
-    import subprocess
-    if _sys.platform.startswith("win"):
-        try:
-            os.startfile(url)  # type: ignore[attr-defined]
-            return True
-        except Exception as exc:
-            print(f"[browser] os.startfile failed: {exc}", flush=True)
-            return False
-    if _sys.platform == "darwin":
-        try:
-            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-            return True
-        except Exception as exc:
-            print(f"[browser] open failed: {exc}", flush=True)
-            return False
-
-    # Linux: restore the env that existed before AppImage / PyInstaller
-    # took over, so the spawned browser doesn't try to load our bundled
-    # libs.
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("LD_LIBRARY_PATH", "QT_", "QML",
-                                "GST_", "GTK_", "PYTHON", "_PYI_"))}
-    for k in list(os.environ.keys()):
-        if k.startswith("APPIMAGE_ORIGINAL_"):
-            env[k[len("APPIMAGE_ORIGINAL_"):]] = os.environ[k]
-            env.pop(k, None)
-    for cmd in (["xdg-open", url], ["x-www-browser", url],
-                ["firefox", url], ["google-chrome", url],
-                ["chromium", url]):
-        try:
-            subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-            print(f"[browser] spawned {cmd[0]} for SSO login", flush=True)
-            return True
-        except FileNotFoundError:
-            continue
-        except Exception as exc:
-            print(f"[browser] {cmd[0]} failed: {exc}", flush=True)
-            continue
-    return False
-
-
 @app.get("/auth/login")
-async def auth_login(request: Request):
-    """Start the OAuth flow + try to open EVE SSO in the system default
-    browser. The webview shows a waiting page with a Cancel button.
+async def auth_login():
+    """Send the browser to EVE SSO.
 
-    If spawning the external browser fails, the waiting page also has an
-    "Open in this window" fallback link (the webview navigates to SSO).
+    A plain redirect. The desktop build opened SSO in the system browser and
+    parked the webview on a waiting page that polled for completion, because the
+    redirect came back to a separate local server. It now comes back to
+    /callback on this app, so there is nothing to wait for.
     """
     _sync_state["done"] = False
-    url = start_web_login()
+    url = begin_login()
     if not url:
-        return RedirectResponse("/?login_busy=1")
-    opened = _open_in_external_browser(url)
-    return _tr("auth_waiting.html", request, {
-        "auth_url": url,
-        "external_opened": opened,
-    })
+        return RedirectResponse("/settings?msg=Set+a+client+ID+first")
+    return RedirectResponse(url, status_code=303)
 
 
-SUPPORT_URL = "https://ko-fi.com/retrovisor"
+@app.get("/callback")
+async def auth_callback(request: Request, code: str | None = None,
+                        state: str | None = None):
+    """Where EVE sends the browser back. Turns the code into a session.
 
-# Hosts that the app may open in the system browser. A plain target=_blank link
-# does not open inside the Android WebView, so external links are routed through
-# _open_in_external_browser — restricted to these hosts.
-_EXTERNAL_HOST_ALLOWLIST = (
-    "ko-fi.com", "github.com", "esi.evetech.net",
-    "developers.eveonline.com", "evetech.net",
-)
-
-
-def _external_host_allowed(url: str) -> bool:
-    from urllib.parse import urlparse
+    Public by necessity — the caller cannot have a session yet. What makes that
+    safe is the state check inside complete_login(): the callback must carry a
+    state this server issued and has not already spent, or there is no PKCE
+    verifier to exchange with and the flow stops here.
+    """
     try:
-        p = urlparse(url)
-    except Exception:
-        return False
-    if p.scheme not in ("http", "https"):
-        return False
-    host = (p.hostname or "").lower()
-    return any(host == d or host.endswith("." + d) for d in _EXTERNAL_HOST_ALLOWLIST)
+        character_id, character_name = complete_login(code, state)
+    except LoginError as exc:
+        return _tr("auth_failed.html", request, {"reason": str(exc)})
 
-
-@app.get("/api/support/open")
-async def api_support_open():
-    """Open the Ko-fi support page in the system default browser. Routed through
-    the server-side opener so it works on both desktop and Android — a plain
-    target=_blank link would not open in the Android WebView."""
-    opened = _open_in_external_browser(SUPPORT_URL)
-    return {"ok": opened, "url": SUPPORT_URL}
-
-
-@app.get("/api/open-external")
-async def api_open_external(url: str):
-    """Open an allowlisted external URL in the system default browser (desktop +
-    Android). Used for informational links (source code, ESI docs) that a plain
-    target=_blank cannot open inside the Android WebView."""
-    if not _external_host_allowed(url):
-        return {"ok": False, "error": "URL not allowed"}
-    opened = _open_in_external_browser(url)
-    return {"ok": opened, "url": url}
-
-
-@app.post("/auth/cancel")
-async def auth_cancel():
-    """Cancel the in-progress login. Server shutdown + lock release."""
-    cancelled = cancel_web_login()
-    return {"cancelled": cancelled}
-
-
-@app.get("/api/auth/status")
-async def api_auth_status():
-    """Polling endpoint for the waiting page. Returns the login flow state."""
-    from app.auth.esi_oauth import _login_lock
     conn = get_conn()
     try:
-        has_chars = has_any_character(conn)
+        if not security.may_sign_in(conn, character_id):
+            owner = security.get_owner_id(conn)
+            print(f"[auth] refused session for character {character_id}: this "
+                  f"instance belongs to {owner}", flush=True)
+            return _tr("auth_failed.html", request, {
+                "reason": f"{character_name} is not the owner of this instance.",
+            })
+        session_id, _ = security.create_session(conn, character_id)
     finally:
         conn.close()
-    # If the lock isn't acquired → the login flow ended (success or cancel).
-    # has_chars distinguishes success (tokens saved) vs cancel/error.
-    in_progress = _login_lock.locked()
-    return {"in_progress": in_progress, "has_character": has_chars}
+
+    resp = RedirectResponse("/auth/sync", status_code=303)
+    security.set_session_cookie(resp, session_id)
+    return resp
 
 
 async def _bg_initial_sync():
@@ -1362,48 +1246,53 @@ async def _bg_initial_sync():
         _sync_state["running"] = False
         _sync_state["done"] = True
 
-
 @app.get("/auth/sync", response_class=HTMLResponse)
 async def auth_sync(request: Request):
-    """Land here after SSO. Redeems the pending login for a session cookie.
+    """Landing page after a successful login. Kicks off the first ESI sync.
 
-    Public, because the caller cannot have a session yet — that is what it is
-    here to hand out. The login ticket is what makes that safe: it exists only
-    between a successful token exchange and the first request that redeems it,
-    it is single-use, and it expires in five minutes.
+    Authenticated like everything else — /callback has already set the cookie by
+    the time the browser arrives here.
     """
-    from app.auth.esi_oauth import consume_login_ticket
-
     conn = get_conn()
     try:
         if not has_any_character(conn):
             return RedirectResponse("/")
-
-        session = security.load_session(conn, request.cookies.get(security.SESSION_COOKIE))
-        new_session_id = None
-
-        if session is None:
-            character_id = consume_login_ticket()
-            if character_id is None:
-                # No session and nothing to redeem — an old tab, a refresh, or
-                # somebody guessing the URL. None of them get a session.
-                return RedirectResponse("/auth/login")
-            if not security.may_sign_in(conn, character_id):
-                owner = security.get_owner_id(conn)
-                print(f"[auth] refused session for character {character_id}: this "
-                      f"instance belongs to {owner}", flush=True)
-                return _deny(request, 403, "This instance belongs to another character.")
-            new_session_id, _ = security.create_session(conn, character_id)
     finally:
         conn.close()
 
     if not _sync_state["running"] and not _sync_state["done"]:
         _sync_reset()
         asyncio.create_task(_bg_initial_sync())
+    return _tr("sync.html", request, {})
 
-    resp = _tr("sync.html", request, {})
-    if new_session_id:
-        security.set_session_cookie(resp, new_session_id)
+
+@app.get("/auth/bootstrap")
+async def auth_bootstrap(request: Request, token: str | None = None):
+    """Redeem a token from `python -m app.web.bootstrap` for a session.
+
+    The way back in when SSO cannot be used — during the minutes when the
+    callback URL registered with CCP does not yet match this deployment. Minting
+    a token needs filesystem access to the database, so this route hands nothing
+    to anyone who does not already have the server.
+    """
+    from app.web.bootstrap import redeem_token
+
+    conn = get_conn()
+    try:
+        character_id = redeem_token(conn, token)
+        if character_id is None:
+            return _tr("auth_failed.html", request, {
+                "reason": "That sign-in link has already been used, or has expired.",
+            })
+        if security.get_owner_id(conn) is None:
+            security.claim_owner(conn, character_id)
+        session_id, _ = security.create_session(conn, character_id)
+    finally:
+        conn.close()
+
+    print(f"[auth] bootstrap session issued for character {character_id}", flush=True)
+    resp = RedirectResponse("/", status_code=303)
+    security.set_session_cookie(resp, session_id)
     return resp
 
 
@@ -1486,7 +1375,7 @@ async def api_sync_start():
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
     from app.auth.token_store import get_client_id
-    from app.auth.esi_oauth import CALLBACK_URL, SCOPES
+    from app.auth.esi_oauth import callback_url, SCOPES
     conn = get_conn()
     try:
         defaults = app_defaults.get_defaults(conn)
@@ -1500,7 +1389,7 @@ async def settings_page(request: Request):
         conn.close()
     return _tr("settings.html", request, {
         "client_id": get_client_id() or "",
-        "callback_url": CALLBACK_URL,
+        "callback_url": callback_url(),
         "scopes": SCOPES,
         "defaults": defaults,
         "station_options": station_options,
@@ -7329,225 +7218,3 @@ async def api_pi_alert_count():
         return _pi_alert_summary(conn, limit=0)
     finally:
         conn.close()
-
-
-# ── Version check / update ───────────────────────────────────────────────────
-
-_GITHUB_REPO = "EVERetroIndustry/Eve-retroindustry"
-_VERSION_CACHE: dict | None = None
-_VERSION_CACHE_TS: float = 0.0
-_VERSION_CACHE_TTL = 3600.0  # 1 hour
-
-
-def _is_bundled() -> bool:
-    return hasattr(_sys, "_MEIPASS")
-
-
-def _install_dir() -> Path:
-    """Folder holding the executable + bundled files — the update target.
-    Distinct from EVE_APP_DIR (user data, kept outside the install so updates
-    never touch eve_cache.db / config)."""
-    return Path(os.environ.get("EVE_INSTALL_DIR") or os.path.dirname(_sys.executable))
-
-
-# Uninstall registry key written by the Inno Setup installer (AppId + Inno's "_is1"
-# suffix). Per-user install → HKCU. Only ever updated, never created (see below).
-_UNINSTALL_KEY = (r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall"
-                  r"\{7F3A9C42-5D18-4B6E-9E2A-1C8B0F4D7A63}_is1")
-
-
-@app.get("/api/version/check")
-async def api_version_check():
-    global _VERSION_CACHE, _VERSION_CACHE_TS
-    now = _time.monotonic()
-    if _VERSION_CACHE and (now - _VERSION_CACHE_TS) < _VERSION_CACHE_TTL:
-        return _VERSION_CACHE
-    try:
-        # follow_redirects matters: if the repository is ever renamed or moved to an
-        # organisation, GitHub answers the old path with a 301, and httpx does not
-        # follow redirects by default — raise_for_status() would then fail and the
-        # update check would break for every already-installed copy.
-        async with esi_client(timeout=10, follow_redirects=True) as client:
-            r = await client.get(
-                f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest",
-                headers={"Accept": "application/vnd.github+json", "User-Agent": "EVE-Retroindustry"},
-            )
-            r.raise_for_status()
-            data = r.json()
-    except Exception as exc:
-        return {"error": str(exc), "current": APP_VERSION}
-
-    latest_tag = data.get("tag_name", "").lstrip("v")
-
-    def _ver(v: str) -> tuple:
-        # numeric, component-wise — so 0.8.51 > 0.8.9 (string compare got this wrong)
-        return tuple(int("".join(c for c in p if c.isdigit()) or 0) for p in v.split("."))
-
-    has_update = bool(latest_tag) and _ver(latest_tag) > _ver(APP_VERSION)
-
-    plat = "win64" if _sys.platform == "win32" else "linux"
-    # Portable archives are named "-portable.zip" (v0.9.7 onwards). The old
-    # "-<plat>.zip" name is still accepted so a copy installed before the rename
-    # can still find its update: an installed build constructs this filename
-    # itself for whatever the newest release turns out to be.
-    asset_names = [
-        f"EVE_Retroindustry-v{latest_tag}-{plat}-portable.zip",
-        f"EVE_Retroindustry-v{latest_tag}-{plat}.zip",
-    ]
-    by_name = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
-    download_url = next((by_name[n] for n in asset_names if n in by_name), None)
-
-    result = {
-        "current": APP_VERSION,
-        "latest": latest_tag,
-        "has_update": has_update,
-        "download_url": download_url,
-        "release_url": data.get("html_url", ""),
-        "release_name": data.get("name", f"v{latest_tag}"),
-        "bundled": _is_bundled(),
-    }
-    _VERSION_CACHE = result
-    _VERSION_CACHE_TS = now
-    return result
-
-
-@app.get("/api/version/download")
-async def api_version_download(url: str):
-    """SSE stream: downloads and extracts update zip to update_staging/ next to the exe."""
-    # Version being installed, taken from the asset filename
-    # (…-v1.2.3-win64-portable.zip). Only used to keep the Windows uninstall entry
-    # in step; None simply means that touch-up is skipped.
-    import re as _re
-    _m = _re.search(r"-v(\d+\.\d+\.\d+)-", url)
-    new_version = _m.group(1) if _m else None
-    if not (url.startswith("https://github.com/") or url.startswith("https://objects.githubusercontent.com/")):
-        async def _err():
-            yield f"data: {json.dumps({'error': 'Invalid download URL'})}\n\n"
-        return StreamingResponse(_err(), media_type="text/event-stream")
-
-    async def _stream():
-        app_dir = _install_dir()
-        staging = app_dir / "update_staging"
-        tmp_zip = app_dir / "update.zip.tmp"
-        try:
-            async with esi_client(follow_redirects=True, timeout=300) as client:
-                async with client.stream("GET", url) as r:
-                    if r.status_code != 200:
-                        yield f"data: {json.dumps({'error': f'HTTP {r.status_code}'})}\n\n"
-                        return
-                    total = int(r.headers.get("content-length", 0))
-                    downloaded = 0
-                    with open(tmp_zip, "wb") as f:
-                        async for chunk in r.aiter_bytes(65536):
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            pct = int(downloaded * 100 / total) if total else 0
-                            yield f"data: {json.dumps({'phase': 'download', 'pct': pct, 'downloaded': downloaded, 'total': total})}\n\n"
-
-            yield f"data: {json.dumps({'phase': 'extract', 'pct': 0})}\n\n"
-
-            import shutil
-            if staging.exists():
-                shutil.rmtree(staging)
-            staging.mkdir(parents=True)
-
-            with _zipfile.ZipFile(tmp_zip) as zf:
-                members = zf.namelist()
-                total_files = len(members)
-                for i, member in enumerate(members):
-                    zf.extract(member, staging)
-                    pct = int((i + 1) * 100 / total_files) if total_files else 100
-                    if i % 50 == 0 or i == total_files - 1:
-                        yield f"data: {json.dumps({'phase': 'extract', 'pct': pct})}\n\n"
-
-            tmp_zip.unlink(missing_ok=True)
-
-            # Detect single root subdirectory (EVE_Retroindustry/) inside the zip
-            roots = {Path(m).parts[0] for m in members if Path(m).parts}
-            inner_dir = staging / roots.pop() if len(roots) == 1 else staging
-
-            # Write helper script
-            if _sys.platform == "win32":
-                script_path = app_dir / "update.bat"
-                # Robust in-place update:
-                #  * give the app a moment to exit, then force-kill any leftover
-                #    QtWebEngineProcess / main exe that still hold locks on the
-                #    bundled DLLs (otherwise the copy silently skips them and the
-                #    result is a broken install);
-                #  * robocopy retries locked files (/R:15 /W:1). /E copies the
-                #    tree WITHOUT purging, so user data (eve_cache.db,
-                #    .eve_config.json, webview_data) is preserved — it is not in
-                #    the source and never gets deleted;
-                #  * launch the new exe BEFORE the script deletes itself — a .bat
-                #    that dels itself first never reaches the next line.
-                script_path.write_text(
-                    '@echo off\r\n'
-                    'timeout /t 2 /nobreak >nul\r\n'
-                    'taskkill /F /IM QtWebEngineProcess.exe >nul 2>&1\r\n'
-                    'taskkill /F /IM EVE_Retroindustry.exe >nul 2>&1\r\n'
-                    'timeout /t 1 /nobreak >nul\r\n'
-                    f'robocopy "{inner_dir}" "{app_dir}" /E /R:15 /W:1 /NFL /NDL /NJH /NJS /NC /NP >nul\r\n'
-                    # If this copy was installed by the Inno Setup installer, keep
-                    # the Apps & features entry honest — a self-update would
-                    # otherwise leave it showing the version we just replaced. The
-                    # `reg query` guard matters: without it, `reg add` would create
-                    # the key and give portable (ZIP) users a bogus uninstall entry.
-                    + (f'reg query "{_UNINSTALL_KEY}" >nul 2>&1 && '
-                       f'reg add "{_UNINSTALL_KEY}" /v DisplayVersion /t REG_SZ '
-                       f'/d {new_version} /f >nul 2>&1\r\n' if new_version else '')
-                    +
-                    f'rmdir /S /Q "{staging}" >nul 2>&1\r\n'
-                    f'start "" "{app_dir}\\EVE_Retroindustry.exe"\r\n'
-                    'del "%~f0"\r\n',
-                    encoding="utf-8",
-                )
-            else:
-                script_path = app_dir / "update.sh"
-                script_path.write_text(
-                    f'#!/bin/bash\n'
-                    f'sleep 3\n'
-                    f'cp -r "{inner_dir}/." "{app_dir}/"\n'
-                    f'rm -rf "{staging}"\n'
-                    f'chmod +x "{app_dir}/EVE_Retroindustry"\n'
-                    f'"{app_dir}/EVE_Retroindustry" &\n'
-                    f'rm -- "$0"\n',
-                    encoding="utf-8",
-                )
-                import stat
-                script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
-
-            yield f"data: {json.dumps({'done': True, 'script': script_path.name})}\n\n"
-
-        except Exception as exc:
-            if tmp_zip.exists():
-                tmp_zip.unlink(missing_ok=True)
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-
-    return StreamingResponse(
-        _stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.post("/api/version/apply")
-async def api_version_apply():
-    """Launch helper update script then exit the process."""
-    import subprocess
-    app_dir = _install_dir()
-    if _sys.platform == "win32":
-        script = app_dir / "update.bat"
-    else:
-        script = app_dir / "update.sh"
-    if not script.exists():
-        return {"error": f"{script.name} not found — run download first"}
-    if _sys.platform == "win32":
-        subprocess.Popen(
-            ["cmd", "/c", str(script)],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            close_fds=True,
-        )
-    else:
-        subprocess.Popen(["/bin/bash", str(script)], start_new_session=True, close_fds=True)
-    asyncio.get_event_loop().call_later(0.5, lambda: os._exit(0))
-    return {"ok": True}
