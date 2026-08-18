@@ -78,6 +78,7 @@ class BOMResolver:
         adjusted_prices: dict[int, float] | None = None,
         rate_mfg: float = 0.0,
         rate_rxn: float = 0.0,
+        runs_per_job_by_product: dict[int, int] | None = None,
     ):
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
@@ -95,6 +96,13 @@ class BOMResolver:
         #                 in a final smaller job
         #   None        — everything in one batched job (in-game multi-run window)
         self.runs_per_job = runs_per_job if (runs_per_job or 0) > 0 else None
+        # Per-product override of runs_per_job. A "max N days per job" rule
+        # produces a *different* run count for every product — a 2-hour
+        # reaction and a 3-day capital part hit the same day limit at wildly
+        # different run counts — so one global number cannot express it.
+        # Empty/None means every product uses self.runs_per_job, so existing
+        # callers (the /plan form, the margin tracker) are unaffected.
+        self._rpj_by_product: dict[int, int] = dict(runs_per_job_by_product or {})
         # product_type_id → character's ME (best available blueprint for that product)
         self._bp_me_by_product: dict[int, int] = {}
         # Hot-path caches — resolver is reused for the entire BOM walk, so
@@ -115,6 +123,11 @@ class BOMResolver:
 
     def close(self):
         self.conn.close()
+
+    def _runs_per_job_for(self, type_id: int) -> int | None:
+        """Runs per job for one product: its own limit, else the global one."""
+        override = self._rpj_by_product.get(type_id)
+        return override if override else self.runs_per_job
 
     def get_type_group(self, type_id: int) -> int | None:
         cached = self._type_group_cache.get(type_id, _MISSING)
@@ -347,8 +360,13 @@ class BOMResolver:
 
         visited = visited | {type_id}  # immutable copy per branch
 
+        # How this product's runs are split into jobs — ME rounds once per job,
+        # so this decides the material totals, not just the schedule.
+        splits = self._runs_per_job_for(type_id)
+
         for mat in materials:
-            mat_qty = self._apply_me(mat["quantity"], runs, effective_me, prod_mult)
+            mat_qty = self._apply_me(mat["quantity"], runs, effective_me, prod_mult,
+                                     runs_per_job=splits)
             child = self.resolve(
                 type_id=mat["material_type_id"],
                 quantity=mat_qty,
@@ -362,7 +380,8 @@ class BOMResolver:
 
         return node
 
-    def _apply_me(self, base_qty: int, runs: int, me: float, facility_multiplier: float = 1.0) -> int:
+    def _apply_me(self, base_qty: int, runs: int, me: float, facility_multiplier: float = 1.0,
+                  runs_per_job: int | None = _MISSING) -> int:  # type: ignore[assignment]
         """
         EVE formula (per Fenris Creations) for ONE job with R runs:
             max(R, ceil(round(base × R × (1-ME/100) × fac_mult, 2)))
@@ -383,7 +402,10 @@ class BOMResolver:
         def job_qty(r: int) -> int:
             return max(r, ceil(round(base_qty * r * per_run_mult, 2)))
 
-        J = self.runs_per_job
+        # `runs_per_job` defaults to the instance-wide value so direct callers
+        # (and the pinned tests) keep working; resolve() passes the product's
+        # own split when one is configured.
+        J = self.runs_per_job if runs_per_job is _MISSING else runs_per_job
         if J is None or J >= runs:
             return job_qty(runs)
         full_jobs, rem = divmod(runs, J)

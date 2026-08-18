@@ -884,32 +884,60 @@ function switchPlanChar(charId) {
 {# === TAB: Manufacturing steps === #}
 <div class="tab-pane fade" id="tab-process" style="padding-top:1rem">
 {% if result.manufacturing_steps %}
-<div class="mb-3">
+<div class="mb-3 d-flex align-items-center gap-3 flex-wrap">
   <button class="btn btn-sm btn-primary" onclick="openSaveToProject()">
     <i class="bi bi-kanban me-1"></i>Save to project
   </button>
+  {% if result.job_groups %}
+  <span class="badge bg-secondary">{{ result.total_job_count }} jobs</span>
+  <label class="d-flex align-items-center gap-2 mb-0" style="font-size:.8rem;cursor:pointer"
+         title="Merge identical jobs in every section into one line with a count">
+    <input type="checkbox" class="form-check-input mt-0" id="jtr-compact-all">
+    <span class="text-muted">Compact all tables</span>
+  </label>
+  <button type="button" class="btn btn-sm btn-ghost" id="jtr-expand-all">Expand all</button>
+  <button type="button" class="btn btn-sm btn-ghost" id="jtr-collapse-all">Collapse all</button>
+  {% endif %}
 </div>
 
-{% for step in result.manufacturing_steps %}
-<div class="mb-3">
-  {# Step header #}
-  <div class="d-flex align-items-center gap-2 mb-2">
-    <span class="badge {% if step.is_final %}bg-primary{% else %}bg-secondary{% endif %} fs-6 px-3 py-2">
-      Step {{ step.step }}
-    </span>
+
+{# Steps are the job categories, worked in order: reactions feed components,
+   components feed the end product. The old numbering was by dependency depth,
+   which said nothing about what you were actually queuing. #}
+{% for step in result.job_groups %}
+<div class="mb-3 jtr-section" data-group="{{ step.key }}">
+  {# Category header — the collapse toggle for the whole section. #}
+  <div class="d-flex align-items-center gap-2 mb-2 flex-wrap jtr-head collapsed px-2 py-2"
+       style="background:#141a22;border:1px solid var(--eve-border);border-radius:8px"
+       role="button" aria-expanded="false" aria-controls="jtr-{{ step.key }}"
+       data-bs-toggle="collapse" data-bs-target="#jtr-{{ step.key }}">
+    <strong>{{ step.label }}</strong>
     <span class="text-muted small">
-      {{ step.jobs | length }} {% if step.jobs | length == 1 %}manufacturing job{% else %}manufacturing jobs{% endif %}
+      Job count: {{ step.job_count }} &nbsp;·&nbsp; Longest: {{ step.longest_days }} days
     </span>
     {% if step.total_cost %}
     <span class="ms-auto text-isk fw-semibold">{{ step.total_cost | isk }} ISK</span>
     {% endif %}
+    {# Stops the label click from also toggling the section. #}
+    <label class="d-flex align-items-center gap-1 mb-0 {% if not step.total_cost %}ms-auto{% endif %}"
+           style="font-size:.74rem;cursor:pointer" onclick="event.stopPropagation()"
+           title="Merge identical jobs in this section into one line with a count">
+      <input type="checkbox" class="form-check-input mt-0 jtr-compact-one"
+             data-group="{{ step.key }}" onclick="event.stopPropagation()">
+      <span class="text-muted">Compact</span>
+    </label>
   </div>
 
-  {# Jobs in this step — accordion #}
-  <div class="accordion" id="step{{ step.step }}acc">
+  {# Jobs in this section — accordion #}
+  <div class="collapse" id="jtr-{{ step.key }}">
+  <div class="accordion" id="step{{ step.key }}acc">
     {% for job in step.jobs %}
-    {% set job_id = "step" ~ step.step ~ "job" ~ loop.index %}
-    <div class="accordion-item" style="background:#161b22;border-color:#30363d">
+    {% set job_id = "step" ~ step.key ~ "job" ~ loop.index %}
+    {# Identity for compacting: same product, same runs, same duration. Lets the
+       compact toggle fold duplicates client-side instead of the template
+       rendering a whole second copy of this accordion. #}
+    <div class="accordion-item jtr-job" style="background:#161b22;border-color:#30363d"
+         data-jobkey="{{ job.type_id }}-{{ job.runs }}-{{ job.job_duration_seconds or 0 }}">
       <h2 class="accordion-header">
         <button class="accordion-button {% if not loop.first or not step.is_final %}collapsed{% endif %}"
                 type="button" data-bs-toggle="collapse" data-bs-target="#{{ job_id }}"
@@ -1049,6 +1077,7 @@ function switchPlanChar(charId) {
     </div>
     {% endfor %}
   </div>
+  </div>{# end section collapse #}
 </div>
 {% endfor %}
 
@@ -1341,6 +1370,120 @@ function saveRecentStation(item) {
 }
 </script>
 <script>
+// Jobs to Run — section collapse and compacting.
+//
+// Sections default to collapsed: a split build is hundreds of jobs, and an
+// all-open page is unreadable. Compacting folds jobs that are identical in
+// every respect a builder cares about — same product, same runs, same duration
+// — into one row with a count, done in the DOM so the template renders the
+// accordion once rather than twice.
+//
+// State persists because a plan is re-submitted constantly while tuning ME and
+// slots; without it you would reopen the same sections on every run.
+(function () {
+  const KEY = 'planJobsToRun';
+  let state = {open: {}, compact: {}, compactAll: false};
+  try { state = Object.assign(state, JSON.parse(localStorage.getItem(KEY)) || {}); } catch (e) {}
+  if (!state.open) state.open = {};
+  if (!state.compact || typeof state.compact !== 'object') state.compact = {};
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} };
+
+  const sections = [...document.querySelectorAll('.jtr-section')];
+  if (!sections.length) return;
+
+  function isCompact(key) {
+    return state.compactAll || !!state.compact[key];
+  }
+
+  function applyCompact(section) {
+    const key = section.dataset.group;
+    const on = isCompact(key);
+    const seen = new Map();
+    section.querySelectorAll('.jtr-job').forEach(item => {
+      const id = item.dataset.jobkey;
+      let badge = item.querySelector('.jtr-dupe');
+      if (!on) {
+        item.classList.remove('d-none');
+        if (badge) badge.remove();
+        return;
+      }
+      const first = seen.get(id);
+      if (first === undefined) {
+        seen.set(id, item);
+        item.classList.remove('d-none');
+      } else {
+        item.classList.add('d-none');
+        const head = first.querySelector('.accordion-button');
+        badge = first.querySelector('.jtr-dupe');
+        if (!badge && head) {
+          badge = document.createElement('span');
+          badge.className = 'badge bg-secondary ms-2 jtr-dupe';
+          badge.style.fontSize = '.62rem';
+          head.appendChild(badge);
+        }
+        if (badge) {
+          const n = (parseInt(badge.dataset.n || '1', 10) + 1);
+          badge.dataset.n = n;
+          badge.textContent = '×' + n + ' jobs';
+        }
+      }
+    });
+    // Reset counters when switching back off, so a re-compact recounts cleanly.
+    if (!on) section.querySelectorAll('.jtr-dupe').forEach(b => b.remove());
+    const box = section.querySelector('.jtr-compact-one');
+    if (box) box.checked = on;
+    if (box) box.disabled = !!state.compactAll;
+  }
+
+  function applyAll() { sections.forEach(applyCompact); }
+
+  sections.forEach(section => {
+    const key = section.dataset.group;
+    const head = section.querySelector('.jtr-head');
+    const panel = section.querySelector('.collapse');
+    if (head && panel && state.open[key]) {
+      panel.classList.add('show');
+      head.classList.remove('collapsed');
+      head.setAttribute('aria-expanded', 'true');
+    }
+    if (panel) {
+      panel.addEventListener('shown.bs.collapse', () => { state.open[key] = true; save(); });
+      panel.addEventListener('hidden.bs.collapse', () => { delete state.open[key]; save(); });
+    }
+    const box = section.querySelector('.jtr-compact-one');
+    if (box) {
+      box.addEventListener('change', () => {
+        state.compact[key] = box.checked;
+        if (!box.checked) delete state.compact[key];
+        save(); applyCompact(section);
+      });
+    }
+  });
+
+  const all = document.getElementById('jtr-compact-all');
+  if (all) {
+    all.checked = !!state.compactAll;
+    all.addEventListener('change', () => {
+      state.compactAll = all.checked; save(); applyAll();
+    });
+  }
+
+  function setAllOpen(open) {
+    sections.forEach(section => {
+      const panel = section.querySelector('.collapse');
+      if (!panel) return;
+      const inst = bootstrap.Collapse.getOrCreateInstance(panel, {toggle: false});
+      open ? inst.show() : inst.hide();
+    });
+  }
+  const expand = document.getElementById('jtr-expand-all');
+  const collapse = document.getElementById('jtr-collapse-all');
+  if (expand) expand.addEventListener('click', () => setAllOpen(true));
+  if (collapse) collapse.addEventListener('click', () => setAllOpen(false));
+
+  applyAll();
+})();
+
 (function () {
   const input = document.getElementById('product-input');
   const box   = document.getElementById('product-suggestions');
@@ -1491,6 +1634,14 @@ function saveRecentStation(item) {
 </script>
 <style>
 .suggest-item:hover, .suggest-active { background: #21262d; }
+/* Jobs to Run — collapsible category headers, same chevron as the Assets groups. */
+.jtr-head { cursor: pointer; }
+.jtr-head:hover { background: #1a212b !important; }
+.jtr-head::before {
+  content: "\25BE"; display: inline-block; font-size: .65rem; line-height: 1;
+  color: var(--eve-steel); transition: transform .15s ease; flex: 0 0 auto;
+}
+.jtr-head.collapsed::before { transform: rotate(-90deg); }
 .plan-form details > summary { padding: .25rem 0; }
 .plan-form details[open] > summary { color: #e3b341; }
 .plan-form details > summary::marker { color: #8b949e; }
