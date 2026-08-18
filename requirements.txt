@@ -8,6 +8,11 @@ uvicorn[standard]>=0.29
 jinja2>=3.1
 python-multipart>=0.0.9
 PyJWT>=2.8
+# RS256 verification backend for PyJWT. EVE SSO signs its access tokens with
+# RS256, and PyJWT raises "Algorithm 'RS256' could not be found" without this —
+# so it is required, not optional, now that we verify signatures rather than
+# trusting the TLS channel to the token endpoint.
+cryptography>=42.0
 Pillow>=10.0
 pywebview>=5.0
 # Qt backend (PyQt6 + QtWebEngine) on both Linux and Windows. Self-contained
