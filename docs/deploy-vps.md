@@ -46,8 +46,8 @@ grep -vE '^(pywebview|PyQt6|QtPy)' requirements.txt | sudo -u eve tee requiremen
 sudo -u eve /opt/eve-retroindustry/.venv/bin/pip install -r requirements-server.txt
 ```
 
-> **Do not run `import_sde.py`.** It rebuilds the game database from raw SDE YAML in a `data/` folder
-> that isn't in the repo. `sde_base.db` is committed at the repo root and the app bootstraps
+> You don't need to run `import_sde.py` to deploy. It rebuilds the game database from CCP's static
+> data export, and is only needed when refreshing to a newer SDE build. `sde_base.db` is committed at the repo root and the app bootstraps
 > `eve_cache.db` from it on first startup.
 
 ## 4. Smoke-test it by hand
@@ -157,7 +157,7 @@ sudo systemctl restart eve-retroindustry
 ```
 
 The in-app updater is for the packaged desktop builds — on a source checkout, use `git pull`. A newer
-`sde_base.db` is picked up automatically on the next start: the app compares type/group counts and
+`sde_base.db` is picked up automatically on the next start: the app compares SDE build numbers, type/group counts and
 refreshes the SDE tables in place, leaving your characters, prices and projects untouched.
 
 **Back up**

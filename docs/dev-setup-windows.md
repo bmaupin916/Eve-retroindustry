@@ -51,11 +51,24 @@ Get-Content requirements.txt | Where-Object { $_ -notmatch '^(pywebview|PyQt6|Qt
 pip install -r requirements-web.txt
 ```
 
-> **Do not run `python import_sde.py`.** That script rebuilds the game database from raw SDE YAML files
-> in a `data/` folder that isn't part of the repo (and needs PyYAML, which isn't in `requirements.txt`).
-> It's only used when regenerating `sde_base.db` after a CCP SDE release. `sde_base.db` is committed at
-> the repo root, and the app copies the SDE tables out of it into `eve_cache.db` automatically on first
-> startup.
+> You don't need to run `import_sde.py` for normal development. `sde_base.db` is committed at the repo
+> root and the app copies the SDE tables out of it into `eve_cache.db` automatically on first startup.
+
+It is safe to run when you *do* want to refresh the game data — it downloads CCP's static data export
+itself and needs nothing that isn't already in `requirements.txt`:
+
+```powershell
+python import_sde.py --out sde_base.db --fresh
+```
+
+That fetches the newest build (~95 MB, cached under `data/sde-archives/`) and rebuilds the bundle in a
+couple of seconds. Pin a build with `--build 3470007`, or reuse an archive already on disk with
+`--zip`. The build number is recorded in the database, which is how the app decides whether a user's
+copy is stale — see `app/sde/feed.py`.
+
+> Earlier versions of this script parsed a 150 MB `types.yaml` out of a hand-populated `data/` folder
+> using PyYAML, which is not in `requirements.txt`. That is why this section used to say "do not run
+> it". Both problems are gone.
 
 ## 5. Run the dev server
 

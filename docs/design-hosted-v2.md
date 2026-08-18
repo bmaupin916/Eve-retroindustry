@@ -589,8 +589,32 @@ Both **JSON Lines and YAML** are still published, so `import_sde.py` is not brok
 says plainly that *"reading large YAML files can be memory-intensive and slow"* and
 recommends JSONL for large datasets. That is precisely the 150 MB `types.yaml` problem.
 
-**Revised recommendation.** Take the SDE from **CCP directly**, using the build-number and
-changes feeds, moving to JSONL. That gets automation, incremental updates, schema-change
+**✅ Done — v0.9.24.** Implemented in `app/sde/feed.py` (fetching) and a rewritten
+`import_sde.py` (loading). Build 3470007 imports in **1.7 seconds** against a YAML pipeline
+whose own progress message read "147 MB, this takes a while", and PyYAML — an undeclared
+dependency the setup docs warned about — is gone entirely. Everything CCP documented is
+real and works: `latest.jsonl`, build-pinned archives, the changes feed with `schemaChanged`
+flags, ETags. `--zip` re-imports from a cached archive with no network at all.
+
+Three things that surfaced only by doing it:
+
+* **`packagedVolume` is not `volume`.** The v0.9.23 import took `volume`, which for a ship is
+  the *assembled* figure — an assembled Nidhoggur is 11,250,000 m³ against 1,300,000 packaged,
+  and it is the packaged one that decides what a hauler carries. 829 types differ, all of
+  them ships and containers, i.e. precisely where profit-per-m³ gets used. The column is now
+  `sde_types.packaged_volume`. Caught before it ever rendered a number, because the column
+  was still NULL everywhere.
+* **Row counts cannot detect staleness, structurally.** Build 3470007 has *five fewer*
+  blueprint material rows than the bundle before it — CCP dropped Isogen from the Venture
+  and rebalanced four others. The refresh gate fired only when the bundle had *more* rows,
+  so a build that **removes** something could never reach a user. `sde_types` now carries a
+  build number and the gate compares that first. This retires W10 ahead of Step 4.
+* **`planetSchematics.types` is a list, not a dict**, and the tables must keep the exact
+  column names the app already queries (`required_level`, `time_bonus_pct`). Both were got
+  wrong first time; both are now pinned by tests.
+
+**Original recommendation, for the record.** Take the SDE from **CCP directly**, using the
+build-number and changes feeds, moving to JSONL. That gets automation, incremental updates, schema-change
 warnings and ETags with **no third-party dependency at all** — which matters, because both
 spreadsheets analysed in §9.2 and §9.3 died from renting their data, and this document
 should not recommend re-renting it.
@@ -987,7 +1011,7 @@ of this work), each mapped to the step that retires it:
 | W7 | Three substantial features sitting uncommitted (PI planner, margins, job splitting) | **Step 0 — done, v0.9.23** |
 | W8 | Invention absent from the data model — every T2 figure optimistic | Step 1 |
 | W9 | Synchronous token refresh blocks the event loop (the v0.9.22 bug class) | Step 4 |
-| W10 | No migration system; SDE refresh decided by row-count comparison | Step 4 |
+| W10 | No migration system; SDE refresh decided by row-count comparison | SDE half **done in Step 1** (build numbers, v0.9.24); migrations still Step 4 |
 | W11 | SQLite under a continuously writing sync worker | Step 4 |
 
 Found during the design work itself (same class, listed for completeness): trading
@@ -1253,7 +1277,7 @@ past the first joiner. Do not.
 2. Localised client names in the appraisal parser — support or explicit limitation?
 3. Alliance-leader authority: is "director in the executor corp" the accepted proxy?
 4. Reallocation policy for abandoned commitments.
-5. Does `planetResources.csv` replace the hardcoded matrix in `planet_data.py` (§8)?
+5. ~~Does `planetResources` replace the hardcoded matrix in `planet_data.py`?~~ **No — answered 2026-08-18.** `planetResources.jsonl` is 25,798 records keyed by *planet id* carrying `power` and `workforce`: the Equinox sovereignty system, nothing to do with PI extraction. The P0-per-planet-type matrix in `planet_data.py` stays hardcoded.
 6. Reactions board — inside Step 1, or its own step? It is the biggest quick win and the
    most tempting scope creep inside a correctness sprint.
 7. **Verify the market tax rates in game.** `app/market/taxes.py` ships 7.5% sales tax,

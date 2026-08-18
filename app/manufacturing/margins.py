@@ -306,13 +306,19 @@ def compute_margin(
 
 
 def _packaged_volume(conn: sqlite3.Connection, type_id: int) -> float | None:
-    """Packaged m³, or None when the SDE predates the volume column.
+    """Packaged m³, or None when the SDE predates the column.
 
     None is deliberate: profit-per-m³ is meaningless without it, and a made-up
     volume would rank the whole watchlist wrongly.
+
+    Packaged, not assembled. An assembled Nidhoggur is 11,250,000 m³ and a
+    packaged one is 1,300,000 — and it is the packaged figure that decides what
+    a hauler carries. 829 types differ, all ships and containers, which is
+    exactly the set where profit-per-m³ gets used.
     """
     try:
-        row = conn.execute("SELECT volume FROM sde_types WHERE type_id=?", (type_id,)).fetchone()
+        row = conn.execute(
+            "SELECT packaged_volume FROM sde_types WHERE type_id=?", (type_id,)).fetchone()
     except sqlite3.OperationalError:
         return None
     return row[0] if row and row[0] else None

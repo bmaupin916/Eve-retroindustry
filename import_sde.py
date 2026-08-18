@@ -1,15 +1,30 @@
 """
-Import the EVE Online SDE into a SQLite database.
-Parses fsd/blueprints.yaml and fsd/types.yaml.
-Usage: python import_sde.py
+Import the EVE Online static data export into SQLite.
+
+Reads CCP's **JSONL** export, downloaded straight from their static-data service
+and pinned to a build number — see `app/sde/feed.py` for why. The previous
+version parsed YAML out of a hand-populated `data/` directory using PyYAML,
+which is not in `requirements.txt`; that is why the dev-setup doc told you not
+to run this script. It is now safe to run.
+
+Usage:
+    python import_sde.py                      # newest build -> eve_cache.db
+    python import_sde.py --out sde_base.db    # fresh bundle DB from scratch
+    python import_sde.py --build 3470007      # pin to a specific build
+    python import_sde.py --zip some.zip       # use an archive already on disk
 """
-import re
-import yaml
-import sqlite3
+from __future__ import annotations
+
+import argparse
 import os
+import re
+import sqlite3
 import time
+import zipfile
+
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+
+from app.sde import feed
 
 # Matches "1% reduction in manufacturing time" or "...in reaction time".
 # Reactions skill (45746) has "...reaction time per skill level" — without
@@ -21,65 +36,17 @@ _BONUS_RE = re.compile(
 
 console = Console()
 
-_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-# The new SDE layout (build 3417089+) has files in the zip root, not in fsd/. Support
-# both layouts — data/fsd/ (older) and data/ (new).
-SDE_DIR = os.path.join(_DATA_DIR, "fsd") \
-    if os.path.exists(os.path.join(_DATA_DIR, "fsd", "types.yaml")) else _DATA_DIR
-DB_PATH = os.path.join(os.path.dirname(__file__), "eve_cache.db")
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(_ROOT, "eve_cache.db")
+CACHE_DIR = os.path.join(_ROOT, "data", "sde-archives")
 
+_SKILL_EXCLUDE = {3380, 3388}   # Handled separately in calc_job_time
+_IMPLANT_GROUP = 743            # Zainou/manufacturing implants — not fetchable via ESI skills
 
-def _yaml_load(f):
-    """Load YAML via the libyaml C loader if available (orders of magnitude faster
-    on the large types.yaml ~150 MB), otherwise the pure-Python SafeLoader."""
-    try:
-        from yaml import CSafeLoader as _Loader
-    except ImportError:
-        from yaml import SafeLoader as _Loader
-    return yaml.load(f, Loader=_Loader)
-
-
-BLUEPRINTS_YAML = os.path.join(SDE_DIR, "blueprints.yaml")
-TYPES_YAML = os.path.join(SDE_DIR, "types.yaml")
-GROUPS_YAML = os.path.join(SDE_DIR, "groups.yaml")
-PLANET_SCHEMATICS_YAML = os.path.join(SDE_DIR, "planetSchematics.yaml")
-
-
-def import_planet_schematics(conn: sqlite3.Connection):
-    """PI factory schematics: inputs → output (type_ids + quantities) + cycle time.
-    Powers the Planets production-chain view. Source: planetSchematics.yaml."""
-    if not os.path.exists(PLANET_SCHEMATICS_YAML):
-        console.print(f"[yellow]planetSchematics.yaml not found ({PLANET_SCHEMATICS_YAML}) — skipping[/]")
-        return
-    console.print("Loading planetSchematics.yaml…")
-    with open(PLANET_SCHEMATICS_YAML, "r", encoding="utf-8") as f:
-        data = _yaml_load(f)
-    sch_rows, mat_rows = [], []
-    for sid, info in (data or {}).items():
-        if not isinstance(info, dict):
-            continue
-        nf = info.get("name", {})
-        name = nf.get("en", "") if isinstance(nf, dict) else str(nf)
-        out_tid, out_qty = None, 0
-        for tid, td in (info.get("types") or {}).items():
-            if not isinstance(td, dict):
-                continue
-            qty = td.get("quantity", 0)
-            if td.get("isInput"):
-                mat_rows.append((int(sid), int(tid), qty))
-            else:
-                out_tid, out_qty = int(tid), qty
-        sch_rows.append((int(sid), name, info.get("cycleTime", 0), out_tid, out_qty))
-    conn.executemany(
-        "INSERT OR REPLACE INTO sde_planet_schematics "
-        "(schematic_id, name, cycle_time, output_type_id, output_qty) VALUES (?,?,?,?,?)",
-        sch_rows)
-    conn.executemany(
-        "INSERT OR REPLACE INTO sde_planet_schematic_materials "
-        "(schematic_id, type_id, quantity) VALUES (?,?,?)",
-        mat_rows)
-    conn.commit()
-    console.print(f"[green]Imported {len(sch_rows):,} planet schematics ({len(mat_rows):,} inputs)[/]")
+# Activities imported from each blueprint. Invention and the two research
+# activities are present in the source and deliberately not read yet — they land
+# with the invention cost model. Adding a name here is all the importer needs.
+_ACTIVITIES = ("manufacturing", "reaction")
 
 
 def init_db(conn: sqlite3.Connection):
@@ -90,10 +57,19 @@ def init_db(conn: sqlite3.Connection):
             group_id        INTEGER,
             published       INTEGER DEFAULT 1,
             market_group_id INTEGER,
-            -- Packaged volume in m³. Needed for profit-per-m³ in the margin
-            -- tracker; a DB imported before this column existed leaves it NULL
-            -- and callers degrade rather than reporting a wrong density.
-            volume          REAL
+            -- Volume of ONE unit as it ships, in m3. PACKAGED, not assembled:
+            -- an assembled Nidhoggur is 11,250,000 m3 and a packaged one is
+            -- 1,300,000, and it is the packaged figure that decides what a
+            -- hauler carries and therefore profit-per-m3. 829 types differ,
+            -- all of them ships and containers. The column this replaced was
+            -- named `volume` and held the assembled figure, which was wrong
+            -- for exactly the items where it mattered most.
+            packaged_volume REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS sde_groups (
+            group_id INTEGER PRIMARY KEY,
+            name     TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS sde_blueprint_materials (
@@ -149,6 +125,16 @@ def init_db(conn: sqlite3.Connection):
             PRIMARY KEY (schematic_id, type_id)
         );
 
+        -- Which SDE build this database was built from. Without it the only
+        -- answer to "is this current?" is a row count, which cannot see a
+        -- rebalance that changes values without changing how many there are.
+        CREATE TABLE IF NOT EXISTS sde_build (
+            id           INTEGER PRIMARY KEY CHECK (id = 1),
+            build_number INTEGER NOT NULL,
+            release_date TEXT,
+            imported_at  REAL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_bp_product ON sde_blueprint_products(product_type_id);
         CREATE INDEX IF NOT EXISTS idx_bp_materials ON sde_blueprint_materials(blueprint_type_id, activity);
         CREATE INDEX IF NOT EXISTS idx_bp_skills ON sde_blueprint_skills(blueprint_type_id, activity);
@@ -156,240 +142,224 @@ def init_db(conn: sqlite3.Connection):
     conn.commit()
 
 
-def import_types(conn: sqlite3.Connection) -> dict:
-    """Returns parsed types_data for reuse in skill bonus import."""
-    console.print("[cyan]Loading types.yaml (147 MB, this takes a while)...[/]")
-    t0 = time.time()
+def record_build(conn: sqlite3.Connection, build: feed.Build):
+    conn.execute(
+        "INSERT INTO sde_build (id, build_number, release_date, imported_at) "
+        "VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "build_number=excluded.build_number, release_date=excluded.release_date, "
+        "imported_at=excluded.imported_at",
+        (build.number, build.release_date, time.time()),
+    )
+    conn.commit()
 
-    with open(TYPES_YAML, "r", encoding="utf-8") as f:
-        data = _yaml_load(f)
 
-    console.print(f"[dim]YAML loaded in {time.time()-t0:.1f}s, importing {len(data):,} types...[/]")
+def import_types(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+    """types -> sde_types, and skill time bonuses in the same pass.
 
-    rows = []
-    for type_id, info in data.items():
-        if not isinstance(info, dict):
-            continue
-        name_field = info.get("name", {})
-        name = name_field.get("en", "") if isinstance(name_field, dict) else str(name_field)
+    One pass, because the descriptions the bonus regex needs live on the same
+    records. The YAML version kept the whole 150 MB parse in memory to reuse it
+    for exactly this; streaming makes that unnecessary.
+    """
+    rows, skills = [], []
+    for r in feed.records(z, "types"):
+        type_id = int(r["_key"])
+        name = feed.en(r.get("name"))
         if not name:
             continue
         rows.append((
-            int(type_id),
+            type_id,
             name,
-            info.get("groupID"),
-            1 if info.get("published", True) else 0,
-            info.get("marketGroupID"),
-            info.get("volume"),
+            r.get("groupID"),
+            1 if r.get("published", True) else 0,
+            r.get("marketGroupID"),
+            # Fall back to `volume` for the handful of types that carry no
+            # packaged figure; for those two are the same anyway.
+            r.get("packagedVolume", r.get("volume")),
         ))
+        if type_id in _SKILL_EXCLUDE or r.get("groupID") == _IMPLANT_GROUP:
+            continue
+        m = _BONUS_RE.search(feed.en(r.get("description")))
+        if m:
+            skills.append((type_id, name, float(m.group(1))))
 
     conn.executemany(
-        "INSERT OR REPLACE INTO sde_types (type_id, name, group_id, published, market_group_id, volume)"
-        " VALUES (?,?,?,?,?,?)",
-        rows
-    )
-    conn.commit()
-    console.print(f"[green]Imported {len(rows):,} types[/]")
-    return data
-
-
-_SKILL_EXCLUDE = {3380, 3388}  # Handled separately in calc_job_time
-_IMPLANT_GROUP  = 743           # Zainou/manufacturing implants — not fetchable via ESI skills
-
-
-def import_groups(conn: sqlite3.Connection):
-    """Import groups.yaml → sde_groups (group_id, name en).
-
-    Previously sde_groups was populated once via ESI (_ensure_groups_populated),
-    which meant new groups (e.g. 5120 Command Carrier from Cradle of War)
-    were never backfilled for existing users — rig_applies_to_product then
-    returned False through its INNER JOIN and no rig applied to products from
-    those groups.
-    """
-    if not os.path.exists(GROUPS_YAML):
-        console.print(f"[yellow]groups.yaml not found ({GROUPS_YAML}) — skipping[/]")
-        return
-    console.print("Loading groups.yaml…")
-    with open(GROUPS_YAML, "r", encoding="utf-8") as f:
-        groups = _yaml_load(f)
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS sde_groups (
-            group_id INTEGER PRIMARY KEY,
-            name     TEXT NOT NULL
-        );
-    """)
-    rows = []
-    for gid, g in groups.items():
-        name = (g.get("name") or {}).get("en") or f"Group {gid}"
-        rows.append((int(gid), name))
-    conn.executemany(
-        "INSERT OR REPLACE INTO sde_groups (group_id, name) VALUES (?,?)", rows
-    )
-    conn.commit()
-    console.print(f"  sde_groups: {len(rows)} groups")
-
-
-def import_skill_time_bonuses(conn: sqlite3.Connection, types_data: dict):
-    """Populate sde_skill_time_bonus from type descriptions."""
-    rows = []
-    for type_id, info in types_data.items():
-        if not isinstance(info, dict):
-            continue
-        tid = int(type_id)
-        if tid in _SKILL_EXCLUDE:
-            continue
-        if info.get("groupID") == _IMPLANT_GROUP:
-            continue
-        desc_field = info.get("description", {})
-        desc_en = desc_field.get("en", "") if isinstance(desc_field, dict) else str(desc_field)
-        m = _BONUS_RE.search(desc_en)
-        if not m:
-            continue
-        bonus_pct = float(m.group(1))
-        name_field = info.get("name", {})
-        name = name_field.get("en", "") if isinstance(name_field, dict) else str(name_field)
-        rows.append((tid, name, bonus_pct))
-
+        "INSERT OR REPLACE INTO sde_types "
+        "(type_id, name, group_id, published, market_group_id, packaged_volume) "
+        "VALUES (?,?,?,?,?,?)", rows)
     conn.execute("DELETE FROM sde_skill_time_bonus")
-    conn.executemany(
-        "INSERT OR REPLACE INTO sde_skill_time_bonus VALUES (?,?,?)", rows
-    )
+    conn.executemany("INSERT OR REPLACE INTO sde_skill_time_bonus VALUES (?,?,?)", skills)
     conn.commit()
-    console.print(f"[green]Imported {len(rows)} skills with a time bonus[/]")
+    console.print(f"[green]  types: {len(rows):,}[/] "
+                  f"[dim]({len(skills)} with a manufacturing/reaction time bonus)[/]")
+    return len(rows)
 
 
-def import_blueprints(conn: sqlite3.Connection):
-    console.print("[cyan]Loading blueprints.yaml...[/]")
+def import_groups(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+    """groups -> sde_groups.
 
-    with open(BLUEPRINTS_YAML, "r", encoding="utf-8") as f:
-        data = _yaml_load(f)
+    Previously populated once via ESI, which meant new groups (e.g. 5120 Command
+    Carrier from Cradle of War) were never backfilled for existing users —
+    rig_applies_to_product then returned False through its INNER JOIN and no rig
+    applied to products from those groups.
+    """
+    rows = [(int(r["_key"]), feed.en(r.get("name")) or f"Group {r['_key']}")
+            for r in feed.records(z, "groups")]
+    conn.executemany("INSERT OR REPLACE INTO sde_groups (group_id, name) VALUES (?,?)", rows)
+    conn.commit()
+    console.print(f"[green]  groups: {len(rows):,}[/]")
+    return len(rows)
 
-    console.print(f"[dim]Importing {len(data):,} blueprints...[/]")
 
+def import_blueprints(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
     bp_rows, mat_rows, prod_rows, skill_rows = [], [], [], []
 
-    for bp_type_id, info in data.items():
-        if not isinstance(info, dict):
-            continue
+    for r in feed.records(z, "blueprints"):
+        bp_id = int(r["_key"])
+        activities = r.get("activities") or {}
 
-        activities = info.get("activities", {})
-        max_limit = info.get("maxProductionLimit", 1)
+        bp_rows.append((
+            bp_id,
+            r.get("maxProductionLimit", 1),
+            (activities.get("manufacturing") or {}).get("time", 0),
+            (activities.get("reaction") or {}).get("time", 0),
+        ))
 
-        mfg_time = activities.get("manufacturing", {}).get("time", 0) if "manufacturing" in activities else 0
-        rxn_time = activities.get("reaction", {}).get("time", 0) if "reaction" in activities else 0
-
-        bp_rows.append((int(bp_type_id), max_limit, mfg_time, rxn_time))
-
-        for activity_name in ("manufacturing", "reaction"):
+        for activity_name in _ACTIVITIES:
             activity = activities.get(activity_name)
             if not activity:
                 continue
-
             for mat in activity.get("materials") or []:
-                mat_rows.append((
-                    int(bp_type_id),
-                    activity_name,
-                    int(mat["typeID"]),
-                    int(mat["quantity"]),
-                ))
-
+                mat_rows.append((bp_id, activity_name,
+                                 int(mat["typeID"]), int(mat["quantity"])))
             for prod in activity.get("products") or []:
-                prod_rows.append((
-                    int(bp_type_id),
-                    activity_name,
-                    int(prod["typeID"]),
-                    int(prod.get("quantity", 1)),
-                    float(prod.get("probability", 1.0)),
-                ))
-
+                prod_rows.append((bp_id, activity_name, int(prod["typeID"]),
+                                  int(prod.get("quantity", 1)),
+                                  float(prod.get("probability", 1.0))))
             for skill in activity.get("skills") or []:
-                skill_rows.append((
-                    int(bp_type_id),
-                    activity_name,
-                    int(skill["typeID"]),
-                    int(skill.get("level", 1)),
-                ))
+                skill_rows.append((bp_id, activity_name,
+                                   int(skill["typeID"]), int(skill.get("level", 1))))
 
-    conn.executemany(
-        "INSERT OR REPLACE INTO sde_blueprints VALUES (?,?,?,?)",
-        bp_rows
-    )
-    conn.executemany(
-        "INSERT OR REPLACE INTO sde_blueprint_materials VALUES (?,?,?,?)",
-        mat_rows
-    )
-    conn.executemany(
-        "INSERT OR REPLACE INTO sde_blueprint_products VALUES (?,?,?,?,?)",
-        prod_rows
-    )
+    conn.executemany("INSERT OR REPLACE INTO sde_blueprints VALUES (?,?,?,?)", bp_rows)
+    conn.executemany("INSERT OR REPLACE INTO sde_blueprint_materials VALUES (?,?,?,?)", mat_rows)
+    conn.executemany("INSERT OR REPLACE INTO sde_blueprint_products VALUES (?,?,?,?,?)", prod_rows)
     conn.execute("DELETE FROM sde_blueprint_skills")
-    conn.executemany(
-        "INSERT OR REPLACE INTO sde_blueprint_skills VALUES (?,?,?,?)",
-        skill_rows
-    )
+    conn.executemany("INSERT OR REPLACE INTO sde_blueprint_skills VALUES (?,?,?,?)", skill_rows)
     conn.commit()
+    console.print(f"[green]  blueprints: {len(bp_rows):,}[/] [dim]({len(mat_rows):,} materials, "
+                  f"{len(prod_rows):,} products, {len(skill_rows):,} skills)[/]")
+    return len(bp_rows)
 
-    console.print(f"[green]Imported: {len(bp_rows):,} blueprints, "
-                  f"{len(mat_rows):,} material rows, "
-                  f"{len(prod_rows):,} product rows, "
-                  f"{len(skill_rows):,} skill rows[/]")
+
+def import_planet_schematics(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+    """PI factory schematics: inputs -> output (type_ids + quantities) + cycle time.
+
+    Powers the Planets production-chain view and the PI planner. The output is
+    the single type whose `isInput` is false; everything else is an input.
+    """
+    sch_rows, mat_rows = [], []
+    for r in feed.records(z, "planetSchematics"):
+        sid = int(r["_key"])
+        out_id, out_qty = None, 0
+        # `types` is a list of {_key, isInput, quantity} -- exactly one entry
+        # has isInput false and that is the schematic's output.
+        for spec in r.get("types") or []:
+            type_id, qty = int(spec["_key"]), int(spec.get("quantity") or 0)
+            if spec.get("isInput"):
+                mat_rows.append((sid, type_id, qty))
+            else:
+                out_id, out_qty = type_id, qty
+        sch_rows.append((sid, feed.en(r.get("name")), int(r.get("cycleTime") or 0),
+                         out_id, out_qty))
+
+    conn.executemany("INSERT OR REPLACE INTO sde_planet_schematics VALUES (?,?,?,?,?)", sch_rows)
+    conn.executemany("INSERT OR REPLACE INTO sde_planet_schematic_materials VALUES (?,?,?)", mat_rows)
+    conn.commit()
+    console.print(f"[green]  planet schematics: {len(sch_rows):,}[/] "
+                  f"[dim]({len(mat_rows):,} inputs)[/]")
+    return len(sch_rows)
+
+
+def _progress(done: int, total: int):
+    if not total:
+        return
+    pct = done * 100 // total
+    if pct != getattr(_progress, "_last", None):
+        _progress._last = pct
+        console.print(f"[dim]  downloading… {pct}% ({done/1e6:.0f}/{total/1e6:.0f} MB)[/]",
+                      end="\r")
 
 
 def main():
-    console.print("[bold]EVE Retroindustry — Import SDE into SQLite[/]\n")
+    ap = argparse.ArgumentParser(description="Import the EVE SDE into SQLite.")
+    ap.add_argument("--build", type=int, help="pin to a specific SDE build number")
+    ap.add_argument("--zip", help="use an archive already on disk instead of downloading")
+    ap.add_argument("--out", default=DB_PATH, help="database to write (default: eve_cache.db)")
+    ap.add_argument("--cache", default=CACHE_DIR, help="where downloaded archives are kept")
+    ap.add_argument("--fresh", action="store_true",
+                    help="delete the target database first (use when building a bundle)")
+    args = ap.parse_args()
 
-    if not os.path.exists(BLUEPRINTS_YAML):
-        console.print(f"[red]Not found: {BLUEPRINTS_YAML}[/]")
-        return
-    if not os.path.exists(TYPES_YAML):
-        console.print(f"[red]Not found: {TYPES_YAML}[/]")
-        return
+    console.print("[bold]EVE Retroindustry — import SDE[/]\n")
 
-    conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
+    if args.zip:
+        archive = args.zip
+        build = feed.archive_build(archive)
+        if build is None:
+            console.print(f"[red]Not a readable SDE archive: {archive}[/]")
+            return 1
+        console.print(f"Using local archive [cyan]{archive}[/] (build {build})")
+    else:
+        build = feed.Build(args.build) if args.build else feed.latest_build()
+        console.print(f"Build [cyan]{build}[/]")
+        try:
+            changed = feed.schema_changed_datasets(build.number)
+        except Exception:
+            changed = set()          # advisory only; never block an import on it
+        if changed:
+            console.print(f"[yellow]  schema changed this build: {', '.join(sorted(changed))}[/]")
+        archive = feed.download_archive(build.number, args.cache, progress=_progress)
+        console.print(f"Archive [cyan]{archive}[/]" + " " * 30)
 
-    t_start = time.time()
-    types_data = import_types(conn)
-    import_skill_time_bonuses(conn, types_data)
-    import_blueprints(conn)
-    import_groups(conn)
-    import_planet_schematics(conn)
-    conn.close()
+    if args.fresh and os.path.exists(args.out):
+        os.remove(args.out)
+        console.print(f"[dim]Removed existing {args.out}[/]")
 
-    console.print(f"\n[bold green]Done in {time.time()-t_start:.1f}s[/]")
-    console.print(f"Database: {DB_PATH}")
+    t0 = time.time()
+    conn = sqlite3.connect(args.out)
+    try:
+        init_db(conn)
+        with zipfile.ZipFile(archive) as z:
+            import_types(conn, z)
+            import_groups(conn, z)
+            import_blueprints(conn, z)
+            import_planet_schematics(conn, z)
+        record_build(conn, build)
+    finally:
+        conn.close()
 
-    # Quick test — Nidhoggur
-    console.print("\n[bold]Test — Nidhoggur (24483):[/]")
-    conn = sqlite3.connect(DB_PATH)
+    console.print(f"\n[bold green]Done in {time.time()-t0:.1f}s[/] -> {args.out}")
 
-    # Find the blueprint for Nidhoggur
-    bp = conn.execute(
-        "SELECT blueprint_type_id FROM sde_blueprint_products WHERE product_type_id=? AND activity='manufacturing'",
-        (24483,)
-    ).fetchone()
-
-    if bp:
-        bp_id = bp[0]
-        bp_name = conn.execute("SELECT name FROM sde_types WHERE type_id=?", (bp_id,)).fetchone()
-        console.print(f"  Blueprint: {bp_name[0] if bp_name else '?'} (ID: {bp_id})")
-
-        materials = conn.execute("""
-            SELECT t.name, m.quantity
-            FROM sde_blueprint_materials m
+    # Smoke check — a capital that exercises the whole join path.
+    conn = sqlite3.connect(args.out)
+    try:
+        bp = conn.execute(
+            "SELECT blueprint_type_id FROM sde_blueprint_products "
+            "WHERE product_type_id=? AND activity='manufacturing'", (24483,)).fetchone()
+        if not bp:
+            console.print("[red]Smoke check failed: no blueprint for Nidhoggur (24483)[/]")
+            return 1
+        mats = conn.execute("""
+            SELECT t.name, m.quantity FROM sde_blueprint_materials m
             JOIN sde_types t ON t.type_id = m.material_type_id
             WHERE m.blueprint_type_id=? AND m.activity='manufacturing'
-            ORDER BY m.quantity DESC
-        """, (bp_id,)).fetchall()
-
-        console.print(f"  Materials ({len(materials)}):")
-        for name, qty in materials:
-            console.print(f"    - {name}: {qty:,}")
-    else:
-        console.print("  [red]Blueprint not found[/]")
-
-    conn.close()
+            ORDER BY m.quantity DESC""", (bp[0],)).fetchall()
+        console.print(f"\n[bold]Nidhoggur[/] — {len(mats)} materials")
+        for name, qty in mats:
+            console.print(f"    {name}: {qty:,}")
+    finally:
+        conn.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

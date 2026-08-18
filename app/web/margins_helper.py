@@ -215,9 +215,9 @@ def _station_name(conn: sqlite3.Connection, location_id) -> str:
 
 
 def _volume_column_present(conn: sqlite3.Connection) -> bool:
-    """False on an SDE imported before `sde_types.volume` existed — the page
+    """False on an SDE imported before `sde_types.packaged_volume` existed — the page
     hides profit-per-m³ rather than showing a column of dashes."""
-    return "volume" in {r[1] for r in conn.execute("PRAGMA table_info(sde_types)")}
+    return "packaged_volume" in {r[1] for r in conn.execute("PRAGMA table_info(sde_types)")}
 
 
 def _all_blueprints(conn: sqlite3.Connection) -> list:

@@ -22,6 +22,8 @@ data/tokens.json
 
 # EVE SDE data (large files, downloaded separately)
 data/sde.zip
+# Downloaded SDE archives (~95 MB each), kept so a re-import needs no network
+data/sde-archives/
 data/fsd/
 data/fsd_backup/
 

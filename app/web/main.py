@@ -1,7 +1,7 @@
 """FastAPI web application for EVE Retroindustry."""
 from __future__ import annotations
 
-APP_VERSION = "0.9.23"
+APP_VERSION = "0.9.24"
 
 import asyncio
 import datetime
@@ -229,6 +229,7 @@ _SDE_TABLES_TO_REFRESH = (
     "sde_skill_time_bonus",
     "sde_planet_schematics",           # v0.8.106 (PI factory chains)
     "sde_planet_schematic_materials",  # v0.8.106
+    "sde_build",                       # v0.9.24 (which SDE build this came from)
 )
 
 
@@ -265,6 +266,21 @@ def _refresh_sde_from_bundle(conn: sqlite3.Connection) -> int:
         except sqlite3.OperationalError:
             groups = 0
         return types, groups
+
+    def _build(c) -> int:
+        """The SDE build this database was imported from, 0 if unknown.
+
+        The authoritative answer to "is this stale?". Row counts cannot give
+        one: build 3470007 has FIVE FEWER blueprint material rows than the
+        bundle shipped with v0.9.23, because CCP rebalanced a handful of
+        blueprints. A comparison that only fires when the bundle has *more*
+        rows can never deliver a build that removes something.
+        """
+        try:
+            row = c.execute("SELECT build_number FROM sde_build WHERE id=1").fetchone()
+        except sqlite3.OperationalError:
+            return 0
+        return int(row[0]) if row and row[0] else 0
 
     user_count, user_groups = _counts(conn)
     # ATTACH-free: we read from the bundled DB via a separate connection and copy
@@ -309,11 +325,17 @@ def _refresh_sde_from_bundle(conn: sqlite3.Connection) -> int:
             for t in _SDE_TABLES_TO_REFRESH
         )
 
-        if (bundled_count <= user_count and bundled_groups <= user_groups
-                and not missing and not stale):
-            return user_count  # up to date on types, groups, tables and columns
+        user_build, bundled_build = _build(conn), _build(bsrc)
+        # A newer build always wins, in either direction of row count. When
+        # neither side records a build we fall back to the old heuristics.
+        newer_build = bundled_build > user_build
+
+        if (not newer_build and bundled_count <= user_count
+                and bundled_groups <= user_groups and not missing and not stale):
+            return user_count  # up to date on build, types, groups, tables and columns
 
         print(f"[sde] refreshing SDE tables: user={user_count}, bundled={bundled_count}, "
+              f"build {user_build} -> {bundled_build}, "
               f"missing_table={missing}, stale_columns={stale}", flush=True)
         payload = []
         for table in _SDE_TABLES_TO_REFRESH:
