@@ -23,7 +23,7 @@ from rich.table import Table
 from rich import box
 
 from app.auth.token_store import get_valid_token, get_character, is_logged_in
-from app.esi.client import search_type_by_name
+from app.esi.client import esi_client, search_type_by_name
 from app.cache.blueprint_cache import resolve_type
 from app.db.database import get_session
 from app.db.type_resolver import resolve_names_bulk
@@ -96,7 +96,7 @@ async def resolve_station_names_bulk(
     token: str | None = None,
 ) -> dict[int, str]:
     """Resolve a list of location_ids to names in parallel."""
-    async with httpx.AsyncClient() as client:
+    async with esi_client() as client:
         tasks = [resolve_station_name(client, lid, token) for lid in location_ids]
         names = await asyncio.gather(*tasks)
     return dict(zip(location_ids, names))
@@ -104,7 +104,7 @@ async def resolve_station_names_bulk(
 
 async def list_blueprints(char_id: int, token: str, conn: sqlite3.Connection):
     """List the character's blueprints. Unknown type_ids are resolved via ESI."""
-    async with httpx.AsyncClient() as client:
+    async with esi_client() as client:
         console.print("[dim]Loading blueprints...[/]")
         bps = await fetch_blueprints(client, char_id, token, conn)
 
@@ -145,7 +145,7 @@ async def list_blueprints(char_id: int, token: str, conn: sqlite3.Connection):
 
 async def list_locations(char_id: int, token: str, conn: sqlite3.Connection):
     """List locations where the character has materials (bulk name resolution)."""
-    async with httpx.AsyncClient() as client:
+    async with esi_client() as client:
         console.print("[dim]Loading assets...[/]")
         assets = await fetch_assets(client, char_id, token, conn)
 
@@ -233,12 +233,12 @@ async def main():
     # Resolve product to type_id
     if args.product.isdigit():
         type_id = int(args.product)
-        async with httpx.AsyncClient() as client:
+        async with esi_client() as client:
             session = get_session()
             type_name = await resolve_type(client, session, type_id)
             session.close()
     else:
-        async with httpx.AsyncClient() as client:
+        async with esi_client() as client:
             session = get_session()
             results = await search_type_by_name(client, args.product)
             if not results:
@@ -252,7 +252,7 @@ async def main():
     console.print(f"  Product: [cyan]{type_name}[/] (ID: {type_id}) ×{args.qty}")
 
     # Load the character's blueprints and assets
-    async with httpx.AsyncClient() as client:
+    async with esi_client() as client:
         console.print("[dim]Loading character blueprints...[/]")
         blueprints = await fetch_blueprints(client, char_id, token, conn, force_refresh=args.refresh)
         console.print(f"[dim]Found {len(blueprints)} blueprints.[/]")
@@ -264,7 +264,7 @@ async def main():
     available = assets_at_location(all_assets, args.station)
     console.print(f"[dim]Materials at station {args.station}: {len(available)} kinds[/]")
 
-    async with httpx.AsyncClient() as client:
+    async with esi_client() as client:
         station_name = await resolve_station_name(client, args.station, token)
 
     # Pick ME from the character's blueprint (needed before loading prices)
@@ -279,7 +279,7 @@ async def main():
 
     # Collect type_ids — we need every node in the tree plus the product itself
     all_ids = list(set(collect_all_type_ids(_root) + [type_id]))
-    async with httpx.AsyncClient() as client:
+    async with esi_client() as client:
         if args.jita:
             console.print(f"[dim]Loading live Jita prices for {len(all_ids)} types...[/]")
             ensure_price_table(conn)

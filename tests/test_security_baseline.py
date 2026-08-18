@@ -32,7 +32,10 @@ def test_user_agent_component_tag_keeps_version_and_contact():
 
 
 def test_esi_client_sends_user_agent():
-    """Every call through esi_client() — the path all ESI traffic takes."""
+    """Every call through esi_client() — the path all ESI traffic takes.
+
+    That second clause is enforced by the next test, not this one.
+    """
     from app.esi.client import esi_client
 
     # Never awaited, so no connection is opened and nothing needs closing.
@@ -40,6 +43,42 @@ def test_esi_client_sends_user_agent():
     assert client.headers["User-Agent"] == USER_AGENT
     # The compatibility-date pin must survive the addition.
     assert client.headers["X-Compatibility-Date"]
+
+
+def test_no_module_builds_its_own_httpx_client():
+    """The docstring above claims esi_client() is 'the path all ESI traffic takes'.
+
+    It was not true when written: main.py and plan.py — the two CLI entry
+    points — each built a bare httpx.AsyncClient(), so every call they made
+    reached CCP with no User-Agent, no X-Compatibility-Date pin and neither
+    rate-limit governor. Nothing in the test suite noticed, because the tests
+    asked the wrapper about itself rather than asking who bypasses it.
+
+    So this one greps instead. Two constructions are sanctioned: the wrapper
+    itself, and the SDE feed's sync client (a different host, its own
+    User-Agent, no ESI versioning to pin).
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sanctioned = {root / "app" / "esi" / "client.py", root / "app" / "sde" / "feed.py"}
+    pattern = re.compile(r"httpx\.(Async)?Client\(")
+
+    offenders = []
+    sources = list((root / "app").rglob("*.py")) + [root / "main.py", root / "plan.py"]
+    for path in sources:
+        if path in sanctioned:
+            continue
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if pattern.search(line):
+                offenders.append(f"{path.relative_to(root)}:{lineno}")
+
+    assert not offenders, (
+        "these build an httpx client directly instead of calling esi_client(), "
+        "so they send unidentified, unpinned, ungoverned traffic to CCP: "
+        + ", ".join(offenders)
+    )
 
 
 def test_esi_client_caller_can_still_override_headers():

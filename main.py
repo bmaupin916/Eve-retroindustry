@@ -14,12 +14,11 @@ import sys
 import argparse
 import os
 import sqlite3
-import httpx
 from rich.console import Console
 
 from app.db.database import get_session
 from app.cache.blueprint_cache import resolve_type
-from app.esi.client import search_type_by_name
+from app.esi.client import esi_client, search_type_by_name
 from app.bom.resolver import BOMResolver
 from app.bom.optimizer import optimize
 from app.bom.display import print_bom_tree, print_primary_materials, print_bom_stats
@@ -41,7 +40,7 @@ DB_ABS = os.path.abspath(os.path.join(os.path.dirname(__file__), "eve_cache.db")
 
 
 async def find_type_id(query: str) -> tuple[int, str] | None:
-    async with httpx.AsyncClient() as client:
+    async with esi_client() as client:
         session = get_session()
         console.print(f"[dim]Searching for '{query}'...[/]")
         results = await search_type_by_name(client, query)
@@ -71,7 +70,7 @@ async def get_prices(
     use_jita: bool,
 ) -> dict[int, tuple[float | None, float | None]]:
     """Return {type_id: (sell_price, buy_price)}."""
-    async with httpx.AsyncClient() as client:
+    async with esi_client() as client:
         if use_jita:
             console.print(f"[dim]Loading live Jita prices for {len(type_ids)} types...[/]")
             conn = sqlite3.connect(DB_ABS)
@@ -124,7 +123,7 @@ async def main():
 
     if args.query.isdigit():
         type_id = int(args.query)
-        async with httpx.AsyncClient() as client:
+        async with esi_client() as client:
             session = get_session()
             type_name = await resolve_type(client, session, type_id)
             session.close()
