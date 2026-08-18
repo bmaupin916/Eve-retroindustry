@@ -1,6 +1,10 @@
 httpx>=0.27
 pydantic>=2.0
 sqlalchemy>=2.0
+# Schema is declared once in app/db/schema.py as SQLAlchemy Core metadata, so
+# one declaration emits both SQLite and Postgres DDL; alembic migrates it and
+# stamps databases that predate it. See app/db/migrate.py.
+alembic>=1.13
 rich>=13.0
 fastapi>=0.111
 uvicorn[standard]>=0.29

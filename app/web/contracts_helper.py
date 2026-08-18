@@ -15,41 +15,12 @@ import time
 
 from app.character import contracts as contracts_api
 from app.esi.client import esi_client
+from app.db.schema import ensure_schema as ensure_db_schema
 
 
 def ensure_public_contract_tables(conn: sqlite3.Connection) -> None:
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS public_contract_meta (
-            region_id      INTEGER PRIMARY KEY,
-            indexed_at     REAL,
-            contract_count INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS public_contracts (
-            contract_id       INTEGER PRIMARY KEY,
-            region_id         INTEGER,
-            type              TEXT,
-            price             REAL,
-            reward            REAL,
-            collateral        REAL,
-            buyout            REAL,
-            volume            REAL,
-            date_expired      TEXT,
-            title             TEXT,
-            start_location_id INTEGER,
-            end_location_id   INTEGER,
-            issuer_id         INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_pc_region ON public_contracts(region_id);
-        CREATE TABLE IF NOT EXISTS public_contract_items (
-            contract_id  INTEGER,
-            type_id      INTEGER,
-            quantity     INTEGER,
-            is_included  INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_pci_contract ON public_contract_items(contract_id);
-        CREATE INDEX IF NOT EXISTS idx_pci_type ON public_contract_items(type_id);
-    """)
-    conn.commit()
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def get_index_status(conn: sqlite3.Connection, region_id: int) -> dict | None:

@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 import httpx
+from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE  = "https://esi.evetech.net/latest"
 CACHE_TTL = 3600  # 1 hour
@@ -87,15 +88,9 @@ def get_mfg_skill_ids(conn: sqlite3.Connection) -> set[int]:
     return science_ids | _GENERAL_SKILL_IDS
 
 
-def ensure_skills_table(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS char_skills_cache (
-            character_id INTEGER PRIMARY KEY,
-            data_json    TEXT NOT NULL,
-            cached_at    REAL NOT NULL
-        )
-    """)
-    conn.commit()
+def ensure_skills_table(conn: sqlite3.Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def _parse_blob(raw: str) -> tuple[int, dict[int, int]]:

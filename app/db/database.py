@@ -4,12 +4,10 @@ from sqlalchemy.pool import NullPool
 import json
 import os
 
-# launcher.py sets EVE_APP_DIR to a writable location (next to the .exe /
-# .AppImage). Fall back to the project root for dev mode.
-_APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
-DB_PATH = os.path.join(_APP_DIR, "eve_cache.db")
+# Where the database lives is now answered in one place, because Alembic needs
+# the same answer from outside the application and cannot import this module to
+# get it — `create_all` below runs on import.
+from app.db.location import DB_PATH, database_url
 
 
 class Base(DeclarativeBase):
@@ -38,7 +36,7 @@ class BlueprintCache(Base):
 # "(sqlite3.OperationalError) attempt to write a readonly database"
 # (SQLITE_READONLY_DBMOVED) on the next INSERT.
 engine = create_engine(
-    f"sqlite:///{os.path.abspath(DB_PATH)}",
+    database_url(),
     poolclass=NullPool,
     # 30s busy timeout so these writes don't raise "database is locked" when the
     # add-character background sync and token refreshes are writing concurrently.

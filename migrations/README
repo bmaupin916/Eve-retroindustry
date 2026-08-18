@@ -1,0 +1,25 @@
+Migrations for the application's own tables.
+
+The schema is declared in `app/db/schema.py` as SQLAlchemy Core metadata, and
+that is the single source of truth — these revisions describe how to get an
+existing database to it, not what it is.
+
+    alembic current                     # where this database stands
+    alembic revision --autogenerate -m "what changed"
+    alembic upgrade head                # startup does this automatically
+
+Two things that are not obvious:
+
+* **`sde_*` is not here.** CCP's static data is dropped and rebuilt wholesale on
+  every SDE build, so putting it under migration control would mean a revision
+  every time CCP adds a column to something we do not own. It is created
+  directly by `apply_sde_schema()`; `include_object` in `app/db/migrate.py`
+  keeps it out of autogenerate.
+
+* **The URL comes from the application.** `alembic.ini` deliberately leaves
+  `sqlalchemy.url` unset; `env.py` takes it from `app.db.location.database_url()`,
+  which reads `EVE_DATABASE_URL` and otherwise points at the local SQLite file.
+  That environment variable is the seam the Postgres cutover goes through.
+
+If `test_the_migrations_match_the_declaration` fails, someone changed
+`app/db/schema.py` without generating a revision. Generate it.

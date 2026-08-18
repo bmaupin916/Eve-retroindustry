@@ -25,6 +25,7 @@ import sqlite3
 import time
 
 from app.web import security
+from app.db.schema import ensure_schema as ensure_db_schema
 
 # Short, because the intended gap between running this and clicking the link is
 # seconds. A token that outlives the terminal it was printed in is a liability.
@@ -32,15 +33,8 @@ TOKEN_TTL = 600.0
 
 
 def ensure_bootstrap_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS app_bootstrap (
-            token        TEXT PRIMARY KEY,
-            character_id INTEGER NOT NULL,
-            created_at   REAL NOT NULL
-        )
-        """
-    )
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def issue_token(conn: sqlite3.Connection, character_id: int) -> str:

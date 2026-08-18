@@ -1228,7 +1228,7 @@ of this work), each mapped to the step that retires it:
 | W7 | Three substantial features sitting uncommitted (PI planner, margins, job splitting) | **Step 0 — done, v0.9.23** |
 | W8 | Invention absent from the data model — every T2 figure optimistic | **Done — root v0.9.25, whole tree v0.9.29** |
 | W9 | Synchronous token refresh blocks the event loop (the v0.9.22 bug class) | Step 4 |
-| W10 | No migration system; SDE refresh decided by row-count comparison | SDE half **done in Step 1** (build numbers, v0.9.24); migrations still Step 4 |
+| W10 | No migration system; SDE refresh decided by row-count comparison | **Done.** SDE half in Step 1 (build numbers, v0.9.24); migrations in Step 4 (Alembic, v0.9.30) |
 | W11 | SQLite under a continuously writing sync worker | Step 4 |
 
 Found during the design work itself (same class, listed for completeness): trading
@@ -1449,11 +1449,48 @@ assertion noticing. Same shape as the `esi_client()` docstring in Step 2 — twi
 so it is worth stating as a rule: **a name that claims something about the world needs an
 assertion about the world.**
 
-**Step 4 — Platform foundations.** Postgres + Alembic (decide once, not hedged); async
-token refresh done properly; background sync worker with delay-after-completion + jitter;
-cache-only routes; ETags on every fetch; 4XX quarantine per character; verify the
-OpenAPI/compatibility-date situation before writing the worker; split `main.py` into
-routers while every route is being touched anyway. *(W6, W9, W10, W11)*
+**Step 4 — Platform foundations. 🟡 STARTED, v0.9.30 — 2 of 8 items.** Postgres + Alembic
+(decide once, not hedged); async token refresh done properly; background sync worker with
+delay-after-completion + jitter; cache-only routes; ETags on every fetch; 4XX quarantine
+per character; ~~verify the OpenAPI/compatibility-date situation before writing the
+worker~~; split `main.py` into routers while every route is being touched anyway.
+*(W6, W9, W10, W11)*
+
+| Item | State |
+|---|---|
+| **Schema declared once** | ✅ **done.** `app/db/schema.py` holds all 51 tables as SQLAlchemy Core metadata. It replaced 34 DDL statements in 14 modules, 20 `ensure_*()` functions, 8 `ALTER TABLE` probes and a second copy of the SDE schema in `import_sde.py` — 549 lines deleted. Pinned by a call-site scan: no DDL may exist outside that module. |
+| **Migrations** | ✅ **done.** Alembic, baseline `5c9156e72c43`, run at startup. Pre-Alembic databases are stamped rather than rebuilt. `test_the_migrations_match_the_declaration` fails if the declaration and the history drift. |
+| **Postgres itself** | ⬜ not started. The declaration already emits Postgres DDL and `EVE_DATABASE_URL` is the seam, but ~316 hand-written queries still assume SQLite — 26 `INSERT OR REPLACE` chief among them. |
+| **Async token refresh** (W9) | ⬜ not started |
+| **Background sync worker** | ⬜ not started. Must emit events, not just fill caches — §9.5 depends on it. |
+| **Cache-only routes** | ⬜ not started |
+| **ETags on every fetch** | ⬜ not started |
+| **4XX quarantine per character** | ⬜ not started |
+| **Split `main.py`** (W6) | ⬜ not started. 7,386 lines / 76 routes. |
+
+Compatibility dates are struck through because that question was answered on 2026-08-18
+and was already handled — see §14.
+
+**Two bugs surfaced by declaring the schema**, both live, neither visible from reading the
+code that caused them:
+
+* **Every SDE refresh silently un-indexed the database.** `_refresh_sde_from_bundle()`
+  replays each table's DDL from `sqlite_master WHERE type='table'` after a `DROP TABLE`.
+  Dropping a table drops its indexes; the stored table DDL does not carry them. The bundled
+  `sde_base.db` ships with six and the live database had **zero**. Three of the six were
+  redundant with a primary-key prefix; the three that were not include `idx_bp_product`,
+  which is "which blueprint makes this item" — a full scan of `sde_blueprint_products` on
+  every node of every bill of materials. A market-group lookup was measured at **2.1 ms**
+  scanning 52,848 rows.
+* **Four tables only existed if you had visited the right page.** `public_contracts`,
+  `public_contract_items`, `public_contract_meta` and `route_jump_cache` were created
+  lazily on first use, so two installs of the same version had different schemas — and the
+  migration baseline would have been "whatever tables this database happens to have".
+
+Both are the same shape as the v0.9.29 defects: invisible until something *ran*, in code
+long marked done. The pattern now has a name in this project — **a name that claims
+something about the world needs an assertion about the world** — and the two tests added
+here are call-site scans for exactly that reason.
 
 **Step 5 — Multi-tenancy.** Accounts, character linking, main-character pointer; every
 table gains an owner scope; all reads through an account-scoped query layer with a CI lint

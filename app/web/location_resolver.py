@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import httpx
 from app.esi.client import esi_client
+from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE = "https://esi.evetech.net/latest"
 _cache: dict[int, str] = {}
@@ -33,27 +34,9 @@ def _set_error_limited(seconds: float = 60.0) -> None:
     _error_limited_until = max(_error_limited_until, time.monotonic() + seconds)
 
 
-def ensure_location_name_table(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS location_name_cache (
-            location_id    INTEGER PRIMARY KEY,
-            name           TEXT NOT NULL,
-            solar_system_id INTEGER
-        )
-    """)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(location_name_cache)")}
-    if "solar_system_id" not in cols:
-        conn.execute("ALTER TABLE location_name_cache ADD COLUMN solar_system_id INTEGER")
-    if "region_id" not in cols:
-        conn.execute("ALTER TABLE location_name_cache ADD COLUMN region_id INTEGER")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS solar_system_cache (
-            system_id       INTEGER PRIMARY KEY,
-            security_status REAL,
-            cached_at       INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-        )
-    """)
-    conn.commit()
+def ensure_location_name_table(conn: sqlite3.Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 async def get_security_status(

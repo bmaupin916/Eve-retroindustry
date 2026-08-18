@@ -25,36 +25,15 @@ from app.manufacturing.margins import (
 )
 from app.web.app_defaults import get_defaults, is_configured
 from app.market.taxes import selling_costs
+from app.db.schema import ensure_schema as ensure_db_schema
 
 # Days of history behind the rolling average.
 AVG_WINDOW_DAYS = 7
 
 
 def ensure_margin_tables(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS margin_watchlist (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            type_id  INTEGER NOT NULL,
-            me       INTEGER NOT NULL DEFAULT 0,
-            te       INTEGER NOT NULL DEFAULT 0,
-            added_at REAL,
-            -- The same product at two ME levels is two genuinely different
-            -- propositions, so (type, ME, TE) is the identity, not the type.
-            UNIQUE (type_id, me, te)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS margin_snapshot (
-            item_id     INTEGER NOT NULL,
-            day         TEXT NOT NULL,          -- YYYY-MM-DD, UTC
-            margin_pct  REAL,
-            profit      REAL,
-            sell_price  REAL,
-            captured_at REAL,
-            PRIMARY KEY (item_id, day)
-        )
-    """)
-    conn.commit()
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def _today() -> str:

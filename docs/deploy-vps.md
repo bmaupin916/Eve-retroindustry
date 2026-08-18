@@ -103,7 +103,22 @@ That is a few minutes and several hundred MB of downloads. The build number it
 pins is recorded in the database, so a later run knows whether it has anything
 to do — and so does startup, which upgrades an existing database from the
 bundle whenever the bundle is newer or carries a table or column the database
-lacks. Schema changes therefore arrive with `git pull`, not with a migration.
+lacks.
+
+That covers CCP's static data, which is replaced wholesale and deliberately
+kept out of the migration history. The application's own tables are the other
+half, and since v0.9.30 they are versioned with Alembic: startup runs
+`upgrade_to_head()` before serving anything, so a schema change still arrives
+with `git pull` and a restart — the difference is that it now arrives the same
+way on every deployment instead of depending on which pages have been visited.
+
+A database that predates Alembic is *stamped* at the baseline rather than
+rebuilt, on the evidence that the app's tables are present while no revision is
+recorded. Nothing to do by hand. To see where a database stands:
+
+```bash
+sudo -u eve .venv/bin/alembic current
+```
 
 ## 5. Configuration
 

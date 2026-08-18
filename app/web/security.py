@@ -28,6 +28,7 @@ import os
 import secrets
 import sqlite3
 import time
+from app.db.schema import ensure_schema as ensure_db_schema
 
 # Cookie carrying the session id. Not `active_char`, which stays what it always
 # was: which character the UI is currently showing.
@@ -152,26 +153,8 @@ def origin_is_allowed(origin_header: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 def ensure_sessions_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS app_sessions (
-            session_id   TEXT PRIMARY KEY,
-            character_id INTEGER NOT NULL,
-            csrf_token   TEXT NOT NULL,
-            created_at   REAL NOT NULL,
-            last_seen_at REAL NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS app_owner (
-            id           INTEGER PRIMARY KEY CHECK (id = 1),
-            character_id INTEGER NOT NULL,
-            claimed_at   REAL NOT NULL
-        )
-        """
-    )
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def get_owner_id(conn: sqlite3.Connection) -> int | None:

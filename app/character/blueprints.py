@@ -9,6 +9,7 @@ import time
 import sqlite3
 import json
 import httpx
+from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE = "https://esi.evetech.net/latest"
 CACHE_TTL = 60 * 15  # 15 minutes
@@ -26,15 +27,9 @@ class CharBlueprint:
     time_efficiency: int       # TE 0-20
 
 
-def ensure_bp_table(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS char_blueprints_cache (
-            character_id INTEGER NOT NULL,
-            data_json    TEXT NOT NULL,
-            cached_at    REAL
-        )
-    """)
-    conn.commit()
+def ensure_bp_table(conn: sqlite3.Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def _load_cache(conn: sqlite3.Connection, character_id: int) -> list[dict] | None:

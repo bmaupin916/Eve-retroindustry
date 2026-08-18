@@ -25,6 +25,7 @@ import zipfile
 from rich.console import Console
 
 from app.sde import feed
+from app.db.schema import apply_sde_schema
 
 # Matches "1% reduction in manufacturing time" or "...in reaction time".
 # Reactions skill (45746) has "...reaction time per skill level" — without
@@ -56,155 +57,14 @@ _ACTIVITIES = ("manufacturing", "reaction", "invention", "copying")
 
 
 def init_db(conn: sqlite3.Connection):
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS sde_types (
-            type_id         INTEGER PRIMARY KEY,
-            name            TEXT NOT NULL,
-            group_id        INTEGER,
-            published       INTEGER DEFAULT 1,
-            market_group_id INTEGER,
-            -- Volume of ONE unit as it ships, in m3. PACKAGED, not assembled:
-            -- an assembled Nidhoggur is 11,250,000 m3 and a packaged one is
-            -- 1,300,000, and it is the packaged figure that decides what a
-            -- hauler carries and therefore profit-per-m3. 829 types differ,
-            -- all of them ships and containers. The column this replaced was
-            -- named `volume` and held the assembled figure, which was wrong
-            -- for exactly the items where it mattered most.
-            packaged_volume REAL,
-            -- How many units one reprocessing batch consumes. Refining is
-            -- all-or-nothing per batch: 100 units for ore and compressed ore,
-            -- 1 for ice and batch-compressed ore. 75 Veldspar plus 25 Dense
-            -- Veldspar is not a batch -- types cannot be combined. Also the
-            -- output quantity of a manufacturing run for the types that come
-            -- out in stacks.
-            portion_size    INTEGER DEFAULT 1
-        );
+    """Create the static-data tables and their indexes.
 
-        CREATE TABLE IF NOT EXISTS sde_groups (
-            group_id INTEGER PRIMARY KEY,
-            name     TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS sde_blueprint_materials (
-            blueprint_type_id  INTEGER NOT NULL,
-            activity           TEXT NOT NULL,   -- manufacturing / reaction
-            material_type_id   INTEGER NOT NULL,
-            quantity           INTEGER NOT NULL,
-            PRIMARY KEY (blueprint_type_id, activity, material_type_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS sde_blueprint_products (
-            blueprint_type_id  INTEGER NOT NULL,
-            activity           TEXT NOT NULL,
-            product_type_id    INTEGER NOT NULL,
-            quantity           INTEGER NOT NULL,
-            probability        REAL DEFAULT 1.0,
-            PRIMARY KEY (blueprint_type_id, activity, product_type_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS sde_blueprints (
-            blueprint_type_id  INTEGER PRIMARY KEY,
-            max_production_limit INTEGER DEFAULT 1,
-            manufacturing_time   INTEGER DEFAULT 0,
-            reaction_time        INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS sde_blueprint_skills (
-            blueprint_type_id  INTEGER NOT NULL,
-            activity           TEXT NOT NULL,
-            skill_type_id      INTEGER NOT NULL,
-            required_level     INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (blueprint_type_id, activity, skill_type_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS sde_skill_time_bonus (
-            skill_type_id   INTEGER PRIMARY KEY,
-            skill_name      TEXT NOT NULL,
-            time_bonus_pct  REAL NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS sde_planet_schematics (
-            schematic_id    INTEGER PRIMARY KEY,
-            name            TEXT,
-            cycle_time      INTEGER,
-            output_type_id  INTEGER,
-            output_qty      INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS sde_planet_schematic_materials (
-            schematic_id    INTEGER NOT NULL,
-            type_id         INTEGER NOT NULL,
-            quantity        INTEGER NOT NULL,
-            PRIMARY KEY (schematic_id, type_id)
-        );
-
-        -- Decryptors, from dogma attributes rather than a hardcoded table.
-        -- There are 64 of them, not the 8 every guide lists: each of the eight
-        -- has faction-flavoured duplicates (Cryptic/Esoteric/Incognito/Occult)
-        -- and the ancient-relic ones (Sleeper/Takmahl/Talocan/Yan Jung) used
-        -- for reverse engineering. A hardcoded table would cover an eighth of
-        -- them and go stale on the next rebalance.
-        CREATE TABLE IF NOT EXISTS sde_decryptors (
-            type_id            INTEGER PRIMARY KEY,
-            name               TEXT NOT NULL,
-            probability_mult   REAL NOT NULL DEFAULT 1.0,  -- multiplies base chance
-            me_modifier        REAL NOT NULL DEFAULT 0.0,  -- added to the BPC's ME
-            te_modifier        REAL NOT NULL DEFAULT 0.0,
-            run_modifier       REAL NOT NULL DEFAULT 0.0   -- added to runs per BPC
-        );
-
-        -- What one BATCH of a type reprocesses into. The quantities are per
-        -- `sde_types.portion_size` units, not per unit, and they are the
-        -- 100%-yield figures before any skill, rig, structure or implant
-        -- bonus -- a real refine never returns all of this.
-        CREATE TABLE IF NOT EXISTS sde_type_materials (
-            type_id          INTEGER NOT NULL,
-            material_type_id INTEGER NOT NULL,
-            quantity         INTEGER NOT NULL,
-            PRIMARY KEY (type_id, material_type_id)
-        );
-
-        -- The in-game market tree. `parent_group_id` is NULL for the dozen or
-        -- so roots; `has_types` marks the leaves that actually contain items,
-        -- which is what stops a browser offering empty branches.
-        CREATE TABLE IF NOT EXISTS sde_market_groups (
-            market_group_id INTEGER PRIMARY KEY,
-            parent_group_id INTEGER,
-            name            TEXT NOT NULL,
-            has_types       INTEGER NOT NULL DEFAULT 0,
-            icon_id         INTEGER
-        );
-
-        -- Which science skill each datacore is tied to, from its
-        -- requiredSkill1 dogma attribute. Needed because invention's success
-        -- formula counts only the skills matching the datacores consumed, and
-        -- the names do NOT match: the skill is "Gallente Starship Engineering"
-        -- while the datacore is "Datacore - Gallentean Starship Engineering".
-        -- Amarr/Amarrian differ the same way. Matching on names silently drops
-        -- one of the two science skills for every Amarr and Gallente T2 ship.
-        CREATE TABLE IF NOT EXISTS sde_datacore_skills (
-            type_id       INTEGER PRIMARY KEY,
-            skill_type_id INTEGER NOT NULL
-        );
-
-        -- Which SDE build this database was built from. Without it the only
-        -- answer to "is this current?" is a row count, which cannot see a
-        -- rebalance that changes values without changing how many there are.
-        CREATE TABLE IF NOT EXISTS sde_build (
-            id           INTEGER PRIMARY KEY CHECK (id = 1),
-            build_number INTEGER NOT NULL,
-            release_date TEXT,
-            imported_at  REAL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_type_materials ON sde_type_materials(type_id);
-        CREATE INDEX IF NOT EXISTS idx_market_group_parent ON sde_market_groups(parent_group_id);
-        CREATE INDEX IF NOT EXISTS idx_types_market_group ON sde_types(market_group_id);
-        CREATE INDEX IF NOT EXISTS idx_bp_product ON sde_blueprint_products(product_type_id);
-        CREATE INDEX IF NOT EXISTS idx_bp_materials ON sde_blueprint_materials(blueprint_type_id, activity);
-        CREATE INDEX IF NOT EXISTS idx_bp_skills ON sde_blueprint_skills(blueprint_type_id, activity);
-    """)
-    conn.commit()
+    The DDL used to live here as one long executescript. It moved to
+    app/db/schema.py so that one file describes the whole database and so the
+    same declaration can emit Postgres DDL — the importer no longer owns a
+    second, divergent copy of the schema.
+    """
+    apply_sde_schema(conn)
 
 
 def record_build(conn: sqlite3.Connection, build: feed.Build):

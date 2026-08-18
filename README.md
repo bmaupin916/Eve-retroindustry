@@ -134,7 +134,8 @@ git tag v0.x.y && git push origin v0.x.y
 |---|---|
 | Web framework | FastAPI + Uvicorn |
 | Templates | Jinja2 + Bootstrap 5 (dark) |
-| Database | SQLite via sqlite3 |
+| Database | SQLite via sqlite3; schema declared once as SQLAlchemy Core metadata |
+| Migrations | Alembic (`app/db/schema.py` is the single source of truth) |
 | EVE API | ESI (esi.evetech.net) |
 | HTTP client | httpx (async) |
 | Auth | EVE SSO (OAuth2 PKCE), JWKS-verified tokens, DB-backed sessions |

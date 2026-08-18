@@ -8,6 +8,7 @@ from app.esi.client import esi_client
 # reference-data (see scripts/build_rig_affected_groups.py). Replaces the old
 # name-based product classification, which produced ~74 false positives.
 from app.web.rig_affected_groups import RIG_AFFECTED_GROUPS
+from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE = "https://esi.evetech.net/latest"
 
@@ -15,63 +16,9 @@ ESI_BASE = "https://esi.evetech.net/latest"
 _SCC = 0.04
 
 
-def ensure_industry_tables(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS adjusted_price_cache (
-            type_id    INTEGER PRIMARY KEY,
-            adjusted   REAL NOT NULL,
-            cached_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sci_cache (
-            solar_system_id INTEGER NOT NULL,
-            activity        TEXT NOT NULL,
-            cost_index      REAL NOT NULL,
-            cached_at       INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-            PRIMARY KEY (solar_system_id, activity)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS facility_tax_cache (
-            facility_id INTEGER PRIMARY KEY,
-            tax_rate    REAL NOT NULL,
-            cached_at   INTEGER NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS station_rigs (
-            location_id    INTEGER PRIMARY KEY,
-            me_bonus_pct   REAL NOT NULL DEFAULT 0,
-            updated_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-            structure_type TEXT,
-            rig1_type_id   INTEGER,
-            rig2_type_id   INTEGER,
-            rig3_type_id   INTEGER
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS rig_bonuses (
-            type_id  INTEGER PRIMARY KEY,
-            name     TEXT NOT NULL,
-            set_size TEXT NOT NULL,
-            category TEXT NOT NULL,
-            me_bonus REAL NOT NULL DEFAULT 0,
-            te_bonus REAL NOT NULL DEFAULT 0
-        )
-    """)
-    # Migrate old station_rigs table (add columns if missing)
-    for col, defn in [
-        ("structure_type", "TEXT"),
-        ("rig1_type_id", "INTEGER"),
-        ("rig2_type_id", "INTEGER"),
-        ("rig3_type_id", "INTEGER"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE station_rigs ADD COLUMN {col} {defn}")
-        except Exception:
-            pass
-    conn.commit()
+def ensure_industry_tables(conn: sqlite3.Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def rig_applies_to_product(

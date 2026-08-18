@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.version import USER_AGENT
+from app.db.schema import ensure_schema as ensure_db_schema
 
 _APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.join(
     os.path.dirname(__file__), "..", ".."
@@ -145,20 +146,8 @@ def save_client_id(client_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def ensure_characters_table(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS characters (
-            character_id     INTEGER PRIMARY KEY,
-            character_name   TEXT    NOT NULL,
-            refresh_token    TEXT    NOT NULL,
-            access_token     TEXT,
-            token_expires_at REAL,
-            corporation_id   INTEGER,
-            last_sync_at     REAL,
-            added_at         REAL    NOT NULL
-        )
-    """)
-    conn.commit()
-    _migrate_legacy_json(conn)
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def _migrate_legacy_json(conn: sqlite3.Connection) -> None:

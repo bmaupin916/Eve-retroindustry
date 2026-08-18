@@ -11,6 +11,7 @@ import time
 import sqlite3
 import httpx
 from app.esi.client import esi_client
+from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE = "https://esi.evetech.net/latest"
 JITA_REGION = 10000002   # The Forge
@@ -47,69 +48,9 @@ _HIST_SEM = asyncio.Semaphore(30)
 # DB schema
 # ---------------------------------------------------------------------------
 
-def ensure_price_table(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS market_price_cache (
-            type_id    INTEGER PRIMARY KEY,
-            sell_price REAL,
-            buy_price  REAL,
-            cached_at  REAL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS custom_price_override (
-            type_id    INTEGER PRIMARY KEY,
-            price      REAL NOT NULL,
-            updated_at REAL
-        )
-    """)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(market_price_cache)")}
-    if "volume" not in cols:
-        conn.execute("ALTER TABLE market_price_cache ADD COLUMN volume INTEGER")
-    if "jita_available" not in cols:
-        conn.execute("ALTER TABLE market_price_cache ADD COLUMN jita_available INTEGER")
-    # Secondary trade-hub prices (Amarr/Dodixie/Rens/Hek …), fetched on demand.
-    # Region-wide best sell/buy + 7-day region volume, one row per (region, type).
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS hub_price_cache (
-            region_id  INTEGER NOT NULL,
-            type_id    INTEGER NOT NULL,
-            sell_price REAL,
-            buy_price  REAL,
-            volume     INTEGER,
-            available  INTEGER,
-            cached_at  REAL,
-            PRIMARY KEY (region_id, type_id)
-        )
-    """)
-    hub_cols = {r[1] for r in conn.execute("PRAGMA table_info(hub_price_cache)")}
-    if "available" not in hub_cols:
-        conn.execute("ALTER TABLE hub_price_cache ADD COLUMN available INTEGER")
-    # Full daily market history (~1 year) per (region, type) for the price chart.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS price_history_cache (
-            region_id INTEGER NOT NULL,
-            type_id   INTEGER NOT NULL,
-            data_json TEXT NOT NULL,
-            cached_at REAL,
-            PRIMARY KEY (region_id, type_id)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS station_volume_cache (
-            location_id    INTEGER NOT NULL,
-            type_id        INTEGER NOT NULL,
-            volume         INTEGER,
-            best_sell      REAL,
-            traded_volume  INTEGER,
-            cached_at      REAL,
-            PRIMARY KEY (location_id, type_id)
-        )
-    """)
-    sv_cols = {r[1] for r in conn.execute("PRAGMA table_info(station_volume_cache)")}
-    if "traded_volume" not in sv_cols:
-        conn.execute("ALTER TABLE station_volume_cache ADD COLUMN traded_volume INTEGER")
-    conn.commit()
+def ensure_price_table(conn: sqlite3.Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -214,21 +155,8 @@ _hist_etags_dirty: set[tuple[int, int]] = set()
 
 
 def ensure_hist_etag_table(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS market_hist_etag (
-            region_id INTEGER NOT NULL,
-            type_id   INTEGER NOT NULL,
-            etag      TEXT,
-            days_json TEXT,
-            cached_at REAL,
-            expires_at REAL,
-            PRIMARY KEY (region_id, type_id)
-        )
-    """)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(market_hist_etag)")}
-    if "expires_at" not in cols:                    # migrate older caches
-        conn.execute("ALTER TABLE market_hist_etag ADD COLUMN expires_at REAL")
-    conn.commit()
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def load_hist_etags(conn: sqlite3.Connection, region_id: int) -> int:

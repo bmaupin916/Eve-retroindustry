@@ -124,6 +124,13 @@ from app.web.projects_helper import (
     add_plan_to_project,
     get_project_detail,
 )
+from app.db.migrate import upgrade_to_head
+from app.db.schema import (
+    ensure_schema as ensure_db_schema,
+    ensure_sde_schema,
+    forget_applied,
+    sde_index_ddl,
+)
 
 # Path resolution. EVE_APP_DIR is the writable data directory and is what a
 # deployment sets; EVE_BUNDLE_DIR is a leftover seam from the retired desktop
@@ -451,6 +458,14 @@ def _refresh_sde_from_bundle(conn: sqlite3.Connection) -> int:
         if rows:
             ph = ",".join("?" * len(rows[0]))
             conn.executemany(f"INSERT INTO {table} VALUES ({ph})", rows)
+    # DROP TABLE drops that table's indexes with it, and `ddl` above is the
+    # CREATE TABLE read from sqlite_master — which never carries indexes. So
+    # every refresh since indexes were introduced has silently un-indexed the
+    # SDE, turning "which blueprint makes this item" into a full scan of
+    # sde_blueprint_products on every node of every bill of materials. The
+    # bundled file has them; a refreshed database did not.
+    for stmt in sde_index_ddl(table for table, _ddl, _rows in payload):
+        conn.execute(stmt)
     conn.commit()
     return conn.execute("SELECT COUNT(*) FROM sde_types").fetchone()[0]
 
@@ -476,9 +491,16 @@ async def _startup_populate_groups():
                 # Exists, but it may be just an empty shell from SQLAlchemy
                 try:
                     probe = sqlite3.connect(DB_ABS)
-                    has_sde = probe.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='sde_types'"
-                    ).fetchone() is not None
+                    # Rows, not existence. The schema bootstrap creates
+                    # sde_types empty, so "the table is there" stopped being
+                    # evidence that anything is in it — the same
+                    # present-but-empty trap that stranded installs on a
+                    # download page they could never leave.
+                    try:
+                        has_sde = probe.execute(
+                            "SELECT 1 FROM sde_types LIMIT 1").fetchone() is not None
+                    except sqlite3.OperationalError:
+                        has_sde = False
                     probe.close()
                     need_copy = not has_sde
                 except Exception:
@@ -489,11 +511,24 @@ async def _startup_populate_groups():
                 _alchemy_engine.dispose()
                 shutil.copy2(bundled, DB_ABS)
                 ensure_user_tables()
-                _SCHEMA_ENSURED[0] = False
+                forget_applied(DB_ABS)
                 print(f"[sde] copied bundled SDE to {DB_ABS} + recreated user tables",
                       flush=True)
     except Exception as exc:
         print(f"[sde] fresh-install copy failed: {exc}", flush=True)
+
+    # Migrations run here and not earlier: the block above can replace the
+    # database file wholesale, and a migration applied to a file that is about
+    # to be overwritten has achieved nothing. Deploying stays `git pull` and a
+    # restart — the schema catches itself up.
+    try:
+        revision = upgrade_to_head()
+        print(f"[db] schema at revision {revision}", flush=True)
+    except Exception as exc:
+        # Not fatal on its own: `ensure_schema()` still creates anything
+        # missing, so the app comes up. But it means the deployment is no
+        # longer tracking revisions, which is worth shouting about.
+        print(f"[db] MIGRATION FAILED — schema may be behind: {exc}", flush=True)
 
     try:
         conn = get_conn()
@@ -748,7 +783,7 @@ async def setup_download():
             # SQLAlchemy user tables. Recreate them now or the next /plan
             # crashes with "no such table: type_cache".
             ensure_user_tables()
-            _SCHEMA_ENSURED[0] = False  # force ensure_schema on next get_conn()
+            forget_applied(DB_ABS)  # new file: rebuild the schema on next get_conn()
 
             # Re-run startup population now that SDE is available
             _SDE_READY[0] = True
@@ -775,43 +810,19 @@ async def setup_download():
     )
 
 
-# `get_conn()` is on the hot path — runs on every request. The 11
-# CREATE TABLE IF NOT EXISTS calls below used to fire on each connection
-# (~10 ms wasted before any real work). Move them to one-shot startup
-# via `ensure_schema()`; later `get_conn()` calls just open the DB.
-_SCHEMA_ENSURED: list[bool] = [False]
-
-
+# `get_conn()` is on the hot path — runs on every request, so the table
+# bootstrap must not. `ensure_db_schema()` memoizes per database file: the
+# first connection in the process builds the schema, the rest just open the
+# DB. It replaces a scattered set of ensure_*() calls that between them built
+# only the twelve tables the startup path happened to know about — the rest
+# appeared later, on whichever page first needed them.
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """One-time table-bootstrap. Idempotent; safe to call multiple times,
-    but the _SCHEMA_ENSURED flag prevents repeat work after first call."""
-    if _SCHEMA_ENSURED[0]:
-        return
-    ensure_bp_table(conn)
-    ensure_assets_table(conn)
-    ensure_corp_assets_table(conn)
-    ensure_skills_table(conn)
-    ensure_price_table(conn)
-    ensure_location_name_table(conn)
-    ensure_industry_tables(conn)
-    ensure_project_tables(conn)
-    ensure_characters_table(conn)
-    ensure_sessions_table(conn)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sde_groups (
-            group_id INTEGER PRIMARY KEY,
-            name     TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS char_wallet_cache (
-            character_id INTEGER PRIMARY KEY,
-            balance      REAL NOT NULL,
-            cached_at    REAL NOT NULL
-        )
-    """)
-    conn.commit()
-    _SCHEMA_ENSURED[0] = True
+    """Bootstrap every table the app owns. Idempotent and cheap to re-call."""
+    ensure_db_schema(conn)
+    # Static data is created empty here so a query against a table CCP's
+    # importer has not filled yet returns no rows instead of raising. The
+    # refresh below decides whether it needs populating.
+    ensure_sde_schema(conn)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -829,9 +840,7 @@ def get_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA synchronous=NORMAL")
     except Exception:
         pass
-    if not _SCHEMA_ENSURED[0]:
-        # First-ever connection in this process: bootstrap once.
-        ensure_schema(conn)
+    ensure_schema(conn)   # memoized per database file; a no-op after the first
     return conn
 
 
@@ -7018,16 +7027,8 @@ async def entity_portrait(kind: str, entity_id: int, size: int = 32):
 # undirected, so the shortest path is the same both ways and one row serves both.
 
 def ensure_route_jump_table(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS route_jump_cache (
-            sys_a     INTEGER NOT NULL,
-            sys_b     INTEGER NOT NULL,
-            jumps     INTEGER NOT NULL,
-            cached_at REAL,
-            PRIMARY KEY (sys_a, sys_b)
-        )
-    """)
-    conn.commit()
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def load_route_jumps(conn: sqlite3.Connection, origin: int, dests: list[int]) -> dict[int, int]:
@@ -7181,13 +7182,8 @@ _PI_CACHE_TTL = 900.0   # 15 min — extractor programs run for days, so this is
 
 
 def _ensure_pi_cache_tables(conn: sqlite3.Connection) -> None:
-    conn.execute("""CREATE TABLE IF NOT EXISTS pi_extractor_cache (
-        char_id INTEGER, char_name TEXT, planet_id INTEGER, planet_name TEXT,
-        product_id INTEGER, product TEXT, expiry_iso TEXT, cached_at REAL,
-        PRIMARY KEY (char_id, planet_id, product_id))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS planet_name_cache (
-        planet_id INTEGER PRIMARY KEY, name TEXT)""")
-    conn.commit()
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 async def _resolve_planet_names(conn: sqlite3.Connection, planet_ids) -> dict[int, str]:

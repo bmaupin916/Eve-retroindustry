@@ -15,6 +15,7 @@ not worth it for single-user config.
 from __future__ import annotations
 
 import sqlite3
+from app.db.schema import ensure_schema as ensure_db_schema
 
 # key → (default value, coercer). The coercer also validates: anything that
 # fails to parse falls back to the default rather than raising, so a hand-edited
@@ -115,13 +116,8 @@ DEFAULTS: dict[str, tuple[object, type]] = {
 
 
 def ensure_defaults_table(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS app_defaults (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    conn.commit()
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def get_defaults(conn: sqlite3.Connection) -> dict:

@@ -3,50 +3,12 @@ import sqlite3
 import time
 import json
 from collections import defaultdict
+from app.db.schema import ensure_schema as ensure_db_schema
 
 
 def ensure_project_tables(conn: sqlite3.Connection) -> None:
-    conn.execute("""CREATE TABLE IF NOT EXISTS production_projects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        created_at REAL NOT NULL,
-        updated_at REAL NOT NULL
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS project_plans (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id INTEGER NOT NULL,
-        product_type_id INTEGER NOT NULL,
-        product_name TEXT NOT NULL,
-        quantity INTEGER NOT NULL DEFAULT 1,
-        me INTEGER DEFAULT 0,
-        te INTEGER DEFAULT 0,
-        station_name TEXT,
-        facility_tax REAL DEFAULT 0,
-        plan_json TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at REAL NOT NULL
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS project_shopping (
-        project_id INTEGER NOT NULL,
-        type_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        needed INTEGER NOT NULL DEFAULT 0,
-        purchased INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(project_id, type_id)
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS project_jobs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        plan_id INTEGER NOT NULL,
-        project_id INTEGER NOT NULL,
-        type_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        quantity INTEGER NOT NULL DEFAULT 1,
-        runs INTEGER NOT NULL DEFAULT 1,
-        step INTEGER NOT NULL DEFAULT 1,
-        activity TEXT NOT NULL DEFAULT 'manufacturing',
-        status TEXT NOT NULL DEFAULT 'pending'
-    )""")
-    conn.commit()
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def list_projects(conn: sqlite3.Connection) -> list[dict]:

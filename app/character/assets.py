@@ -8,6 +8,7 @@ import time
 import sqlite3
 import json
 import httpx
+from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE  = "https://esi.evetech.net/latest"
 CACHE_TTL = 60 * 10  # 10 minutes (assets change)
@@ -24,15 +25,9 @@ class CharAsset:
     is_blueprint_copy:  bool   # True = BPC (blueprint copy with no market price)
 
 
-def ensure_assets_table(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS char_assets_cache (
-            character_id INTEGER NOT NULL,
-            data_json    TEXT NOT NULL,
-            cached_at    REAL
-        )
-    """)
-    conn.commit()
+def ensure_assets_table(conn: sqlite3.Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def _load_cache(conn: sqlite3.Connection, character_id: int) -> list[dict] | None:
@@ -106,15 +101,9 @@ def _parse_assets(raw: list[dict]) -> list[CharAsset]:
     return result
 
 
-def ensure_corp_assets_table(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS corp_assets_cache (
-            corporation_id INTEGER NOT NULL,
-            data_json      TEXT NOT NULL,
-            cached_at      REAL
-        )
-    """)
-    conn.commit()
+def ensure_corp_assets_table(conn: sqlite3.Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
+    ensure_db_schema(conn)
 
 
 def _load_corp_cache(conn: sqlite3.Connection, corporation_id: int) -> list[dict] | None:
