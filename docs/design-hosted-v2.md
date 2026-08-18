@@ -758,7 +758,8 @@ price *the whole board* every refresh. That gives a complete ranked leaderboard 
 unprofitable reactions explicitly marked — the "what NOT to make" half, which a curated
 watchlist structurally cannot provide because you would have to know to add the loser first.
 
-> **Built — v0.9.29, `/reactions`.** The count above was **111** and is wrong: Intermediate
+> **Built to beta — v0.9.29, `/reactions`.** Costing verified, three advertised features not
+> yet working — see Step 7. The count above was **111** and is wrong: Intermediate
 > Materials 41, Composite 17, Biochemical 32, Hybrid Polymers 9 and Molecular-Forged 12 sum
 > to 111 and omit the eighth group, the **8 Unrefined Mineral** (alchemy) products. Verified
 > against the SDE at 119. They ship flagged rather than dropped — their output is meant to
@@ -1465,15 +1466,27 @@ ledger; the coarse alliance read model. Joiners grant minimal scopes (identity +
 `read_character_jobs`). **Pilot in own corp and measure the match-correction rate before
 any alliance rollout.**
 
-**Step 7 — Feature buildout. 1 of 8 shipped.** Market BI rebuild on the group tree; refine
-calculator; mining ledger; appraisal; compression LP. Ordered by appetite — each is
-independent once Steps 1 and 4 exist.
+**Step 7 — Feature buildout. 0 of 8 complete; 1 in beta.** Market BI rebuild on the group
+tree; refine calculator; mining ledger; appraisal; compression LP. Ordered by appetite — each
+is independent once Steps 1 and 4 exist.
 
-**Reactions board — ✅ done, v0.9.29, `/reactions`.** Taken out of order, ahead of Steps 4-6,
-as a low-friction day rather than plan progress. See §9.1 for what the build settled. Note it
-is built on the pre-Step-4 foundations, so it inherits SQLite, the unsplit `main.py` and the
-synchronous refresh; nothing about it blocks Step 4, but it is one more page Step 4 will have
-to move.
+**Reactions board — 🟡 beta, v0.9.29, `/reactions`.** Initial deployment, not a finished
+feature. Taken out of order, ahead of Steps 4-6, as a low-friction day rather than plan
+progress. The costing engine is verified (see §9.1) and the page is usable, but it has not
+been run against a real week of decisions, and three things it advertises do not work yet:
+
+| Gap | State |
+|---|---|
+| **Sell advantage** | Column exists and is always `—`. `hub_price_cache` is empty until a hub is fetched on /prices, so the comparison has never once produced a number. Untested against real data. |
+| **Import freight** | Setting is stored and never charged. Which inputs get hauled differs between the two costing models — the whole moon-goo chain under raw, only the intermediates under buy — and guessing would quietly bias every margin. |
+| **Player-owned structure as a sell venue** | Not wired. `fetch_structure_market` exists but needs a market fetch tied to a docked character; the venue picker offers the four NPC hubs only. |
+| **Layouts for the other five groups** | Only Composite has the two-model layout. The other 102 products use the generic one. |
+
+Also unvalidated: the **Build Advantage** figure. The raw-cost engine cross-checks well (a
+fuel block's build cost lands within 3% of its market price) but nobody has yet acted on the
+number and found out whether it says what it should. It is built on pre-Step-4 foundations,
+so it inherits SQLite, the unsplit `main.py` and the synchronous refresh; nothing about it
+blocks Step 4, but it is one more page Step 4 will have to move.
 
 ### Why this order
 
@@ -1511,7 +1524,7 @@ calls**, **47 tables**.
 |---|---|
 | Dashboard widgets (§9.6) | 0.5–1 |
 | Refine calculator | 0.5–1 |
-| ~~Reactions board~~ | ✅ **done v0.9.29** — 1 session, as estimated |
+| Reactions board | 🟡 **beta v0.9.29** — 1 session spent, as estimated; finishing it is a second |
 | Appraisal tool | 1 |
 | Market BI rebuild (§9.4) | 1–2 |
 | Mining ledger (§9.3) | 1–2 |
