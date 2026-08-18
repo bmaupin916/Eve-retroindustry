@@ -13,6 +13,8 @@ from math import ceil
 import sqlite3
 
 from app.character.blueprints import CharBlueprint
+from app.manufacturing import invention as invention_mod
+from app.manufacturing.invention import Decryptor
 
 # Sentinel for "cache miss" — `None` is a valid stored value (no group for the
 # given type_id), so we need a separate marker.
@@ -37,6 +39,27 @@ class StationFacility:
     sec_multiplier: float = 1.0
 
 
+@dataclass(frozen=True)
+class InventionParams:
+    """How to charge the invented blueprint on T2 nodes anywhere in the tree.
+
+    Prices arrive as a dict rather than being looked up in here, for two
+    reasons. The resolver otherwise reads only `sde_*` tables, and datacore
+    prices have to follow the same basis and the same custom overrides as every
+    other material — a second lookup path would quietly disagree with the
+    figures the rest of the page is built from. The set to prefetch is small and
+    fixed; `invention.invention_material_ids()` returns it.
+
+    Absent (`None` on the resolver) means "do not model invention at all", which
+    is what the `invent_t2` default switches off.
+    """
+    prices: dict[int, float] = field(default_factory=dict)
+    decryptor: Decryptor | None = None
+    decryptor_price: float = 0.0
+    science_level: int = 0
+    encryption_level: int = 0
+
+
 @dataclass
 class BOMNode:
     type_id: int
@@ -51,6 +74,13 @@ class BOMNode:
     job_fee: float = 0.0    # install fee for THIS job (0 if fee params not supplied) —
                             # lets the make-vs-buy optimizer compare all-in make cost
                             # (materials + fee) against the buy price, per node.
+    # Expected cost of the invented BPC this node's output needs, for the whole
+    # of `quantity` — 0 for anything not invented, and 0 when the resolver was
+    # built without InventionParams. Amortised per unit, so a partial build is
+    # charged its share of the BPC rather than all of it.
+    invention_cost: float = 0.0
+    invention_chance: float | None = None   # per-attempt success chance, for display
+    invention_runs: int = 0                 # runs on the invented BPC
     children: list[BOMNode] = field(default_factory=list)
 
     def aggregate_leaves(self) -> dict[int, tuple[str, int]]:
@@ -69,6 +99,16 @@ class BOMNode:
             child._collect_leaves(acc)
 
 
+def total_invention_cost(node: BOMNode) -> float:
+    """Invention cost of every node in the tree, root included.
+
+    Lives here rather than in a caller so the margin tracker and the planner
+    cannot drift into two different totals of the same thing.
+    """
+    return (node.invention_cost or 0.0) + sum(
+        total_invention_cost(child) for child in node.children)
+
+
 class BOMResolver:
     def __init__(
         self,
@@ -79,6 +119,7 @@ class BOMResolver:
         rate_mfg: float = 0.0,
         rate_rxn: float = 0.0,
         runs_per_job_by_product: dict[int, int] | None = None,
+        invention: InventionParams | None = None,
     ):
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
@@ -118,6 +159,15 @@ class BOMResolver:
         self._rig_group_cache: dict[int, int | None] = {}
         # rig_type_id → frozenset of product group_ids it bonuses (authoritative)
         self._rig_affected_cache: dict[int, frozenset[int]] = {}
+        # Invention: None = do not model it (the pre-v0.9.29 behaviour, and what
+        # the invent_t2 default switches off). The recipe cache holds None for
+        # "looked it up, not invented", which is the common answer and the one
+        # worth not re-querying on every repeat of a component.
+        self._invention = invention
+        self._invention_recipe_cache: dict[int, invention_mod.InventionRecipe | None] = {}
+        # Datacores with no cached price, in encounter order. Non-empty means the
+        # invention figures are understated and the caller has to say so.
+        self.invention_unpriced: list[str] = []
         if blueprints:
             self._build_bp_index(blueprints)
 
@@ -358,6 +408,11 @@ class BOMResolver:
                 )
                 node.job_fee = eiv * rate
 
+        # The invented blueprint this node's output needs. Reactions are never
+        # invented, so only manufacturing nodes can carry the cost.
+        if self._invention is not None and activity == "manufacturing":
+            self._charge_invention(node)
+
         visited = visited | {type_id}  # immutable copy per branch
 
         # How this product's runs are split into jobs — ME rounds once per job,
@@ -379,6 +434,49 @@ class BOMResolver:
             node.children.append(child)
 
         return node
+
+    def _charge_invention(self, node: BOMNode) -> None:
+        """Charge one node for the T2 blueprint it had to be invented from.
+
+        Applies at every manufacturing node, root or nested. Before this, the
+        margin tracker was the only caller that charged invention at all, and it
+        charged only the product it was pricing — so a T2 item appearing as a
+        *material* resolved with a free blueprint, and `/plan`, which never went
+        through that path, built every T2 item with a free blueprint.
+
+        `find_recipe` returning None is the ordinary case (T1 items, reaction
+        outputs, anything bought) and is how "not invented" stays distinguishable
+        from "invented, and happens to cost nothing".
+        """
+        params = self._invention
+        recipe = self._invention_recipe_cache.get(node.type_id, _MISSING)
+        if recipe is _MISSING:
+            recipe = invention_mod.find_recipe(self.conn, node.type_id)
+            self._invention_recipe_cache[node.type_id] = recipe
+        if recipe is None:
+            return
+
+        levels = {sid: params.science_level for sid in recipe.science_skill_ids}
+        if recipe.encryption_skill_id:
+            levels[recipe.encryption_skill_id] = params.encryption_level
+
+        cost = invention_mod.compute_cost(
+            recipe,
+            prices=params.prices,
+            skill_levels=levels,
+            decryptor=params.decryptor,
+            decryptor_price=params.decryptor_price,
+        )
+        # per_unit already amortises the BPC over runs_per_bpc × units_per_run,
+        # so this node's share is per_unit × quantity. That is the marginal view
+        # the margin tracker has always shown: needing 3 runs off a 10-run BPC is
+        # charged 3/10 of it, not all of it — the remaining runs still have value.
+        node.invention_cost = cost.per_unit * node.quantity
+        node.invention_chance = cost.success_chance
+        node.invention_runs = cost.runs_per_bpc
+        for name in cost.unpriced:
+            if name not in self.invention_unpriced:
+                self.invention_unpriced.append(name)
 
     def _apply_me(self, base_qty: int, runs: int, me: float, facility_multiplier: float = 1.0,
                   runs_per_job: int | None = _MISSING) -> int:  # type: ignore[assignment]

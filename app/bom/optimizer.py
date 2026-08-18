@@ -8,10 +8,14 @@ Algorithm (bottom-up):
               make_cost = job install fee + sum of children's optimal costs
               buy_cost  = input_price × quantity
 
-  make_cost includes the node's OWN job install fee (node.job_fee) so the
-  decision is all-in: building a component only wins if its materials + fee
-  beat buying it. Without the fee term the optimizer over-selects "make" and
-  the (real) install fees then silently erase the paper savings.
+  make_cost includes the node's OWN job install fee (node.job_fee) and the
+  invented blueprint it needs (node.invention_cost) so the decision is all-in:
+  building a component only wins if its materials + fee + BPC beat buying it.
+  Without the fee term the optimizer over-selects "make" and the (real) install
+  fees then silently erase the paper savings; invention is the same class of
+  term and much larger on a T2 component, where the BPC can outweigh the
+  materials. A bought T2 component carries someone else's invention cost in its
+  price, so the comparison is only fair when the make side carries ours.
 
   input_price is Jita sell (index 0) or Jita buy (index 1) depending on the
   `input_basis` argument — real builders source inputs from buy orders, which
@@ -117,8 +121,9 @@ def _optimize_node(
     if any(c is None for c in children_costs):
         make_cost = None
     else:
-        # All-in make cost = this job's install fee + optimal children.
-        make_cost = sum(children_costs) + node.job_fee
+        # All-in make cost = this job's install fee + its invented blueprint +
+        # optimal children.
+        make_cost = sum(children_costs) + node.job_fee + node.invention_cost
 
     buy_cost = (price * node.quantity) if price is not None else None
 
@@ -199,4 +204,4 @@ def _naive_cost(
     child_costs = [_naive_cost(c, prices, price_idx) for c in node.children]
     if any(c is None for c in child_costs):
         return None
-    return sum(child_costs) + node.job_fee
+    return sum(child_costs) + node.job_fee + node.invention_cost

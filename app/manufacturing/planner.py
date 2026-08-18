@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 from typing import Literal
 import sqlite3
 
-from app.bom.resolver import BOMResolver, BOMNode, StationFacility
+from app.bom.resolver import (
+    BOMResolver, BOMNode, InventionParams, StationFacility, total_invention_cost,
+)
 from app.bom.optimizer import optimize, get_shopping_list
 from app.character.blueprints import CharBlueprint
 
@@ -140,6 +142,14 @@ class ManufacturingPlan:
     # [Decision, …] from the optimizer (optimal mode only) — the UI renders
     # the Make vs Buy table from them, and steps skip "buy" components.
     opt_decisions:     list | None = None
+    # Expected cost of every invented blueprint in the tree, 0 when invention is
+    # not being modelled. Deliberately not folded into `materials`: a BPC is not
+    # a line on a shopping list, and the datacores are consumed by an invention
+    # job rather than by the build.
+    invention_cost:    float = 0.0
+    # Datacores with no cached price — non-empty means invention_cost is
+    # understated and the UI must say so instead of showing a confident figure.
+    invention_unpriced: list[str] = field(default_factory=list)
 
 
 def find_blueprint_for_product(
@@ -195,6 +205,7 @@ def build_plan(
     me_override: float | None = None,
     te_override: int | None = None,
     runs_per_job_by_product: dict[int, int] | None = None,
+    invention: InventionParams | None = None,
 ) -> ManufacturingPlan:
     db_conn = sqlite3.connect(db_path)
 
@@ -210,11 +221,14 @@ def build_plan(
     resolver = BOMResolver(db_path, blueprints=blueprints, runs_per_job=runs_per_job,
                            adjusted_prices=adjusted_prices,
                            rate_mfg=rate_mfg, rate_rxn=rate_rxn,
-                           runs_per_job_by_product=runs_per_job_by_product)
+                           runs_per_job_by_product=runs_per_job_by_product,
+                           invention=invention)
     root = resolver.resolve(
         product_type_id, quantity, me=float(me),
         mfg_facility=mfg_facility, rxn_facility=rxn_facility,
     )
+    plan_invention_cost = total_invention_cost(root)
+    plan_invention_unpriced = list(resolver.invention_unpriced)
     resolver.close()
     db_conn.close()
 
@@ -269,4 +283,6 @@ def build_plan(
         opt_total_cost   = opt_total,
         opt_naive_cost   = opt_naive,
         opt_decisions    = opt_decisions,
+        invention_cost   = plan_invention_cost,
+        invention_unpriced = plan_invention_unpriced,
     )

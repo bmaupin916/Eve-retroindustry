@@ -25,13 +25,21 @@ resulting BPC, via `app.manufacturing.invention`. Without that, T2 rows were
 flattered by a free blueprint while T1 rows were penalised by the conservative
 single-run ME rounding below, so the ranking was biased between the two classes
 for reasons that were not real.
+
+Since v0.9.29 that charge is applied by `BOMResolver` at **every** manufacturing
+node rather than by this module at the root, so a T2 component nested inside the
+tree is charged too. This module's remaining share is `build_invention_params`:
+reading the stored defaults and pricing the datacores on the row's own input
+basis.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import sqlite3
 
-from app.bom.resolver import BOMResolver, StationFacility
+from app.bom.resolver import (
+    BOMResolver, InventionParams, StationFacility, total_invention_cost,
+)
 from app.manufacturing.planner import calc_job_time
 from app.market.taxes import selling_costs
 from app.manufacturing import invention as invention_mod
@@ -235,9 +243,11 @@ def compute_margin(
     defaults: dict,
     blueprints: list | None = None,
     ctx: dict | None = None,
+    inv: tuple[InventionParams | None, list[str]] | None = None,
 ) -> MarginRow:
-    """Prices one product. `ctx` is `_station_context` output — pass it in when
-    pricing a whole watchlist so the station lookups happen once."""
+    """Prices one product. `ctx` is `_station_context` output and `inv` is
+    `build_invention_params` output — pass both in when pricing a whole
+    watchlist so the station and datacore lookups happen once, not per row."""
     name_row = conn.execute(
         "SELECT t.name, g.name FROM sde_types t "
         "LEFT JOIN sde_groups g ON g.group_id = t.group_id WHERE t.type_id=?",
@@ -257,6 +267,10 @@ def compute_margin(
     from app.web.industry_helper import get_adjusted_prices_cached
     adjusted = get_adjusted_prices_cached(conn)
 
+    inv_params, inv_warnings = (
+        inv if inv is not None else build_invention_params(conn, defaults, basis))
+    row.unpriced.extend(inv_warnings)
+
     resolver = BOMResolver(
         db_path,
         blueprints=blueprints or [],
@@ -264,6 +278,7 @@ def compute_margin(
         adjusted_prices=adjusted,
         rate_mfg=ctx["rate_mfg"],
         rate_rxn=ctx["rate_rxn"],
+        invention=inv_params,
     )
     try:
         blueprint = resolver.find_blueprint(type_id)
@@ -293,7 +308,13 @@ def compute_margin(
         fee = _total_job_fee(node)
         row.job_fee = fee / row.units_per_run
 
-        _apply_invention(conn, row, defaults)
+        # Per unit, like material_cost and job_fee above. The tree total, not
+        # just the root's own BPC: a T2 component nested in the build needs
+        # inventing too, and until v0.9.29 nothing charged for it.
+        row.invention_cost = total_invention_cost(node) / row.units_per_run
+        row.invention_chance = node.invention_chance
+        row.invention_runs = node.invention_runs
+        row.unpriced.extend(resolver.invention_unpriced)
 
         # The product always sells off sell orders — you are the one listing it.
         sell = _pick(prices.get(type_id), "sell")
@@ -322,54 +343,61 @@ def compute_margin(
         resolver.close()
 
 
-def _apply_invention(conn: sqlite3.Connection, row: MarginRow, defaults: dict) -> None:
-    """Charge a T2 product for the blueprint it had to be invented from.
+def build_invention_params(conn: sqlite3.Connection, defaults: dict,
+                           basis: str) -> tuple[InventionParams | None, list[str]]:
+    """Invention settings for the resolver, plus anything left unpriced.
 
-    Silently does nothing for anything not invented, which is the common case —
-    `find_recipe` returning None is how "not a T2 item" is distinguished from
-    "T2 item that happens to cost nothing".
+    Public because `/plan` needs the identical thing. It lives here rather than
+    in a helper of its own because pricing an input from the cache on a given
+    basis, with custom overrides applied, is what this module already does — and
+    a second copy of that rule is how two pages start quoting different costs
+    for the same datacore.
 
-    An unpriced datacore is reported on the row rather than counted as free,
-    the same rule the materials follow: understating cost overstates profit,
-    which is the one error this page exists to avoid.
+    Returns `(None, [])` when `invent_t2` is off, which is how the resolver is
+    told not to model invention at all.
+
+    This used to be `_apply_invention`, which charged the product being priced
+    and nothing else. The walk now belongs to the resolver — so the margin
+    tracker and `/plan` charge invention identically, and a T2 component nested
+    inside a tree stops resolving with a free blueprint. What stays here is the
+    part that is genuinely this module's business: turning stored defaults into
+    parameters, and pricing the datacores on the *same* basis and the same
+    custom overrides as every other material on the row.
+
+    Prices cover every datacore in the game rather than one recipe's, because
+    the resolver does not know which ones a tree contains until it walks it. It
+    is one query over a few dozen types.
     """
     if not int(defaults.get("invent_t2", 1) or 0):
-        return
-    recipe = invention_mod.find_recipe(conn, row.type_id)
-    if recipe is None:
-        return
+        return None, []
 
     decryptor = invention_mod.load_decryptor(
         conn, int(defaults.get("decryptor_type_id") or 0))
 
-    science = int(defaults.get("science_skill") or 0)
-    levels = {sid: science for sid in recipe.science_skill_ids}
-    if recipe.encryption_skill_id:
-        levels[recipe.encryption_skill_id] = int(defaults.get("encryption_skill") or 0)
-
-    wanted = {tid for tid, _n, _q in recipe.datacores}
+    wanted = invention_mod.invention_material_ids(conn)
     if decryptor:
         wanted.add(decryptor.type_id)
-    prices = _cached_prices(conn, wanted)
-    unit_prices = {tid: _pick(prices.get(tid), "sell") for tid in wanted}
+    cached = _cached_prices(conn, wanted)
+    unit_prices = {tid: _pick(cached.get(tid), basis) for tid in wanted}
 
+    warnings: list[str] = []
     decryptor_price = 0.0
     if decryptor:
         decryptor_price = unit_prices.get(decryptor.type_id) or 0.0
         if unit_prices.get(decryptor.type_id) is None:
-            row.unpriced.append(decryptor.name)
+            warnings.append(decryptor.name)
 
-    cost = invention_mod.compute_cost(
-        recipe,
+    params = InventionParams(
+        # An unpriced datacore is dropped here and reported by the resolver as
+        # unpriced rather than counted as free: understating cost overstates
+        # profit, which is the one error this page exists to avoid.
         prices={k: v for k, v in unit_prices.items() if v is not None},
-        skill_levels=levels,
         decryptor=decryptor,
         decryptor_price=decryptor_price,
+        science_level=int(defaults.get("science_skill") or 0),
+        encryption_level=int(defaults.get("encryption_skill") or 0),
     )
-    row.invention_cost = cost.per_unit
-    row.invention_chance = cost.success_chance
-    row.invention_runs = cost.runs_per_bpc
-    row.unpriced.extend(cost.unpriced)
+    return params, warnings
 
 
 def _packaged_volume(conn: sqlite3.Connection, type_id: int) -> float | None:

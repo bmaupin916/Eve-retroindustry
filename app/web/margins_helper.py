@@ -20,7 +20,9 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 
-from app.manufacturing.margins import MarginRow, compute_margin, _station_context
+from app.manufacturing.margins import (
+    MarginRow, build_invention_params, compute_margin, _station_context,
+)
 from app.web.app_defaults import get_defaults, is_configured
 from app.market.taxes import selling_costs
 
@@ -182,10 +184,14 @@ def build_view_model(conn: sqlite3.Connection, db_path: str,
     ctx = _station_context(conn, defaults)
     view["sci_cached"] = ctx["sci_cached"]
     blueprints = _all_blueprints(conn)
+    # Hoisted for the same reason as ctx: the datacore price lookup is identical
+    # for every row, and a watchlist prices dozens of them.
+    inv = build_invention_params(
+        conn, defaults, str(defaults.get("input_basis") or "sell"))
 
     for item in items:
         row = compute_margin(conn, db_path, item["type_id"], item["me"], item["te"],
-                             defaults, blueprints=blueprints, ctx=ctx)
+                             defaults, blueprints=blueprints, ctx=ctx, inv=inv)
         record_snapshot(conn, item["id"], row)
         hist = history_for(conn, item["id"])
         change = None

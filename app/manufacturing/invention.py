@@ -282,6 +282,23 @@ def compute_cost(
     return cost
 
 
+def invention_material_ids(conn: sqlite3.Connection) -> set[int]:
+    """Every type consumed by an invention job — i.e. every datacore.
+
+    The resolver charges invention at any node in a tree, so it cannot know
+    which datacores it will meet before it walks. This is the whole set, and it
+    is small enough (a few dozen types) that a caller can price all of it in one
+    query and hand over a plain dict, instead of the resolver reaching into the
+    market tables itself on every node.
+    """
+    try:
+        return {int(r[0]) for r in conn.execute(
+            "SELECT DISTINCT material_type_id FROM sde_blueprint_materials "
+            "WHERE activity='invention'")}
+    except sqlite3.OperationalError:
+        return set()                     # SDE predates the invention activity
+
+
 def load_decryptor(conn: sqlite3.Connection, type_id: int) -> Decryptor | None:
     if not type_id:
         return None
