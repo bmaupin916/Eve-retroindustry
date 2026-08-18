@@ -1,0 +1,558 @@
+{% extends "base.html" %}
+{% block title %}PI Planner — EVE Retroindustry{% endblock %}
+{% block content %}
+
+<style>
+  .pip-band { background: linear-gradient(90deg, rgba(63,185,80,.12), rgba(63,185,80,.02)); }
+  .pip-tier-band { background: linear-gradient(90deg, rgba(123,184,236,.14), rgba(123,184,236,.02)); }
+  .pip-out { color: #7ee2a8; }
+  .pip-note { font-size: .78rem; }
+  /* Same countdown colours as /planets — the JS below drives these. */
+  .pi-countdown.pi-expired { color: #f85149; font-weight: 600; }
+  .pi-countdown.pi-soon    { color: #e6b84a; font-weight: 600; }
+  /* Collapsible section headers. Chevron matches the Assets/Blueprints groups;
+     Bootstrap toggles `.collapsed` on the header, which is the toggle. */
+  .pip-sec-head { cursor: pointer; }
+  .pip-sec-head:hover { filter: brightness(1.25); }
+  .pip-sec-head > span:first-child::before {
+    content: "\25BE"; display: inline-block; font-size: .7rem; line-height: 1;
+    transition: transform .15s ease; flex: 0 0 auto; opacity: .8;
+  }
+  .pip-sec-head.collapsed > span:first-child::before { transform: rotate(-90deg); }
+  /* Fixed layout so the tier tables all line up with each other. */
+  .pip-qty-table { table-layout: fixed; }
+  .pip-qty-table th:nth-child(2), .pip-qty-table td:nth-child(2) { width: 180px; }
+  .pip-qty-table th:nth-child(3), .pip-qty-table td:nth-child(3) { width: 180px; }
+  .pip-qty-table td:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+
+<div class="row mb-3 align-items-center">
+  <div class="col">
+    <h4 class="mb-0"><i class="bi bi-diagram-3 me-2 text-primary"></i>PI Planner
+      {% if result %}
+      <span class="badge bg-secondary ms-2">{{ result.total_colonies }} colon{{ 'ies' if result.total_colonies != 1 else 'y' }}</span>
+      {% endif %}
+    </h4>
+    <div class="text-muted pip-note mt-1">
+      Works backwards from a target product to colony counts. Recipe ratios come from the SDE;
+      colony layouts and the derate are planning assumptions you can change below.
+    </div>
+  </div>
+</div>
+
+{# ── inputs ────────────────────────────────────────────────────────────── #}
+<div class="card mb-3">
+  <div class="card-body py-3">
+    <form method="get" action="/pi-planner" class="row g-2 align-items-end">
+      <div class="col-12 col-lg-4">
+        <label class="form-label mb-1"><i class="bi bi-box me-1"></i>Target product</label>
+        <input type="text" name="target" class="form-control form-control-sm"
+               list="pip-targets" autocomplete="off" required
+               placeholder="Nitrogen Fuel Block, Robotics, Broadcast Node…"
+               value="{{ form.target }}">
+        <datalist id="pip-targets">
+          {% for name in target_choices %}<option value="{{ name }}">{% endfor %}
+        </datalist>
+      </div>
+      <div class="col-6 col-lg-2">
+        <label class="form-label mb-1">Quantity</label>
+        <input type="number" name="qty" min="1" class="form-control form-control-sm"
+               value="{{ form.quantity }}">
+      </div>
+      <div class="col-6 col-lg-1">
+        <label class="form-label mb-1">Per</label>
+        <select name="period" class="form-select form-select-sm">
+          {% for p in periods %}
+          <option value="{{ p }}" {% if form.period == p %}selected{% endif %}>{{ p }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-6 col-lg-2">
+        <label class="form-label mb-1"
+               title="Extractors decay over a program, so a colony never sustains its theoretical peak. 60% is the conservative end of what real colonies hold. Applies to extraction colonies only — factory colonies run on imports.">
+          Derate <i class="bi bi-question-circle text-muted"></i>
+        </label>
+        <div class="input-group input-group-sm">
+          <input type="number" name="derate" min="5" max="100" step="5"
+                 class="form-control form-control-sm" value="{{ form.derate_pct }}">
+          <span class="input-group-text">%</span>
+        </div>
+      </div>
+      <div class="col-6 col-lg-1">
+        <label class="form-label mb-1" title="Command centre upgrade level — sets the colony's CPU and powergrid budget.">CCU</label>
+        <select name="ccu" class="form-select form-select-sm">
+          {% for lvl in ccu_levels %}
+          <option value="{{ lvl }}" {% if form.ccu_level == lvl %}selected{% endif %}>{{ lvl }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% if show_me %}
+      <div class="col-6 col-lg-1">
+        <label class="form-label mb-1"
+               title="Blueprint material efficiency. Applies to the blueprint's own inputs only — planetary schematics have no ME.">ME</label>
+        <input type="number" name="me" min="0" max="10" class="form-control form-control-sm"
+               value="{{ form.me }}">
+      </div>
+      {% endif %}
+      <div class="col-12 col-lg-1 d-grid">
+        <button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-calculator me-1"></i>Plan</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% if error %}
+<div class="alert alert-danger"><i class="bi bi-exclamation-circle me-2"></i>{{ error }}</div>
+{% endif %}
+
+{% if not result and not error %}
+<div class="card"><div class="text-muted text-center py-4">
+  <i class="bi bi-diagram-3 mb-2" style="font-size:2rem;opacity:.3"></i><br>
+  Pick a target product and quantity to see the colony plan.
+</div></div>
+{% endif %}
+
+{% if result %}
+
+<div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
+  <img loading="lazy" src="/icon/{{ result.type_id }}?size=64" width="32" height="32"
+       class="rounded" onerror="this.style.display='none'">
+  <span class="fw-semibold">{{ result.quantity | format_number }} × {{ result.name }}</span>
+  <span class="text-muted">per {{ result.period }}</span>
+  {% if result.is_manufactured %}
+  <span class="badge badge-mfg">ME {{ form.me }}</span>
+  {% else %}
+  <span class="badge badge-neutral">PI commodity</span>
+  {% endif %}
+  <span class="badge badge-neutral">derate {{ form.derate_pct }}%</span>
+  <span class="badge badge-neutral">CCU {{ form.ccu_level }}</span>
+</div>
+
+{% if result.unbuildable %}
+<div class="alert alert-warning py-2 pip-note">
+  <i class="bi bi-exclamation-triangle me-2"></i>
+  The standard extraction layout does not fit a level {{ form.ccu_level }} command centre
+  ({{ result.unbuildable | join(', ') }}). The archetypes are defined at CCU V — raise the
+  command centre level, or treat these counts as a lower bound.
+</div>
+{% endif %}
+
+{# ── 1. Manufacturing inputs ───────────────────────────────────────────── #}
+{% if result.manufacturing %}
+<div class="card mb-3">
+  <div class="card-header pip-band py-2 pip-sec-head"
+       role="button" aria-expanded="true" aria-controls="pip-sec-1"
+       data-bs-toggle="collapse" data-bs-target="#pip-sec-1" data-sec="1">
+    <span class="d-flex align-items-center gap-2">
+      <i class="bi bi-hammer" style="color:#3fb950"></i>
+      <strong>1 · Manufacturing inputs</strong>
+      <span class="text-muted pip-note">bill of materials at ME {{ result.manufacturing.me }}, split at the PI boundary</span>
+    </span>
+  </div>
+  <div class="collapse show" id="pip-sec-1">
+  <div class="row g-0">
+    <div class="col-12 col-lg-6 border-end" style="border-color:var(--eve-border) !important">
+      <div class="px-3 pt-2 pb-1 text-muted pip-note">
+        <i class="bi bi-globe-americas me-1" style="color:#3fb950"></i>Planetary — planned below
+      </div>
+      <div class="table-responsive">
+        <table class="table table-hover tbl-compact table-sm mb-0 align-middle pip-qty-table">
+          <thead>
+            <tr>
+              <th>Material</th>
+              <th class="text-end">Per {{ result.period }}</th>
+              <th class="text-end">Per day</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for m in result.manufacturing.pi %}
+            <tr>
+              <td>
+                <span class="d-inline-flex align-items-center gap-2">
+                  <img loading="lazy" src="/icon/{{ m.type_id }}?size=32" width="24" height="24"
+                       class="rounded" onerror="this.style.visibility='hidden'">
+                  {{ m.name }}
+                </span>
+              </td>
+              <td class="text-end">{{ m.per_period_units | format_number }}</td>
+              <td class="text-end text-muted">{{ m.per_day_units | format_number }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="col-12 col-lg-6">
+      <div class="px-3 pt-2 pb-1 text-muted pip-note">
+        <i class="bi bi-slash-circle me-1"></i>Not planetary — <strong>out of scope</strong>
+      </div>
+      {% if result.manufacturing.other %}
+      <div class="table-responsive">
+        <table class="table table-hover tbl-compact table-sm mb-0 align-middle pip-qty-table">
+          <thead>
+            <tr>
+              <th>Material</th>
+              <th class="text-end">Per {{ result.period }}</th>
+              <th class="text-end">Per day</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for m in result.manufacturing.other %}
+            <tr class="text-muted">
+              <td>
+                <span class="d-inline-flex align-items-center gap-2">
+                  <img loading="lazy" src="/icon/{{ m.type_id }}?size=32" width="24" height="24"
+                       class="rounded" style="opacity:.55" onerror="this.style.visibility='hidden'">
+                  {{ m.name }}
+                </span>
+              </td>
+              <td class="text-end">{{ m.per_period_units | format_number }}</td>
+              <td class="text-end">{{ m.per_day_units | format_number }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="px-3 py-2 text-muted pip-note border-top" style="border-color:var(--eve-border) !important">
+        Ice products, minerals and moon goo are listed so the bill of materials is complete.
+        This planner does not source them — buy or mine them separately.
+      </div>
+      {% else %}
+      <div class="text-muted text-center py-3 pip-note">Everything in this bill of materials is planetary.</div>
+      {% endif %}
+    </div>
+  </div>
+  </div>
+</div>
+{% endif %}
+
+{# ── 2. PI demand by tier ──────────────────────────────────────────────── #}
+<div class="card mb-3">
+  <div class="card-header pip-tier-band py-2 pip-sec-head"
+       role="button" aria-expanded="true" aria-controls="pip-sec-2"
+       data-bs-toggle="collapse" data-bs-target="#pip-sec-2" data-sec="2">
+    <span class="d-flex align-items-center gap-2 flex-wrap">
+      <i class="bi bi-bar-chart-steps" style="color:var(--eve-steel)"></i>
+      <strong>2 · PI demand by tier</strong>
+      <span class="text-muted pip-note">every unit the chain consumes, P4 down to raw</span>
+    </span>
+  </div>
+  <div class="collapse show" id="pip-sec-2">
+  <div class="px-3 py-2 text-muted pip-note border-bottom" style="border-color:var(--eve-border) !important">
+    <i class="bi bi-info-circle me-1"></i>
+    This is the full pyramid, including the P1 and P0 a colony refines for itself.
+    The colony plan below counts only what has to be <em>supplied</em>, so a P1 consumed
+    inside its own P2 colony appears here but gets no colony of its own.
+  </div>
+  {% for t in result.tiers %}
+  <div class="px-3 py-2 border-bottom d-flex align-items-center gap-2"
+       style="border-color:var(--eve-border) !important;background:#141a22">
+    <span class="badge badge-neutral">P{{ t.tier }}</span>
+    <span class="fw-semibold pip-note">{{ t.label }}</span>
+    <span class="text-muted pip-note">· {{ t.rows | length }} product{{ 's' if t.rows | length != 1 }}</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover tbl-compact table-sm mb-0 align-middle pip-qty-table">
+      <thead>
+        <tr>
+          <th>Product</th>
+          <th class="text-end">Per {{ result.period }}</th>
+          <th class="text-end">Per day</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in t.rows %}
+        <tr>
+          <td>
+            <span class="d-inline-flex align-items-center gap-2">
+              <img loading="lazy" src="/icon/{{ r.type_id }}?size=32" width="24" height="24"
+                   class="rounded" onerror="this.style.visibility='hidden'">
+              {{ r.name }}
+            </span>
+          </td>
+          <td class="text-end">{{ r.per_period_units | format_number }}</td>
+          <td class="text-end text-muted">{{ r.per_day_units | format_number }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endfor %}
+  </div>
+</div>
+
+{# ── 3. Colony plan ────────────────────────────────────────────────────── #}
+<div class="card mb-3">
+  <div class="card-header pip-band py-2 pip-sec-head"
+       role="button" aria-expanded="true" aria-controls="pip-sec-3"
+       data-bs-toggle="collapse" data-bs-target="#pip-sec-3" data-sec="3">
+    <span class="d-flex align-items-center gap-2 flex-wrap">
+      <i class="bi bi-globe-americas" style="color:#3fb950"></i>
+      <strong>3 · Colony plan</strong>
+      <span class="text-muted pip-note">
+        {{ result.total_colonies }} colon{{ 'ies' if result.total_colonies != 1 else 'y' }} total
+        · extraction colonies derated to {{ form.derate_pct }}%
+      </span>
+    </span>
+  </div>
+  <div class="collapse show" id="pip-sec-3">
+  <div class="table-responsive">
+    <table class="table table-hover tbl-compact table-sm mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Product</th>
+          <th class="text-end">Demand/day</th>
+          <th class="text-end">Output/colony</th>
+          <th class="text-end">Colonies</th>
+          <th class="text-end">Facilities</th>
+          <th>Colony type</th>
+          <th>Candidate planets</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in result.colonies %}
+        <tr>
+          <td>
+            <span class="d-inline-flex align-items-center gap-2">
+              <img loading="lazy" src="/icon/{{ c.type_id }}?size=32" width="24" height="24"
+                   class="rounded" onerror="this.style.visibility='hidden'">
+              <span class="pip-out">{{ c.name }}</span>
+              <span class="badge badge-neutral" style="font-size:.62rem">{{ c.tier_label }}</span>
+            </span>
+          </td>
+          <td class="text-end">{{ c.demand_units | format_number }}</td>
+          <td class="text-end text-muted">{{ c.output_units | format_number }}</td>
+          <td class="text-end fw-semibold">{{ c.colonies }}</td>
+          <td class="text-end text-muted">{{ c.facilities }}</td>
+          <td>
+            {% if c.kind == 'factory' %}
+            <span class="badge badge-rxn" style="font-size:.62rem">Factory</span>
+            {% else %}
+            <span class="badge" style="background:#12331f;color:#7ee2a8;font-size:.62rem;border:1px solid #1f5236">Extraction</span>
+            {% endif %}
+            {% if not c.layout_fits %}
+            <span class="badge bg-danger ms-1" style="font-size:.62rem" title="Does not fit the selected command centre level">won't fit</span>
+            {% endif %}
+          </td>
+          <td class="text-muted" style="font-size:.74rem">
+            {% if c.factory_only %}
+            <span class="badge" style="background:#3d2c00;color:#e6b84a;font-size:.62rem"
+                  title="Its two P1 inputs share no planet type, so it cannot be made on a self-contained colony">
+              <i class="bi bi-exclamation-triangle me-1"></i>imports P1
+            </span>
+            {% elif c.planet_restricted %}
+            {{ c.planet_types | join(', ') }}
+            <span class="badge" style="background:#3d2c00;color:#e6b84a;font-size:.62rem"
+                  title="High-Tech Production Plants only build on Barren or Temperate planets">P4 only</span>
+            {% elif c.planet_types %}
+            {{ c.planet_types | join(', ') }}
+            {% else %}
+            <span title="A factory colony imports its inputs, so any planet type will do">any</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="px-3 py-2 border-top text-muted pip-note" style="border-color:var(--eve-border) !important">
+    {% if result.factory_only %}
+    <div class="mb-1">
+      <i class="bi bi-exclamation-triangle me-1" style="color:#e6b84a"></i>
+      <strong>{{ result.factory_only | join(', ') }}</strong>
+      {{ 'have' if result.factory_only | length > 1 else 'has' }} inputs that share no planet type —
+      build {{ 'them' if result.factory_only | length > 1 else 'it' }} on a factory colony and import the P1.
+    </div>
+    {% endif %}
+    {% if result.needs_p4_planet %}
+    <div class="mb-1">
+      <i class="bi bi-info-circle me-1"></i>
+      P4 needs a High-Tech Production Plant, which only builds on Barren or Temperate planets.
+    </div>
+    {% endif %}
+    <div>
+      Extraction colonies are the CCU V archetypes (2 ECU, 8 heads, 6 BIF, 3 AIF for P2).
+      Factory colonies carry no extractors and are not derated.
+      Link cost, extractor head placement and deposit richness are out of scope.
+    </div>
+  </div>
+  </div>
+</div>
+
+{# ── 4. Plan vs actual ─────────────────────────────────────────────────── #}
+{% if actual %}
+<div class="card mb-3">
+  <div class="card-header pip-band py-2 pip-sec-head"
+       role="button" aria-expanded="true" aria-controls="pip-sec-4"
+       data-bs-toggle="collapse" data-bs-target="#pip-sec-4" data-sec="4">
+    <span class="d-flex align-items-center gap-2 flex-wrap">
+      <i class="bi bi-clipboard-check" style="color:#3fb950"></i>
+      <strong>4 · Plan vs actual</strong>
+      <span class="text-muted pip-note">
+        {% if actual.total_gap %}{{ actual.total_gap }} colon{{ 'ies' if actual.total_gap != 1 else 'y' }} short
+        {% else %}plan fully covered{% endif %}
+        · {{ actual.total_have }} of {{ actual.total_needed }} in place
+      </span>
+    </span>
+  </div>
+  <div class="collapse show" id="pip-sec-4">
+
+  {% if actual.needs_relogin %}
+  <div class="px-3 py-2 border-bottom" style="border-color:var(--eve-border) !important">
+    <div class="alert alert-warning mb-0 py-2 pip-note">
+      <i class="bi bi-shield-lock me-2"></i>PI access not authorized for:
+      <strong>{{ actual.needs_relogin | join(', ') }}</strong>.
+      Re-add {{ 'these characters' if actual.needs_relogin | length > 1 else 'this character' }}
+      to grant the Planetary Interaction permission —
+      <a href="/auth/login">re-authenticate</a>.
+    </div>
+  </div>
+  {% endif %}
+
+  {% if not signed_in %}
+  <div class="text-muted text-center py-3 pip-note">
+    Sign in to compare this plan against your existing colonies.
+  </div>
+  {% else %}
+
+  {% if actual.expiring %}
+  <div class="px-3 py-2 border-bottom" style="border-color:var(--eve-border) !important">
+    <div class="alert mb-0 py-2 pip-note" style="background:#3d2c00;color:#e6b84a;border:1px solid #6b4f00">
+      <i class="bi bi-clock-history me-2"></i>
+      <strong>{{ actual.expiring | length }} extractor{{ 's' if actual.expiring | length != 1 }}</strong>
+      expiring within 24h on {{ 'colonies' if actual.expiring | length != 1 else 'a colony' }} this plan depends on:
+      <div class="mt-2">
+        {% for e in actual.expiring %}
+        <div class="d-flex align-items-center gap-2 flex-wrap mb-1">
+          <span class="pi-countdown {{ 'pi-expired' if e.expired else 'pi-soon' }}"
+                data-expiry="{{ e.expiry_iso }}" style="min-width:64px">{{ e.remaining }}</span>
+          <span class="text-muted">{{ e.char_name }}</span>
+          <span>{{ e.planet_name }}</span>
+          <span class="text-muted">extracting</span>
+          <strong>{{ e.product }}</strong>
+          <span class="text-muted">→ feeds {{ e.for_products | join(', ') }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="table-responsive">
+    <table class="table table-hover tbl-compact table-sm mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Product</th>
+          <th class="text-end">Needed</th>
+          <th class="text-end">Have</th>
+          <th class="text-end">Gap</th>
+          <th class="text-end">Factories</th>
+          <th>Existing colonies</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in actual.rows %}
+        <tr class="{% if r.gap %}material-missing{% elif r.have %}material-ok{% endif %}">
+          <td>
+            <span class="d-inline-flex align-items-center gap-2">
+              <img loading="lazy" src="/icon/{{ r.type_id }}?size=32" width="24" height="24"
+                   class="rounded" onerror="this.style.visibility='hidden'">
+              <span class="pip-out">{{ r.name }}</span>
+              <span class="badge badge-neutral" style="font-size:.62rem">{{ r.tier_label }}</span>
+            </span>
+          </td>
+          <td class="text-end">{{ r.needed }}</td>
+          <td class="text-end {% if r.have %}text-profit{% else %}text-muted{% endif %}">{{ r.have }}</td>
+          <td class="text-end fw-semibold {% if r.gap %}text-loss{% else %}text-profit{% endif %}">
+            {% if r.gap %}+{{ r.gap }}{% else %}<i class="bi bi-check-lg"></i>{% endif %}
+          </td>
+          <td class="text-end text-muted">{{ r.facilities or '—' }}</td>
+          <td class="text-muted" style="font-size:.74rem">
+            {% if r.sources %}{{ r.sources | join(' · ') }}{% else %}<span class="text-muted">none</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="px-3 py-2 border-top text-muted pip-note" style="border-color:var(--eve-border) !important">
+    {% if actual.unplanned %}
+    <div class="mb-1">
+      <i class="bi bi-info-circle me-1"></i>
+      Your colonies also produce <strong>{{ actual.unplanned | join(', ') }}</strong>,
+      which this plan does not call for.
+    </div>
+    {% endif %}
+    <div>
+      “Have” counts colonies with a factory running that product’s schematic, read from the
+      same live data as <a href="/planets">Planets</a>. A colony exporting raw P0 has no
+      factory pin, so it cannot be matched to a product and its extractors are not listed here.
+    </div>
+  </div>
+  {% endif %}
+  </div>
+</div>
+{% endif %}
+
+{% endif %}
+
+{% endblock %}
+{% block scripts %}
+<script>
+// Remember which sections are collapsed. Submitting the form reloads the page,
+// so without this every plan would reopen all four sections and the collapse
+// would be useless in practice. Keyed by section number, so it survives a
+// change of target.
+(function () {
+  const KEY = 'piPlannerCollapsedSections';
+  let state = {};
+  try { state = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
+
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+  }
+
+  document.querySelectorAll('.pip-sec-head').forEach(head => {
+    const sec = head.dataset.sec;
+    const panel = document.querySelector(head.dataset.bsTarget);
+    if (!panel) return;
+    // Apply the remembered state before Bootstrap builds a Collapse instance —
+    // it reads the DOM lazily on first toggle, so plain class changes are safe.
+    if (state[sec] === true) {
+      panel.classList.remove('show');
+      head.classList.add('collapsed');
+      head.setAttribute('aria-expanded', 'false');
+    }
+    panel.addEventListener('shown.bs.collapse', () => { delete state[sec]; save(); });
+    panel.addEventListener('hidden.bs.collapse', () => { state[sec] = true; save(); });
+  });
+})();
+</script>
+<script>
+// Live countdown on the expiring-extractor list — same behaviour as /planets,
+// so a page left open doesn't quietly go stale.
+(function () {
+  function fmt(ms) {
+    if (ms <= 0) return 'Expired';
+    let s = Math.floor(ms / 1000);
+    const d = Math.floor(s / 86400); s -= d * 86400;
+    const h = Math.floor(s / 3600);  s -= h * 3600;
+    return (d ? d + 'd ' : '') + ((d || h) ? h + 'h ' : '') + Math.floor(s / 60) + 'm';
+  }
+  function tick() {
+    const now = Date.now();
+    document.querySelectorAll('.pi-countdown').forEach(el => {
+      const iso = el.dataset.expiry;
+      if (!iso) return;
+      const ms = new Date(iso).getTime() - now;
+      el.textContent = fmt(ms);
+      el.classList.toggle('pi-expired', ms <= 0);
+      el.classList.toggle('pi-soon', ms > 0);
+    });
+  }
+  tick();
+  setInterval(tick, 60000);
+})();
+</script>
+{% endblock %}

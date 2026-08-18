@@ -16,6 +16,17 @@
   .pi-ext-table th:nth-child(5), .pi-ext-table td:nth-child(5) { width: 190px; }
   .pi-ext-table th:nth-child(6), .pi-ext-table td:nth-child(6) { width: 130px; }
   .pi-ext-table td:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* "More detail" strip. Production + stored collapse behind it so a card stays
+     at planet + what's extracting — the operational view — while the chain and
+     storage contents are one click away. Chevron matches the Assets groups. */
+  .pi-more { cursor: pointer; }
+  .pi-more:hover { background: #1a212b; }
+  .pi-more::before {
+    content: "\25BE"; display: inline-block; font-size: .6rem; line-height: 1;
+    color: var(--eve-steel); transition: transform .15s ease;
+    margin-right: .4rem; flex: 0 0 auto;
+  }
+  .pi-more.collapsed::before { transform: rotate(-90deg); }
 </style>
 
 <div class="row mb-3 align-items-center">
@@ -108,6 +119,20 @@
     {% else %}
     <div class="text-muted text-center py-2" style="font-size:.82rem">No active extractors (factory-only or idle colony).</div>
     {% endif %}
+    {% if c.production or c.stored %}
+    <div class="px-3 py-1 border-top pi-more collapsed d-flex align-items-center"
+         style="border-color:var(--eve-border) !important"
+         role="button" aria-expanded="false" aria-controls="pi-det-{{ c.planet_id }}"
+         data-bs-toggle="collapse" data-bs-target="#pi-det-{{ c.planet_id }}"
+         data-planet="{{ c.planet_id }}">
+      <span class="text-muted" style="font-size:.72rem">
+        {%- if c.production %}{{ c.production | length }} production chain{{ 's' if c.production | length != 1 }}{% endif -%}
+        {%- if c.production and c.stored %} · {% endif -%}
+        {%- if c.stored %}{{ c.stored | length }} stored type{{ 's' if c.stored | length != 1 }}{% endif -%}
+      </span>
+    </div>
+    <div class="collapse" id="pi-det-{{ c.planet_id }}">
+    {% endif %}
     {% if c.production %}
     <div class="px-3 py-2 border-top" style="border-color:var(--eve-border) !important">
       <span class="text-muted small me-2 d-block mb-1"><i class="bi bi-diagram-3 me-1"></i>Production</span>
@@ -140,6 +165,9 @@
       {% if c.stored | length > 14 %}<span class="text-muted small">+{{ c.stored | length - 14 }} more</span>{% endif %}
     </div>
     {% endif %}
+    {% if c.production or c.stored %}
+    </div>
+    {% endif %}
   </div>
   {% endfor %}
 </div>
@@ -147,6 +175,35 @@
 
 {% endblock %}
 {% block scripts %}
+<script>
+// Remember which colonies have their production/storage detail open. Default is
+// collapsed, so a card reads as "planet + what's extracting" — the thing you
+// actually visit this page for — and a colony you opened stays open next visit.
+(function () {
+  const KEY = 'planetsOpenDetail';
+  let state = {};
+  try { state = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
+
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+  }
+
+  document.querySelectorAll('.pi-more').forEach(strip => {
+    const planet = strip.dataset.planet;
+    const panel = document.querySelector(strip.dataset.bsTarget);
+    if (!panel) return;
+    // Applied before Bootstrap builds a Collapse instance — it reads the DOM
+    // lazily on first toggle, so plain class changes are safe here.
+    if (state[planet] === true) {
+      panel.classList.add('show');
+      strip.classList.remove('collapsed');
+      strip.setAttribute('aria-expanded', 'true');
+    }
+    panel.addEventListener('shown.bs.collapse', () => { state[planet] = true; save(); });
+    panel.addEventListener('hidden.bs.collapse', () => { delete state[planet]; save(); });
+  });
+})();
+</script>
 <script>
 (function () {
   function fmt(ms) {
