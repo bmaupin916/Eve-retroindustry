@@ -43,10 +43,16 @@ CACHE_DIR = os.path.join(_ROOT, "data", "sde-archives")
 _SKILL_EXCLUDE = {3380, 3388}   # Handled separately in calc_job_time
 _IMPLANT_GROUP = 743            # Zainou/manufacturing implants — not fetchable via ESI skills
 
-# Activities imported from each blueprint. Invention and the two research
-# activities are present in the source and deliberately not read yet — they land
-# with the invention cost model. Adding a name here is all the importer needs.
-_ACTIVITIES = ("manufacturing", "reaction")
+# Activities imported from each blueprint.
+#
+# `invention` lives on the **T1** blueprint and its products are T2 *blueprints*
+# carrying a success `probability` — so one T1 BP can invent several T2s (Condor
+# invents both the Crow and the Raptor). `copying` is here because inventing
+# consumes a T1 BPC run, so its cost is part of an invention attempt.
+#
+# The two research activities are in the source and still unread; they land with
+# the research planner. Adding a name here is all the importer needs.
+_ACTIVITIES = ("manufacturing", "reaction", "invention", "copying")
 
 
 def init_db(conn: sqlite3.Connection):
@@ -123,6 +129,33 @@ def init_db(conn: sqlite3.Connection):
             type_id         INTEGER NOT NULL,
             quantity        INTEGER NOT NULL,
             PRIMARY KEY (schematic_id, type_id)
+        );
+
+        -- Decryptors, from dogma attributes rather than a hardcoded table.
+        -- There are 64 of them, not the 8 every guide lists: each of the eight
+        -- has faction-flavoured duplicates (Cryptic/Esoteric/Incognito/Occult)
+        -- and the ancient-relic ones (Sleeper/Takmahl/Talocan/Yan Jung) used
+        -- for reverse engineering. A hardcoded table would cover an eighth of
+        -- them and go stale on the next rebalance.
+        CREATE TABLE IF NOT EXISTS sde_decryptors (
+            type_id            INTEGER PRIMARY KEY,
+            name               TEXT NOT NULL,
+            probability_mult   REAL NOT NULL DEFAULT 1.0,  -- multiplies base chance
+            me_modifier        REAL NOT NULL DEFAULT 0.0,  -- added to the BPC's ME
+            te_modifier        REAL NOT NULL DEFAULT 0.0,
+            run_modifier       REAL NOT NULL DEFAULT 0.0   -- added to runs per BPC
+        );
+
+        -- Which science skill each datacore is tied to, from its
+        -- requiredSkill1 dogma attribute. Needed because invention's success
+        -- formula counts only the skills matching the datacores consumed, and
+        -- the names do NOT match: the skill is "Gallente Starship Engineering"
+        -- while the datacore is "Datacore - Gallentean Starship Engineering".
+        -- Amarr/Amarrian differ the same way. Matching on names silently drops
+        -- one of the two science skills for every Amarr and Gallente T2 ship.
+        CREATE TABLE IF NOT EXISTS sde_datacore_skills (
+            type_id       INTEGER PRIMARY KEY,
+            skill_type_id INTEGER NOT NULL
         );
 
         -- Which SDE build this database was built from. Without it the only
@@ -250,6 +283,73 @@ def import_blueprints(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
     return len(bp_rows)
 
 
+# Dogma attributes describing a decryptor. CCP's spelling of 1112 is theirs.
+_DECRYPTOR_ATTRS = {
+    1112: "probability_mult",     # inventionPropabilityMultiplier
+    1113: "me_modifier",          # inventionMEModifier
+    1114: "te_modifier",          # inventionTEModifier
+    1124: "run_modifier",         # inventionMaxRunModifier
+}
+
+
+_DATACORE_GROUP = 333       # the only group ever consumed by an invention job
+_REQUIRED_SKILL_1 = 182     # dogma attribute naming a type's primary skill
+_DATACORE_PREFIX = "Datacore - "
+_SKILL_GROUPS = {270, 268}  # Science, Production — where invention skills live
+
+
+def import_dogma(conn: sqlite3.Connection, z: zipfile.ZipFile) -> tuple[int, int]:
+    """Decryptor effects and datacore-to-skill links, in one pass over typeDogma.
+
+    A decryptor is any type carrying `inventionPropabilityMultiplier` (1112).
+    The Subsystems Data Interfaces come along too — they carry the attribute at
+    1.0/0/0/0, so they are neutral and harmless to keep.
+
+    A datacore's `requiredSkill1` is the science skill that raises the odds of
+    the invention jobs consuming it. Reading it here is what makes the link
+    authoritative rather than a string match on names that do not agree.
+    """
+    names, datacore_ids, skill_ids_by_name = {}, set(), {}
+    for r in feed.records(z, "types"):
+        name = feed.en(r.get("name"))
+        names[r["_key"]] = name
+        if r.get("groupID") == _DATACORE_GROUP:
+            datacore_ids.add(r["_key"])
+        elif r.get("groupID") in _SKILL_GROUPS and name:
+            skill_ids_by_name[name] = r["_key"]
+
+    decryptors, links = [], {}
+    for r in feed.records(z, "typeDogma"):
+        type_id = int(r["_key"])
+        attrs = {d["attributeID"]: d["value"] for d in (r.get("dogmaAttributes") or [])}
+        if 1112 in attrs:
+            vals = {field: float(attrs.get(attr_id) or 0.0)
+                    for attr_id, field in _DECRYPTOR_ATTRS.items()}
+            decryptors.append((type_id, names.get(type_id, "?"),
+                               vals["probability_mult"], vals["me_modifier"],
+                               vals["te_modifier"], vals["run_modifier"]))
+        if type_id in datacore_ids and attrs.get(_REQUIRED_SKILL_1):
+            links[type_id] = int(attrs[_REQUIRED_SKILL_1])
+
+    # `Datacore - Triglavian Quantum Engineering` has no dogma record at all, so
+    # nothing declares its skill. Its name happens to match the skill exactly,
+    # which is the safe direction to fall back in: dogma is authoritative where
+    # it exists (and disagrees with the name for the Amarr and Gallente lines),
+    # and the name is only consulted where dogma says nothing.
+    for type_id in datacore_ids - set(links):
+        bare = names.get(type_id, "").replace(_DATACORE_PREFIX, "").strip()
+        if bare in skill_ids_by_name:
+            links[type_id] = skill_ids_by_name[bare]
+
+    conn.executemany("INSERT OR REPLACE INTO sde_decryptors VALUES (?,?,?,?,?,?)", decryptors)
+    conn.executemany("INSERT OR REPLACE INTO sde_datacore_skills VALUES (?,?)",
+                     sorted(links.items()))
+    conn.commit()
+    console.print(f"[green]  decryptors: {len(decryptors)}[/] "
+                  f"[dim]({len(links)} datacore skill links)[/]")
+    return len(decryptors), len(links)
+
+
 def import_planet_schematics(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
     """PI factory schematics: inputs -> output (type_ids + quantities) + cycle time.
 
@@ -332,6 +432,7 @@ def main():
             import_types(conn, z)
             import_groups(conn, z)
             import_blueprints(conn, z)
+            import_dogma(conn, z)
             import_planet_schematics(conn, z)
         record_build(conn, build)
     finally:

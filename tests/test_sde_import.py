@@ -182,15 +182,29 @@ def test_column_names_match_what_the_app_queries(imported):
     assert "volume" not in cols("sde_types")
 
 
-def test_only_manufacturing_and_reaction_are_imported_for_now(imported):
-    """Invention is in the source and read by nothing yet. This pins the
-    current state so enabling it is a deliberate change, not a surprise."""
+def test_invention_is_imported_with_its_probability(imported):
+    """Invention lives on the T1 blueprint and its product is the T2
+    *blueprint*, carrying the success chance. Without this every T2 figure in
+    the app treats the blueprint as free."""
     acts = {r[0] for r in imported.execute(
         "SELECT DISTINCT activity FROM sde_blueprint_materials")}
-    assert acts == {"manufacturing"}
+    assert acts == {"manufacturing", "invention"}
     assert imported.execute(
-        "SELECT COUNT(*) FROM sde_blueprint_products WHERE activity='invention'"
-    ).fetchone()[0] == 0
+        "SELECT product_type_id, quantity, probability FROM sde_blueprint_products "
+        "WHERE activity='invention'").fetchone() == (12345, 1, 0.3)
+    # The datacores, on the T1 blueprint.
+    assert imported.execute(
+        "SELECT material_type_id, quantity FROM sde_blueprint_materials "
+        "WHERE activity='invention'").fetchone() == (20416, 2)
+
+
+def test_research_activities_are_still_unread(imported):
+    """The two research activities are in the source and land with the research
+    planner. Pinned so enabling them is deliberate, not a surprise."""
+    acts = {r[0] for r in imported.execute(
+        "SELECT DISTINCT activity FROM sde_blueprint_materials")}
+    assert "research_material" not in acts
+    assert "research_time" not in acts
 
 
 def test_the_build_is_recorded(imported):

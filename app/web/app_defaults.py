@@ -65,6 +65,22 @@ DEFAULTS: dict[str, tuple[object, type]] = {
     "faction_standing":      (0.0, float),  # −0.03% broker fee per point
     "corp_standing":         (0.0, float),  # −0.02% broker fee per point
     "structure_broker_pct":  (0.0, float),  # owner-set %, Upwell only
+
+    # ── Invention ────────────────────────────────────────────────────────
+    # A T2 blueprint is not free: it comes out of an invention job that
+    # consumes datacores and fails more often than not. See
+    # app/manufacturing/invention.py.
+    #
+    # One level covers both science skills rather than storing thirty
+    # separate ones. That is exact when they are trained equally, which is
+    # the normal case, and the page says so.
+    "encryption_skill":      (0, int),      # +2.5% of base chance per level
+    "science_skill":         (0, int),      # +3.333% per level, counted twice
+    # 0 = invent without a decryptor. Type id from sde_decryptors.
+    "decryptor_type_id":     (0, int),
+    # Invention is modelled only when this is on, so an install that buys its
+    # T2 BPCs rather than inventing them is not charged for invention.
+    "invent_t2":             (1, int),
 }
 
 

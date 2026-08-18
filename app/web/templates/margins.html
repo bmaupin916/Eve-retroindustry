@@ -152,7 +152,7 @@
           <td class="text-end mg-num">{{ r.te }}</td>
           <td class="text-end mg-num">{{ r.sell_price | isk0 if r.sell_price else '—' }}</td>
           <td class="text-end mg-num {{ 'text-profit' if r.profit and r.profit > 0 else 'text-loss' if r.profit else '' }}"
-              {% if r.profit is not none %}title="{{ r.sell_price | isk0 }} sell &minus; {{ r.material_cost | isk0 }} materials &minus; {{ r.job_fee | isk0 }} job fee &minus; {{ r.selling_cost | isk0 }} selling ({{ '%.2f' % r.selling_cost_pct }}%)"{% endif %}>
+              {% if r.profit is not none %}title="{{ r.sell_price | isk0 }} sell &minus; {{ r.material_cost | isk0 }} materials &minus; {{ r.job_fee | isk0 }} job fee &minus; {{ r.selling_cost | isk0 }} selling ({{ '%.2f' % r.selling_cost_pct }}%){% if r.invention_cost %} &minus; {{ r.invention_cost | isk0 }} invention ({{ '%.0f' % (r.invention_chance * 100) }}% chance, {{ r.invention_runs }} run{{ 's' if r.invention_runs != 1 }}/BPC){% endif %}"{% endif %}>
             {{ r.profit | isk0 if r.profit is not none else '—' }}
           </td>
           <td class="text-end mg-num {{ 'text-profit' if r.margin_pct and r.margin_pct > 0 else 'text-loss' if r.margin_pct is not none else '' }}">
@@ -211,6 +211,14 @@
       {%- endif %}
       <a href="/settings" class="text-decoration-none">Change</a>.
     </div>
+    {% if defaults.invent_t2 %}
+    <div class="mb-1">
+      <i class="bi bi-lightbulb me-1"></i>
+      T2 rows are charged for inventing their blueprint &mdash; datacores divided by the
+      success chance, spread over the runs on the BPC. Hover a profit figure for the split.
+      <a href="/settings" class="text-decoration-none">Change</a>.
+    </div>
+    {% endif %}
     <div>
       Cost is the full build: raw materials at market plus every job fee down the tree,
       manufacturing at your build station and reactions at your reaction station.

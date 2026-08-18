@@ -447,6 +447,37 @@ Already in flight (uncommitted): `volume` on `sde_types` from `types.yaml`, with
 `_volume_column_present` guard so an older DB degrades rather than reporting a wrong
 density. That is the pattern for all of these.
 
+### Invention specifically — ✅ done, v0.9.25
+
+Implemented in `app/manufacturing/invention.py`, charged to every T2 row in the margin
+tracker. Four things the SDE settled that guidance would have got wrong:
+
+* **Runs per BPC is data.** The T2 blueprint's `max_production_limit` is the real number.
+  "10, or 1 for ships and rigs" holds for most, but ~145 of the 1,209 invented blueprints
+  are 5, 20, 200 or 300. The entire invention cost is divided by this, so the rule of thumb
+  misprices those by up to 300x. Ships really are 1 run — in 121 cases out of 121.
+* **Decryptors are data too.** `sde_decryptors`, from dogma attributes 1112/1113/1114/1124.
+  There are **64**, not the 8 every guide lists. Every value in Appendix A's table below is
+  confirmed exactly by the SDE.
+* **The science skills come from the datacores, via `requiredSkill1` — never from names.**
+  The datacore is `Datacore - Gallentean Starship Engineering`; the skill is `Gallente
+  Starship Engineering`. Amarrian/Amarr disagree the same way. Name matching silently drops
+  one of the two science skills for **every Amarr and Gallente T2 ship**, understating the
+  success chance by ~4 points (the Ishtar read 33.6% instead of 37.9%).
+* **Nor from the blueprint's own skill list.** That list carries gating prerequisites which
+  do not affect the odds (`Capital Ship Construction`, on 95 blueprints), and it does not
+  always agree with the datacores — Multispectrum Coating II consumes Molecular Engineering
+  datacores while its blueprint lists Nanite Engineering.
+
+Two edge cases handled: `Datacore - Triglavian Quantum Engineering` has no dogma record at
+all, so the importer falls back to a name match (which is exact for that one); and seven
+legacy blueprints carry no encryption skill, which is a real answer rather than a lookup
+failure. A property test asserts all 1,200 invented products resolve exactly two science
+skills — it is what caught both bugs above.
+
+The base probabilities in the SDE match EVE University's published table exactly, which is
+a useful cross-check but never the source.
+
 ### Invention specifically
 
 `import_sde.py:283` imports only `manufacturing` and `reaction`. So a T2 item resolves its
@@ -1009,7 +1040,7 @@ of this work), each mapped to the step that retires it:
 | W5 | Full tracebacks returned to clients on 500 | Step 2 |
 | W6 | `main.py` at 7,352 lines / 80 routes | Step 4 |
 | W7 | Three substantial features sitting uncommitted (PI planner, margins, job splitting) | **Step 0 — done, v0.9.23** |
-| W8 | Invention absent from the data model — every T2 figure optimistic | Step 1 |
+| W8 | Invention absent from the data model — every T2 figure optimistic | **Step 1 — done, v0.9.25** |
 | W9 | Synchronous token refresh blocks the event loop (the v0.9.22 bug class) | Step 4 |
 | W10 | No migration system; SDE refresh decided by row-count comparison | SDE half **done in Step 1** (build numbers, v0.9.24); migrations still Step 4 |
 | W11 | SQLite under a continuously writing sync worker | Step 4 |

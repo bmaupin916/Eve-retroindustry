@@ -18,6 +18,13 @@ reaction station, each with its own system cost index and tax — and then *sell
 it, which is not free. Sales tax and broker's fee come off the top via
 `app.market.taxes`; between 4.4% and 10.5% of the sale price never reaches the
 wallet, which on a thin margin is the entire margin.
+
+A T2 product is also charged for the blueprint it had to be invented from —
+datacores divided by the success chance and spread over the runs on the
+resulting BPC, via `app.manufacturing.invention`. Without that, T2 rows were
+flattered by a free blueprint while T1 rows were penalised by the conservative
+single-run ME rounding below, so the ranking was biased between the two classes
+for reasons that were not real.
 """
 from __future__ import annotations
 
@@ -27,6 +34,7 @@ import sqlite3
 from app.bom.resolver import BOMResolver, StationFacility
 from app.manufacturing.planner import calc_job_time
 from app.market.taxes import selling_costs
+from app.manufacturing import invention as invention_mod
 
 # Sales tax component of the official job-cost formula:
 #   fee = EIV × (SCI × (1 − structure bonus) + facility tax + SCC)
@@ -53,6 +61,12 @@ class MarginRow:
     # number is lower than the naive sell-minus-cost figure.
     selling_cost: float = 0.0             # per unit
     selling_cost_pct: float = 0.0         # % of sell price
+    # Expected invention cost per unit for a T2 product: datacores and any
+    # decryptor, divided by the success chance and spread over the runs on the
+    # resulting BPC. Zero for anything not invented.
+    invention_cost: float = 0.0           # per unit
+    invention_chance: float | None = None  # success chance, for the tooltip
+    invention_runs: int = 0               # runs on the invented BPC
     profit: float | None = None           # per unit, net of everything
     margin_pct: float | None = None
     volume_m3: float | None = None        # packaged volume of one unit
@@ -279,6 +293,8 @@ def compute_margin(
         fee = _total_job_fee(node)
         row.job_fee = fee / row.units_per_run
 
+        _apply_invention(conn, row, defaults)
+
         # The product always sells off sell orders — you are the one listing it.
         sell = _pick(prices.get(type_id), "sell")
         row.sell_price = sell
@@ -288,7 +304,8 @@ def compute_margin(
             costs = selling_costs(defaults)
             row.selling_cost = costs.on(sell)
             row.selling_cost_pct = costs.pct
-            row.profit = sell - row.material_cost - row.job_fee - row.selling_cost
+            row.profit = (sell - row.material_cost - row.job_fee
+                          - row.selling_cost - row.invention_cost)
             row.margin_pct = (row.profit / sell * 100) if sell else None
             if row.volume_m3:
                 row.profit_per_m3 = row.profit / row.volume_m3
@@ -303,6 +320,56 @@ def compute_margin(
         return row
     finally:
         resolver.close()
+
+
+def _apply_invention(conn: sqlite3.Connection, row: MarginRow, defaults: dict) -> None:
+    """Charge a T2 product for the blueprint it had to be invented from.
+
+    Silently does nothing for anything not invented, which is the common case —
+    `find_recipe` returning None is how "not a T2 item" is distinguished from
+    "T2 item that happens to cost nothing".
+
+    An unpriced datacore is reported on the row rather than counted as free,
+    the same rule the materials follow: understating cost overstates profit,
+    which is the one error this page exists to avoid.
+    """
+    if not int(defaults.get("invent_t2", 1) or 0):
+        return
+    recipe = invention_mod.find_recipe(conn, row.type_id)
+    if recipe is None:
+        return
+
+    decryptor = invention_mod.load_decryptor(
+        conn, int(defaults.get("decryptor_type_id") or 0))
+
+    science = int(defaults.get("science_skill") or 0)
+    levels = {sid: science for sid in recipe.science_skill_ids}
+    if recipe.encryption_skill_id:
+        levels[recipe.encryption_skill_id] = int(defaults.get("encryption_skill") or 0)
+
+    wanted = {tid for tid, _n, _q in recipe.datacores}
+    if decryptor:
+        wanted.add(decryptor.type_id)
+    prices = _cached_prices(conn, wanted)
+    unit_prices = {tid: _pick(prices.get(tid), "sell") for tid in wanted}
+
+    decryptor_price = 0.0
+    if decryptor:
+        decryptor_price = unit_prices.get(decryptor.type_id) or 0.0
+        if unit_prices.get(decryptor.type_id) is None:
+            row.unpriced.append(decryptor.name)
+
+    cost = invention_mod.compute_cost(
+        recipe,
+        prices={k: v for k, v in unit_prices.items() if v is not None},
+        skill_levels=levels,
+        decryptor=decryptor,
+        decryptor_price=decryptor_price,
+    )
+    row.invention_cost = cost.per_unit
+    row.invention_chance = cost.success_chance
+    row.invention_runs = cost.runs_per_bpc
+    row.unpriced.extend(cost.unpriced)
 
 
 def _packaged_volume(conn: sqlite3.Connection, type_id: int) -> float | None:

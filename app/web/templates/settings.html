@@ -258,6 +258,59 @@
           </div>
         </div>
 
+        <hr class="my-4" style="border-color:var(--eve-border)">
+        <h6 class="mb-1" style="font-size:.9rem">Invention</h6>
+        <p class="text-muted small">
+          A T2 blueprint is not free. It comes out of an invention job that burns datacores
+          and <em>fails more often than it succeeds</em> &mdash; about 50% at max skills with no
+          decryptor, so a successful BPC costs roughly two attempts. That cost is charged to
+          every T2 row, divided by the runs on the resulting BPC. It matters most for T2
+          <strong>ships</strong>, which get 1 run per BPC where a module gets 10, so a hull
+          carries ten times the share a module does.
+        </p>
+
+        <div class="row g-3">
+          <div class="col-6 col-lg-2">
+            <label class="form-label small" title="Your racial Encryption Methods skill. +2.5% of the base chance per level.">Encryption</label>
+            <input type="number" min="0" max="5" id="def-encryption"
+                   class="form-control form-control-sm" value="{{ defaults.encryption_skill }}">
+          </div>
+          <div class="col-6 col-lg-2">
+            <label class="form-label small" title="The two datacore science skills. +3.333% of the base chance per level, counted for each of the two.">Science skills</label>
+            <input type="number" min="0" max="5" id="def-science"
+                   class="form-control form-control-sm" value="{{ defaults.science_skill }}">
+            <div class="form-text" style="font-size:.72rem">Applies to both</div>
+          </div>
+          <div class="col-12 col-lg-5">
+            <label class="form-label small" title="Decryptors change the success chance, the runs on the BPC, and its ME and TE. Their effects are read from the SDE.">Decryptor</label>
+            <select id="def-decryptor" class="form-select form-select-sm">
+              <option value="0"{% if not defaults.decryptor_type_id %} selected{% endif %}>None</option>
+              {% for d in decryptors %}
+              <option value="{{ d.type_id }}"{% if defaults.decryptor_type_id == d.type_id %} selected{% endif %}>
+                {{ d.name }} &mdash; chance x{{ '%.1f' % d.probability_mult }},
+                runs {{ '%+d' % d.run_modifier|int }}, ME {{ '%+d' % d.me_modifier|int }},
+                TE {{ '%+d' % d.te_modifier|int }}
+              </option>
+              {% endfor %}
+            </select>
+            {% if not decryptors %}
+            <div class="form-text" style="font-size:.72rem">
+              This database predates the decryptor table &mdash; re-run the SDE import.
+            </div>
+            {% endif %}
+          </div>
+          <div class="col-12 col-lg-3 d-flex align-items-end">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" id="def-invent-t2"
+                     {% if defaults.invent_t2 %}checked{% endif %}>
+              <label class="form-check-label small" for="def-invent-t2"
+                     title="Turn off if you buy your T2 blueprint copies rather than inventing them.">
+                I invent my own T2 blueprints
+              </label>
+            </div>
+          </div>
+        </div>
+
         <div class="mt-3 d-flex align-items-center gap-2">
           <button class="btn btn-eve btn-sm" onclick="saveDefaults()">
             <i class="bi bi-check-lg me-1"></i>Save defaults
@@ -321,6 +374,10 @@ async function saveDefaults() {
       faction_standing:      num('def-faction-standing'),
       corp_standing:         num('def-corp-standing'),
       structure_broker_pct:  num('def-structure-broker'),
+      encryption_skill:      num('def-encryption'),
+      science_skill:         num('def-science'),
+      decryptor_type_id:     num('def-decryptor'),
+      invent_t2:             document.getElementById('def-invent-t2').checked ? 1 : 0,
     }),
   });
   const d = await r.json();

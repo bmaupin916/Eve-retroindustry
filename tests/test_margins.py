@@ -44,7 +44,12 @@ def _price(conn, type_id, sell, buy=None):
 
 
 def _price_whole_tree(conn, path, type_id, me, unit_price=100.0):
-    """Gives every BOM leaf a cached price so a row can price fully."""
+    """Gives every BOM leaf a cached price so a row can price fully.
+
+    Includes the datacores for a T2 product: since invention is modelled, an
+    unpriced datacore is reported exactly like an unpriced material, and a row
+    that cannot price its blueprint is not fully priced.
+    """
     from app.bom.resolver import BOMResolver
     resolver = BOMResolver(path)
     try:
@@ -53,7 +58,16 @@ def _price_whole_tree(conn, path, type_id, me, unit_price=100.0):
         resolver.close()
     for leaf_id in leaves:
         _price(conn, leaf_id, unit_price)
+    for dc_id in _datacores(conn, type_id):
+        _price(conn, dc_id, unit_price)
     return leaves
+
+
+def _datacores(conn, type_id):
+    """Datacore type ids consumed inventing `type_id`, empty if not invented."""
+    from app.manufacturing.invention import find_recipe
+    recipe = find_recipe(conn, type_id)
+    return [tid for tid, _name, _qty in recipe.datacores] if recipe else []
 
 
 # ── the engine ───────────────────────────────────────────────────────────────
@@ -73,9 +87,13 @@ def test_profit_is_sell_minus_materials_and_fees(db):
     assert row.unpriced == []
     assert row.sell_price == 500_000_000.0
     assert row.material_cost > 0
-    # profit = sell − materials − job fee − what selling costs.
+    # profit = sell − materials − job fee − selling − inventing the blueprint.
     assert row.profit == pytest.approx(
-        row.sell_price - row.material_cost - row.job_fee - row.selling_cost)
+        row.sell_price - row.material_cost - row.job_fee
+        - row.selling_cost - row.invention_cost)
+    # The Crane is T2, so it is charged for the BPC it came from.
+    assert row.invention_cost > 0
+    assert 0 < row.invention_chance <= 1
     # An unconfigured install assumes untrained skills and no standings, which
     # is the *pessimistic* end: 7.5% sales tax + 3% broker fee on a listed order.
     assert row.selling_cost_pct == pytest.approx(10.5)

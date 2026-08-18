@@ -1,7 +1,7 @@
 """FastAPI web application for EVE Retroindustry."""
 from __future__ import annotations
 
-APP_VERSION = "0.9.24"
+APP_VERSION = "0.9.25"
 
 import asyncio
 import datetime
@@ -46,6 +46,7 @@ from app.web import contracts_helper
 from app.web import pi_planner_helper
 from app.web import app_defaults
 from app.market.taxes import selling_costs
+from app.manufacturing import invention
 from app.web import margins_helper
 from app.character.assets import (
     fetch_assets, ensure_assets_table, assets_at_location,
@@ -230,6 +231,8 @@ _SDE_TABLES_TO_REFRESH = (
     "sde_planet_schematics",           # v0.8.106 (PI factory chains)
     "sde_planet_schematic_materials",  # v0.8.106
     "sde_build",                       # v0.9.24 (which SDE build this came from)
+    "sde_decryptors",                  # v0.9.25 (invention)
+    "sde_datacore_skills",             # v0.9.25 (invention)
 )
 
 
@@ -1346,6 +1349,11 @@ async def settings_page(request: Request):
     try:
         defaults = app_defaults.get_defaults(conn)
         station_options = _industry_station_options(conn)
+        # Only the eight canonical decryptors: the faction-flavoured duplicates
+        # and the ancient-relic ones behave identically or belong to reverse
+        # engineering, and 64 entries would make the picker unusable.
+        decryptors = [d for d in invention.list_decryptors(conn)
+                      if d.name.endswith("Decryptor")]
     finally:
         conn.close()
     return _tr("settings.html", request, {
@@ -1354,6 +1362,7 @@ async def settings_page(request: Request):
         "scopes": SCOPES,
         "defaults": defaults,
         "station_options": station_options,
+        "decryptors": decryptors,
     })
 
 
