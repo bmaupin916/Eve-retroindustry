@@ -1254,6 +1254,50 @@ Steps 1 and 4 exist.
 * Tenancy (5) lands before the first outside user exists, never retrofitted after.
 * The flagship (6) ships as a pilot with real builders before the alliance depends on it.
 
+### Rough effort
+
+**Unit: a "session"** — one focused working block of the kind that produced Steps 0 and 1
+together. That is the only calibration point that exists, and it flatters the remaining
+work: Steps 0 and 1 were deliberately sequenced first *because* they were small and
+self-contained. Nothing after Step 3 is like them.
+
+Measured against the codebase as of v0.9.26: **17,575 lines of Python**, `main.py` at
+**7,413** of them (42%), **77 routes** of which **22 are POST**, **310 raw `.execute()`
+calls**, **47 tables**.
+
+| Step | Effort | Confidence | What drives it |
+|---|---|---|---|
+| 2 — Security baseline | **1–2 sessions** | High | Bounded and well understood. CSRF is only 22 POST routes; most items are an hour each. Session auth and JWKS verification are the substantial two. |
+| 3 — Go hosted | **1–2 sessions** + your VPS time | Med-high | Mostly *deletion*, which is fast. The unknown is deployment: DNS, certificates and the real SSO callback are elapsed time, not coding time. |
+| 4 — Platform foundations | **3–5 sessions** | **Low** | The wall. 310 queries and 47 tables to move to Postgres, plus ~45 SQLite-specific statements (`INSERT OR REPLACE` ×25, `PRAGMA` ×12, `AUTOINCREMENT` ×4). Splitting a 7,413-line module is mechanical but large. Widest range of any step. |
+| 5 — Multi-tenancy | **2–3 sessions** | Medium | Touches every table and every read, but the pattern is uniform once the query layer exists. The leak tests are what make it slow to call done. |
+| 6 — Groups + coordination | **3–4 sessions** to MVP | Low-med | The flagship, and the least designed. Plus **weeks of calendar time** piloting in your own corp — the match-correction rate cannot be rushed. |
+| 7 — Feature buildout | **8–14 sessions** for all of it | Medium | A menu, not a step. Each item is independent and separately estimable (below). |
+
+**Step 7, itemised** — pick, do not commit to the total:
+
+| Feature | Effort |
+|---|---|
+| Dashboard widgets (§9.6) | 0.5–1 |
+| Refine calculator | 0.5–1 |
+| Reactions board | 1 |
+| Appraisal tool | 1 |
+| Market BI rebuild (§9.4) | 1–2 |
+| Mining ledger (§9.3) | 1–2 |
+| Compression LP | 1–2 |
+| Discord bot (§9.5) | 2–3 — identity linking is most of it |
+
+**Totals.** Steps 2–3 (a real hosted tool, secured): **2–4 sessions**. Steps 2–6 (the
+coordination product): **10–16 sessions** plus pilot time. Everything including all of
+Step 7: **18–30 sessions**.
+
+**Read these as ranges, not dates.** Two honest caveats. Step 4 is the least certain
+estimate here and the most likely to double — a Postgres port surfaces its problems while
+you are doing it, not while you are planning it. And Steps 0–1 each turned up real bugs
+that were not in the plan (the packaged-volume error, the row-count refresh gate, the
+datacore name mismatch); there is no reason to think the later steps are cleaner, so
+assume some fraction of every estimate goes to things nobody has found yet.
+
 ---
 
 ## 12. Appendix A — verified game formulas
