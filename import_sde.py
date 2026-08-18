@@ -70,7 +70,14 @@ def init_db(conn: sqlite3.Connection):
             -- all of them ships and containers. The column this replaced was
             -- named `volume` and held the assembled figure, which was wrong
             -- for exactly the items where it mattered most.
-            packaged_volume REAL
+            packaged_volume REAL,
+            -- How many units one reprocessing batch consumes. Refining is
+            -- all-or-nothing per batch: 100 units for ore and compressed ore,
+            -- 1 for ice and batch-compressed ore. 75 Veldspar plus 25 Dense
+            -- Veldspar is not a batch -- types cannot be combined. Also the
+            -- output quantity of a manufacturing run for the types that come
+            -- out in stacks.
+            portion_size    INTEGER DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS sde_groups (
@@ -146,6 +153,28 @@ def init_db(conn: sqlite3.Connection):
             run_modifier       REAL NOT NULL DEFAULT 0.0   -- added to runs per BPC
         );
 
+        -- What one BATCH of a type reprocesses into. The quantities are per
+        -- `sde_types.portion_size` units, not per unit, and they are the
+        -- 100%-yield figures before any skill, rig, structure or implant
+        -- bonus -- a real refine never returns all of this.
+        CREATE TABLE IF NOT EXISTS sde_type_materials (
+            type_id          INTEGER NOT NULL,
+            material_type_id INTEGER NOT NULL,
+            quantity         INTEGER NOT NULL,
+            PRIMARY KEY (type_id, material_type_id)
+        );
+
+        -- The in-game market tree. `parent_group_id` is NULL for the dozen or
+        -- so roots; `has_types` marks the leaves that actually contain items,
+        -- which is what stops a browser offering empty branches.
+        CREATE TABLE IF NOT EXISTS sde_market_groups (
+            market_group_id INTEGER PRIMARY KEY,
+            parent_group_id INTEGER,
+            name            TEXT NOT NULL,
+            has_types       INTEGER NOT NULL DEFAULT 0,
+            icon_id         INTEGER
+        );
+
         -- Which science skill each datacore is tied to, from its
         -- requiredSkill1 dogma attribute. Needed because invention's success
         -- formula counts only the skills matching the datacores consumed, and
@@ -168,6 +197,9 @@ def init_db(conn: sqlite3.Connection):
             imported_at  REAL
         );
 
+        CREATE INDEX IF NOT EXISTS idx_type_materials ON sde_type_materials(type_id);
+        CREATE INDEX IF NOT EXISTS idx_market_group_parent ON sde_market_groups(parent_group_id);
+        CREATE INDEX IF NOT EXISTS idx_types_market_group ON sde_types(market_group_id);
         CREATE INDEX IF NOT EXISTS idx_bp_product ON sde_blueprint_products(product_type_id);
         CREATE INDEX IF NOT EXISTS idx_bp_materials ON sde_blueprint_materials(blueprint_type_id, activity);
         CREATE INDEX IF NOT EXISTS idx_bp_skills ON sde_blueprint_skills(blueprint_type_id, activity);
@@ -208,6 +240,7 @@ def import_types(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
             # Fall back to `volume` for the handful of types that carry no
             # packaged figure; for those two are the same anyway.
             r.get("packagedVolume", r.get("volume")),
+            r.get("portionSize") or 1,
         ))
         if type_id in _SKILL_EXCLUDE or r.get("groupID") == _IMPLANT_GROUP:
             continue
@@ -217,8 +250,8 @@ def import_types(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
 
     conn.executemany(
         "INSERT OR REPLACE INTO sde_types "
-        "(type_id, name, group_id, published, market_group_id, packaged_volume) "
-        "VALUES (?,?,?,?,?,?)", rows)
+        "(type_id, name, group_id, published, market_group_id, packaged_volume, "
+        "portion_size) VALUES (?,?,?,?,?,?,?)", rows)
     conn.execute("DELETE FROM sde_skill_time_bonus")
     conn.executemany("INSERT OR REPLACE INTO sde_skill_time_bonus VALUES (?,?,?)", skills)
     conn.commit()
@@ -350,6 +383,43 @@ def import_dogma(conn: sqlite3.Connection, z: zipfile.ZipFile) -> tuple[int, int
     return len(decryptors), len(links)
 
 
+def import_type_materials(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+    """typeMaterials -> sde_type_materials: what a batch reprocesses into.
+
+    Powers the refine calculator, ore valuation and the mining ledger. Note the
+    quantities are per *batch* of `portion_size`, so anything reporting a
+    per-unit or per-m3 figure has to divide.
+    """
+    rows = [
+        (int(r["_key"]), int(m["materialTypeID"]), int(m["quantity"]))
+        for r in feed.records(z, "typeMaterials")
+        for m in (r.get("materials") or [])
+    ]
+    conn.executemany("INSERT OR REPLACE INTO sde_type_materials VALUES (?,?,?)", rows)
+    conn.commit()
+    console.print(f"[green]  type materials: {len(rows):,}[/] "
+                  f"[dim](reprocessing yields)[/]")
+    return len(rows)
+
+
+def import_market_groups(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+    """marketGroups -> sde_market_groups: the in-game market tree.
+
+    `sde_types.market_group_id` already points into this; until now there was
+    nothing to point at, so the Prices page could only be one flat list.
+    """
+    rows = [
+        (int(r["_key"]), r.get("parentGroupID"), feed.en(r.get("name")) or f"Group {r['_key']}",
+         1 if r.get("hasTypes") else 0, r.get("iconID"))
+        for r in feed.records(z, "marketGroups")
+    ]
+    conn.executemany("INSERT OR REPLACE INTO sde_market_groups VALUES (?,?,?,?,?)", rows)
+    conn.commit()
+    roots = sum(1 for r in rows if r[1] is None)
+    console.print(f"[green]  market groups: {len(rows):,}[/] [dim]({roots} roots)[/]")
+    return len(rows)
+
+
 def import_planet_schematics(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
     """PI factory schematics: inputs -> output (type_ids + quantities) + cycle time.
 
@@ -433,6 +503,8 @@ def main():
             import_groups(conn, z)
             import_blueprints(conn, z)
             import_dogma(conn, z)
+            import_type_materials(conn, z)
+            import_market_groups(conn, z)
             import_planet_schematics(conn, z)
         record_build(conn, build)
     finally:

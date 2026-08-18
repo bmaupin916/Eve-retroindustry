@@ -436,12 +436,28 @@ bottleneck visible — which is the leader's actual decision.
 Four additions to `import_sde.py`, none depending on the hosted migration, each turning
 numbers that are currently wrong or absent into correct ones.
 
-| Addition | Source | Unlocks |
-|---|---|---|
-| `invention` + `copying` activities | `blueprints.yaml` (already read) | Correct T2 costs everywhere; research planner |
-| `typeMaterials.yaml` | new file | Refine calculator, ore valuation, mining ledger, alchemy |
-| `portionSize` | `types.yaml` (already read) | Refine batching — one line in a loop already modified |
-| `marketGroups.yaml` | new file | Market hierarchy and group-level BI |
+| Addition | Source | Unlocks | Status |
+|---|---|---|---|
+| `invention` + `copying` activities | `blueprints` | Correct T2 costs everywhere; research planner | ✅ v0.9.25 |
+| `typeMaterials` | `typeMaterials` | Refine calculator, ore valuation, mining ledger, alchemy | ✅ v0.9.26 |
+| `portionSize` | `types` | Refine batching | ✅ v0.9.26 |
+| `marketGroups` | `marketGroups` | Market hierarchy and group-level BI | ✅ v0.9.26 |
+
+**All four landed.** 47,051 reprocessing yields, 2,106 market groups under 19 roots, and
+`portion_size` on every type. Two things worth recording from doing it:
+
+* **The golden fixtures hold exactly.** Plagioclase (0.35 m³, 100 per batch, 175 Tritanium
+  + 70 Mexallon → 5.0 and 2.0 per m³) and Spodumain (30 / 0.625 / 0.1 / 0.05 / 0.025 per
+  m³) match CCP's export, ore.cerlestes.de and the DARK spreadsheet — three independent
+  sources agreeing. A test now pins the *shipped* `sde_base.db` against those numbers, so a
+  future import that silently switches per-unit for per-batch, or assembled for packaged
+  volume, fails rather than quietly rescaling every ore figure by 100.
+* **Appendix A's batch rule is confirmed by data**, not just quoted: `portion_size` is 100
+  for ore and compressed ore, 1 for ice (Glacial Mass, White Glaze).
+
+The market tree comes out as the shape §9.4 assumed: Ships → Battleships → {Advanced,
+Faction, Precursor, Standard} Battleships, with `has_types` marking the leaves that hold
+items so a browser never offers an empty branch.
 
 Already in flight (uncommitted): `volume` on `sde_types` from `types.yaml`, with a
 `_volume_column_present` guard so an older DB degrades rather than reporting a wrong

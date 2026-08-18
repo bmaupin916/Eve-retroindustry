@@ -1,7 +1,7 @@
 """FastAPI web application for EVE Retroindustry."""
 from __future__ import annotations
 
-APP_VERSION = "0.9.25"
+APP_VERSION = "0.9.26"
 
 import asyncio
 import datetime
@@ -233,6 +233,8 @@ _SDE_TABLES_TO_REFRESH = (
     "sde_build",                       # v0.9.24 (which SDE build this came from)
     "sde_decryptors",                  # v0.9.25 (invention)
     "sde_datacore_skills",             # v0.9.25 (invention)
+    "sde_type_materials",              # v0.9.26 (reprocessing yields)
+    "sde_market_groups",               # v0.9.26 (market hierarchy)
 )
 
 

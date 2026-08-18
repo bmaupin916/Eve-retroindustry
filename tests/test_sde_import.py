@@ -211,3 +211,144 @@ def test_the_build_is_recorded(imported):
     assert imported.execute(
         "SELECT build_number, release_date FROM sde_build WHERE id=1"
     ).fetchone() == (BUILD, "2026-08-17T11:26:56Z")
+
+
+# ── reprocessing yields and the market tree ────────────────────────────────
+@pytest.fixture
+def ore_archive(tmp_path):
+    """Plagioclase and Glacial Mass, with the real numbers."""
+    return _archive(str(tmp_path / "ore.zip"), {
+        "types": [
+            {"_key": 18, "name": {"en": "Plagioclase"}, "groupID": 456,
+             "published": True, "volume": 0.35, "packagedVolume": 0.35,
+             "portionSize": 100, "marketGroupID": 517},
+            {"_key": 16262, "name": {"en": "Glacial Mass"}, "groupID": 465,
+             "published": True, "volume": 1000.0, "packagedVolume": 1000.0,
+             "portionSize": 1},
+            {"_key": 34, "name": {"en": "Tritanium"}, "groupID": 18, "published": True},
+            {"_key": 36, "name": {"en": "Mexallon"}, "groupID": 18, "published": True},
+        ],
+        "typeMaterials": [
+            {"_key": 18, "materials": [{"materialTypeID": 34, "quantity": 175},
+                                       {"materialTypeID": 36, "quantity": 70}]},
+        ],
+        "marketGroups": [
+            {"_key": 4, "name": {"en": "Ships"}, "hasTypes": False},
+            {"_key": 1361, "name": {"en": "Battleships"}, "parentGroupID": 4,
+             "hasTypes": False},
+            {"_key": 517, "name": {"en": "Standard Battleships"},
+             "parentGroupID": 1361, "hasTypes": True},
+        ],
+    })
+
+
+@pytest.fixture
+def ore_db(ore_archive, tmp_path):
+    import import_sde
+    conn = sqlite3.connect(str(tmp_path / "ore.db"))
+    import_sde.init_db(conn)
+    with zipfile.ZipFile(ore_archive) as z:
+        import_sde.import_types(conn, z)
+        import_sde.import_type_materials(conn, z)
+        import_sde.import_market_groups(conn, z)
+    conn.commit()
+    return conn
+
+
+def test_portion_size_is_the_reprocessing_batch(ore_db):
+    """Ore refines 100 at a time, ice 1 at a time. Getting this wrong scales
+    every yield by 100."""
+    sizes = dict(ore_db.execute(
+        "SELECT type_id, portion_size FROM sde_types WHERE type_id IN (18, 16262)"))
+    assert sizes[18] == 100          # Plagioclase
+    assert sizes[16262] == 1         # Glacial Mass, an ice
+
+
+def test_yields_are_per_batch_and_match_the_published_figures(ore_db):
+    """Plagioclase is the cross-check fixture: 0.35 m³, 100 per batch, 175
+    Tritanium and 70 Mexallon, which is 5.0 and 2.0 per m³ — the numbers both
+    ore.cerlestes.de and the DARK mining spreadsheet report."""
+    vol, portion = ore_db.execute(
+        "SELECT packaged_volume, portion_size FROM sde_types WHERE type_id=18").fetchone()
+    yields = dict(ore_db.execute(
+        "SELECT material_type_id, quantity FROM sde_type_materials WHERE type_id=18"))
+    assert yields == {34: 175, 36: 70}
+    assert yields[34] / (vol * portion) == pytest.approx(5.0)
+    assert yields[36] / (vol * portion) == pytest.approx(2.0)
+
+
+def test_market_groups_form_a_walkable_tree(ore_db):
+    """The hierarchy the Prices rebuild needs: a root with no parent, interior
+    nodes, and leaves flagged as the ones that hold items."""
+    root = ore_db.execute(
+        "SELECT market_group_id, name FROM sde_market_groups "
+        "WHERE parent_group_id IS NULL").fetchone()
+    assert root == (4, "Ships")
+
+    child = ore_db.execute(
+        "SELECT market_group_id, name, has_types FROM sde_market_groups "
+        "WHERE parent_group_id=4").fetchone()
+    assert child == (1361, "Battleships", 0)
+
+    leaf = ore_db.execute(
+        "SELECT market_group_id, name, has_types FROM sde_market_groups "
+        "WHERE parent_group_id=1361").fetchone()
+    assert leaf == (517, "Standard Battleships", 1)
+
+    # …and a type hangs off the leaf, which is what makes the tree browsable.
+    assert ore_db.execute(
+        "SELECT name FROM sde_types WHERE market_group_id=517").fetchone()[0] == "Plagioclase"
+
+
+def test_a_type_with_no_reprocessing_output_simply_has_no_rows(ore_db):
+    """Absence is the answer for anything that does not reprocess — not a zero
+    row that would read as "refines into nothing"."""
+    assert ore_db.execute(
+        "SELECT COUNT(*) FROM sde_type_materials WHERE type_id=16262").fetchone()[0] == 0
+
+
+def test_shipped_ore_yields_match_an_independent_source():
+    """Guards the real `sde_base.db`, not a synthetic fixture.
+
+    These per-m³ figures were cross-checked against ore.cerlestes.de and the
+    DARK mining spreadsheet, independently of CCP's export, and all three agree.
+    If a future SDE import silently changes units — per-unit instead of
+    per-batch, assembled instead of packaged volume — this is what notices.
+    """
+    conn = sqlite3.connect(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sde_base.db"))
+    try:
+        expected = {
+            "Plagioclase": {"Tritanium": 5.0, "Mexallon": 2.0},
+            "Spodumain": {"Tritanium": 30.0, "Isogen": 0.625, "Nocxium": 0.1,
+                          "Zydrine": 0.05, "Megacyte": 0.025},
+            "Veldspar": {"Tritanium": 40.0},
+        }
+        for ore, wanted in expected.items():
+            type_id, volume, portion = conn.execute(
+                "SELECT type_id, packaged_volume, portion_size FROM sde_types "
+                "WHERE name=?", (ore,)).fetchone()
+            got = {name: qty / (volume * portion) for name, qty in conn.execute(
+                "SELECT t.name, m.quantity FROM sde_type_materials m "
+                "JOIN sde_types t ON t.type_id = m.material_type_id "
+                "WHERE m.type_id=?", (type_id,))}
+            assert got == pytest.approx(wanted), ore
+    finally:
+        conn.close()
+
+
+def test_ice_refines_one_unit_at_a_time_in_the_shipped_data():
+    """Appendix A's batch rule, verified against the export rather than quoted:
+    100 for ore, 1 for ice."""
+    conn = sqlite3.connect(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sde_base.db"))
+    try:
+        sizes = dict(conn.execute(
+            "SELECT name, portion_size FROM sde_types WHERE name IN "
+            "('Veldspar', 'Plagioclase', 'Glacial Mass', 'White Glaze')"))
+        assert sizes["Veldspar"] == 100
+        assert sizes["Plagioclase"] == 100
+        assert sizes["Glacial Mass"] == 1
+        assert sizes["White Glaze"] == 1
+    finally:
+        conn.close()
