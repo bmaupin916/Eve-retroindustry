@@ -78,6 +78,132 @@
     </div>
     {% endif %}
 
+    {# ── Industry defaults ─────────────────────────────────────────────── #}
+    <div class="card mb-4 mt-4">
+      <div class="card-header py-2">
+        <span class="d-flex align-items-center gap-2">
+          <i class="bi bi-hammer" style="color:var(--eve-gold)"></i>
+          <strong>Industry defaults</strong>
+        </span>
+      </div>
+      <div class="card-body">
+        <p class="text-muted small">
+          Where you build, and what a job costs there. The
+          <a href="/margins">Margin Tracker</a> prices its whole watchlist against these,
+          and the <a href="/plan">Plan</a> form pre-fills from them.
+        </p>
+
+        <div class="row g-3">
+          <div class="col-12 col-lg-6">
+            <label class="form-label small">Build station</label>
+            <select id="def-build-station" class="form-select form-select-sm">
+              <option value="0">— not set —</option>
+              {% for s in station_options %}
+              <option value="{{ s.location_id }}" {% if defaults.build_station_id == s.location_id %}selected{% endif %}>{{ s.name }}</option>
+              {% endfor %}
+            </select>
+            <div class="form-text" style="font-size:.72rem">
+              {% if not station_options %}
+              No known stations yet — visit Assets or run a Plan first so the app learns their names.
+              {% else %}
+              Drives the system cost index and structure bonuses.
+              {% endif %}
+            </div>
+          </div>
+          <div class="col-12 col-lg-6">
+            <label class="form-label small">Reaction station</label>
+            <select id="def-reaction-station" class="form-select form-select-sm">
+              <option value="0">— same as build station —</option>
+              {% for s in station_options %}
+              <option value="{{ s.location_id }}" {% if defaults.reaction_station_id == s.location_id %}selected{% endif %}>{{ s.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="col-6 col-lg-3">
+            <label class="form-label small">Facility tax %</label>
+            <input type="number" step="0.1" id="def-facility-tax" class="form-control form-control-sm"
+                   value="{{ defaults.facility_tax }}">
+          </div>
+          <div class="col-6 col-lg-3">
+            <label class="form-label small">Reaction tax %</label>
+            <input type="number" step="0.1" id="def-reaction-tax" class="form-control form-control-sm"
+                   value="{{ defaults.reaction_facility_tax }}">
+          </div>
+          <div class="col-6 col-lg-3">
+            <label class="form-label small">Industry skill</label>
+            <input type="number" min="0" max="5" id="def-industry" class="form-control form-control-sm"
+                   value="{{ defaults.industry_skill }}">
+          </div>
+          <div class="col-6 col-lg-3">
+            <label class="form-label small">Adv. Industry skill</label>
+            <input type="number" min="0" max="5" id="def-adv-industry" class="form-control form-control-sm"
+                   value="{{ defaults.adv_industry_skill }}">
+          </div>
+
+          <div class="col-12 col-lg-6">
+            <label class="form-label small" title="How input materials are costed: instant-buy off sell orders, or patiently placing buy orders.">Material pricing</label>
+            <select id="def-input-basis" class="form-select form-select-sm">
+              <option value="sell" {% if defaults.input_basis == 'sell' %}selected{% endif %}>Jita sell (instant buy)</option>
+              <option value="buy"  {% if defaults.input_basis == 'buy'  %}selected{% endif %}>Jita buy (place orders)</option>
+            </select>
+          </div>
+          <div class="col-12 col-lg-6">
+            <label class="form-label small">Price hub</label>
+            <select id="def-price-hub" class="form-select form-select-sm" disabled>
+              <option value="jita" selected>Jita</option>
+            </select>
+            <div class="form-text" style="font-size:.72rem">Other hubs come later.</div>
+          </div>
+        </div>
+
+        <hr class="my-4" style="border-color:var(--eve-border)">
+        <h6 class="mb-1" style="font-size:.9rem">Job splitting &amp; slots</h6>
+        <p class="text-muted small">
+          Nobody installs one 10-day job. Cap the length and a 600-run reaction becomes
+          ten 1-day jobs — which is both how you'd really run it and, because EVE rounds
+          material efficiency once per job, slightly more expensive. The split feeds the
+          Materials tab, not just the schedule.
+        </p>
+
+        <div class="row g-3">
+          <div class="col-6 col-lg-3">
+            <label class="form-label small" title="Longest a single job may run before it is split. 0 disables splitting.">Max job length (days)</label>
+            <input type="number" min="0" step="0.5" id="def-max-job-days"
+                   class="form-control form-control-sm" value="{{ defaults.max_job_days }}">
+            <div class="form-text" style="font-size:.72rem">0 = never split</div>
+          </div>
+          <div class="col-6 col-lg-3">
+            <label class="form-label small" title="Total concurrent manufacturing jobs across all your characters.">Manufacturing slots</label>
+            <input type="number" min="0" id="def-mfg-slots"
+                   class="form-control form-control-sm" value="{{ defaults.manufacturing_slots }}">
+            <div class="form-text" style="font-size:.72rem">0 = unlimited</div>
+          </div>
+          <div class="col-6 col-lg-3">
+            <label class="form-label small" title="Total concurrent reaction jobs. Reactions have their own pool.">Reaction slots</label>
+            <input type="number" min="0" id="def-rxn-slots"
+                   class="form-control form-control-sm" value="{{ defaults.reaction_slots }}">
+            <div class="form-text" style="font-size:.72rem">0 = unlimited</div>
+          </div>
+          <div class="col-6 col-lg-3">
+            <label class="form-label small" title="How many of your manufacturing slots belong to capital-capable characters.">Capital-capable slots</label>
+            <input type="number" min="0" id="def-cap-slots"
+                   class="form-control form-control-sm" value="{{ defaults.capital_slots }}">
+            <div class="form-text" style="font-size:.72rem">
+              A subset of manufacturing slots, not extra ones.
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-3 d-flex align-items-center gap-2">
+          <button class="btn btn-eve btn-sm" onclick="saveDefaults()">
+            <i class="bi bi-check-lg me-1"></i>Save defaults
+          </button>
+          <span id="defaults-msg" class="small"></span>
+        </div>
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -105,6 +231,31 @@ async function saveClientId() {
   } else {
     showMsg(d.error || 'Error saving.', false);
   }
+}
+
+async function saveDefaults() {
+  const msg = document.getElementById('defaults-msg');
+  const num = id => document.getElementById(id).value;
+  const r = await fetch('/api/settings/defaults', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      build_station_id:      num('def-build-station'),
+      reaction_station_id:   num('def-reaction-station'),
+      facility_tax:          num('def-facility-tax'),
+      reaction_facility_tax: num('def-reaction-tax'),
+      industry_skill:        num('def-industry'),
+      adv_industry_skill:    num('def-adv-industry'),
+      input_basis:           num('def-input-basis'),
+      max_job_days:          num('def-max-job-days'),
+      manufacturing_slots:   num('def-mfg-slots'),
+      reaction_slots:        num('def-rxn-slots'),
+      capital_slots:         num('def-cap-slots'),
+    }),
+  });
+  const d = await r.json();
+  msg.textContent = d.ok ? 'Saved.' : (d.error || 'Error saving.');
+  msg.className = 'small ' + (d.ok ? 'text-success' : 'text-danger');
 }
 
 function showMsg(text, ok) {
