@@ -5,6 +5,10 @@ sqlalchemy>=2.0
 # one declaration emits both SQLite and Postgres DDL; alembic migrates it and
 # stamps databases that predate it. See app/db/migrate.py.
 alembic>=1.13
+# Postgres driver. Not yet the runtime store — the schema and migrations
+# run on it (tests/test_postgres_schema.py), but the ~316 hand-written
+# queries still use sqlite3 positional placeholders.
+psycopg[binary]>=3.2
 rich>=13.0
 fastapi>=0.111
 uvicorn[standard]>=0.29
