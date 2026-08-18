@@ -54,6 +54,12 @@ SALES_TAX_PER_LEVEL = 0.11      # Accounting cuts the base by 11% per level
 
 BROKER_BASE = 0.03              # 3% in NPC stations
 BROKER_PER_RELATIONS = 0.003    # -0.3% per Broker Relations level
+# **Unmodified standings only.** The broker's fee reads raw standing and ignores
+# the standing skills entirely — Connections, Diplomacy and the rest do not
+# apply, even though the character sheet shows their effect by default. Feeding
+# in the modified figure inflates the discount and understates the fee, which
+# overstates profit: the one direction of error this module exists to prevent.
+# The settings fields are labelled "(unmodified)" for this reason.
 BROKER_PER_FACTION_STANDING = 0.0003    # -0.03% per point
 BROKER_PER_CORP_STANDING = 0.0002       # -0.02% per point
 
@@ -87,7 +93,9 @@ def _standing(raw) -> float:
 
 def sales_tax_rate(accounting: int = 0) -> float:
     """Fraction of sale price paid as sales tax. 7.5% at Accounting 0,
-    3.3375% at Accounting V."""
+    3.375% at Accounting V (7.5 × 0.45). Published tables give this variously as
+    3.4%, 3.37% or 3.3% — all of them are that same number, rounded or
+    truncated, not a different coefficient."""
     return SALES_TAX_BASE * (1.0 - SALES_TAX_PER_LEVEL * _lvl(accounting))
 
 
