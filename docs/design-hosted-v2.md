@@ -973,7 +973,7 @@ of this work), each mapped to the step that retires it:
 | W4 | Refresh tokens plaintext; no file permissions on `eve_cache.db` | Step 2 |
 | W5 | Full tracebacks returned to clients on 500 | Step 2 |
 | W6 | `main.py` at 7,352 lines / 80 routes | Step 4 |
-| W7 | Three substantial features sitting uncommitted (PI planner, margins, job splitting) | Step 0 |
+| W7 | Three substantial features sitting uncommitted (PI planner, margins, job splitting) | **Step 0 — done, v0.9.23** |
 | W8 | Invention absent from the data model — every T2 figure optimistic | Step 1 |
 | W9 | Synchronous token refresh blocks the event loop (the v0.9.22 bug class) | Step 4 |
 | W10 | No migration system; SDE refresh decided by row-count comparison | Step 4 |
@@ -985,9 +985,24 @@ endpoints (Step 2), deprecated YAML SDE pipeline (Step 1).
 
 ### The steps
 
-**Step 0 — Land the WIP.** Commit and release the three in-flight features on the current
-codebase. Clears an 875-line diff before any restructuring; margins is the reference
-pattern for everything later. *(W7)*
+**Step 0 — Land the WIP. ✅ Done — v0.9.23.** The three in-flight features shipped as
+four commits plus a release: PI planner, margin tracker, job splitting/slot scheduling,
+and the app-wide defaults page they share. 875-line diff cleared; margins is the
+reference pattern for everything later. *(W7)*
+
+Landing it surfaced one thing worth carrying forward. `sde_types` gained a packaged-volume
+column, and the bundled-SDE refresh **could not see it**: the gate triggers on more rows or
+a missing *table*, so a release that only adds a *column* left every existing install
+behind, silently, forever. Fixed here (the gate compares columns too, one-directionally,
+so a column only the user has does not re-trigger on every startup) and covered by
+`tests/test_sde_refresh.py`. This is W10 — "SDE refresh decided by row-count comparison" —
+arriving two steps early and confirming it is real rather than theoretical. The Step 1
+importer rework should treat build-pinning as the actual fix; this gate is a patch on a
+mechanism that wants replacing.
+
+Note the live install still shows no profit-per-m³: the column exists in the schema but
+`sde_base.db` predates it, so the value lands only when the SDE is re-imported and the
+bundle rebuilt. The page says so rather than showing a blank column.
 
 **Step 1 — Correctness sprint.** SDE importer to CCP's JSONL feed with build pinning and
 the changes feed; invention + copying activities; `typeMaterials`, `portionSize`,
