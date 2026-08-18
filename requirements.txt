@@ -1,16 +1,14 @@
 httpx>=0.27
 pydantic>=2.0
 sqlalchemy>=2.0
-aiofiles>=23.0
 rich>=13.0
 fastapi>=0.111
 uvicorn[standard]>=0.29
-jinja2>=3.1
-python-multipart>=0.0.9
+jinja2>=3.1            # templates, via fastapi.templating
+python-multipart>=0.0.9  # required by FastAPI to parse Form() bodies
 PyJWT>=2.8
 # RS256 verification backend for PyJWT. EVE SSO signs its access tokens with
 # RS256, and PyJWT raises "Algorithm 'RS256' could not be found" without this —
 # so it is required, not optional, now that we verify signatures rather than
 # trusting the TLS channel to the token endpoint.
 cryptography>=42.0
-Pillow>=10.0
