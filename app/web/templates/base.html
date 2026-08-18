@@ -243,6 +243,9 @@ window.escHtml = function (s) {
           <a class="nav-link {% if request.url.path.startswith('/prices') %}active{% endif %}" href="/prices" title="Prices"><i class="bi bi-currency-exchange"></i><span class="nav-label">Prices</span></a>
         </li>
         <li class="nav-item">
+          <a class="nav-link {% if request.url.path.startswith('/margins') %}active{% endif %}" href="/margins" title="Margin Tracker"><i class="bi bi-graph-up-arrow"></i><span class="nav-label">Margins</span></a>
+        </li>
+        <li class="nav-item">
           <a class="nav-link {% if request.url.path.startswith('/projects') %}active{% endif %}" href="/projects" title="Projects"><i class="bi bi-kanban"></i><span class="nav-label">Projects</span></a>
         </li>
         <li class="nav-item">
@@ -260,12 +263,21 @@ window.escHtml = function (s) {
         <li class="nav-item">
           <a class="nav-link {% if request.url.path.startswith('/planets') %}active{% endif %}" href="/planets" title="Planets"><i class="bi bi-globe-americas"></i><span class="nav-label">Planets</span><span id="nav-pi-badge" class="d-none badge rounded-pill ms-1" style="font-size:.6rem;vertical-align:top" title="PI extractors expiring within 24h"></span></a>
         </li>
+        <li class="nav-item">
+          <a class="nav-link {% if request.url.path.startswith('/pi-planner') %}active{% endif %}" href="/pi-planner" title="PI Planner"><i class="bi bi-diagram-3"></i><span class="nav-label">PI Planner</span></a>
+        </li>
       </ul>
       <ul class="navbar-nav ms-auto align-items-center gap-2">
         <li class="nav-item">
           <a class="nav-link d-flex align-items-center" href="#" onclick="kofiOpen(event)"
              style="font-size:.85rem;opacity:.7" title="Support me on Ko-fi">
             <i class="bi bi-cup-hot-fill" style="color:#e3b341"></i><span class="nav-label">Support me</span>
+          </a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link {% if request.url.path.startswith('/settings') %}active{% endif %}"
+             href="/settings" style="font-size:.85rem;opacity:.7" title="Settings — industry defaults, slots, ESI">
+            <i class="bi bi-gear"></i><span class="nav-label">Settings</span>
           </a>
         </li>
         <li class="nav-item">

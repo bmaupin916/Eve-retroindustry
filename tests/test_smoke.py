@@ -6,7 +6,10 @@ import pytest
 ROUTES = [
     "/", "/plan", "/prices", "/blueprints", "/assets", "/assets?view=all",
     "/wallet", "/orders", "/jobs", "/contracts", "/contracts/public",
-    "/projects", "/about",
+    "/projects", "/about", "/settings", "/margins",
+    # Pure SDE maths, no ESI — safe to render in a smoke test, unlike /planets.
+    "/pi-planner",
+    "/pi-planner?target=Nitrogen+Fuel+Block&qty=50000&period=week&derate=60&ccu=5&me=10",
 ]
 CZECH = re.compile(r"[áéíýóúůžščřďťňěÁÉÍÝÓÚŽŠČŘĎŤŇĚ]")
 

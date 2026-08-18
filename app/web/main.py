@@ -1,7 +1,7 @@
 """FastAPI web application for EVE Retroindustry."""
 from __future__ import annotations
 
-APP_VERSION = "0.9.22"
+APP_VERSION = "0.9.23"
 
 import asyncio
 import datetime
@@ -21,6 +21,7 @@ from app.esi.client import (
 )
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from urllib.parse import quote
 from fastapi.templating import Jinja2Templates
 
 from app.auth.token_store import (
@@ -42,6 +43,9 @@ from app.character import jobs as jobs_api
 from app.character import contracts as contracts_api
 from app.character import planets as planets_api
 from app.web import contracts_helper
+from app.web import pi_planner_helper
+from app.web import app_defaults
+from app.web import margins_helper
 from app.character.assets import (
     fetch_assets, ensure_assets_table, assets_at_location,
     fetch_corp_assets, ensure_corp_assets_table,
@@ -290,11 +294,26 @@ def _refresh_sde_from_bundle(conn: sqlite3.Connection) -> int:
             for t in _SDE_TABLES_TO_REFRESH
         )
 
-        if bundled_count <= user_count and bundled_groups <= user_groups and not missing:
-            return user_count  # user is up to date on types, groups, and tables
+        # ...and when a table the user already has is missing a COLUMN the bundle
+        # now carries — e.g. sde_types.volume (v0.9.23, profit-per-m3 in the
+        # margin tracker). Counts cannot see this: the same 52,848 types arrive
+        # either way, so without a column check the new field never lands and the
+        # feature that needs it stays silently dark on every existing install.
+        def _columns(c, table: str) -> set:
+            return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+
+        stale = any(
+            t in bundle_tables and t in user_tables
+            and (_columns(bsrc, t) - _columns(conn, t))
+            for t in _SDE_TABLES_TO_REFRESH
+        )
+
+        if (bundled_count <= user_count and bundled_groups <= user_groups
+                and not missing and not stale):
+            return user_count  # up to date on types, groups, tables and columns
 
         print(f"[sde] refreshing SDE tables: user={user_count}, bundled={bundled_count}, "
-              f"missing_table={missing}", flush=True)
+              f"missing_table={missing}, stale_columns={stale}", flush=True)
         payload = []
         for table in _SDE_TABLES_TO_REFRESH:
             ddl = bsrc.execute(
@@ -1300,11 +1319,48 @@ async def api_sync_start():
 async def settings_page(request: Request):
     from app.auth.token_store import get_client_id
     from app.auth.esi_oauth import CALLBACK_URL, SCOPES
+    conn = get_conn()
+    try:
+        defaults = app_defaults.get_defaults(conn)
+        station_options = _industry_station_options(conn)
+    finally:
+        conn.close()
     return _tr("settings.html", request, {
         "client_id": get_client_id() or "",
         "callback_url": CALLBACK_URL,
         "scopes": SCOPES,
+        "defaults": defaults,
+        "station_options": station_options,
     })
+
+
+def _industry_station_options(conn: sqlite3.Connection) -> list[dict]:
+    """Stations we know a name for — the candidates for a build/reaction default.
+
+    Sourced from the shared location-name cache, so it lists exactly the places
+    this install has already seen (assets, jobs, a previous /plan).
+    """
+    try:
+        rows = conn.execute(
+            "SELECT location_id, name FROM location_name_cache "
+            "WHERE name IS NOT NULL AND name <> '' ORDER BY name"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"location_id": r[0], "name": r[1]} for r in rows]
+
+
+@app.post("/api/settings/defaults")
+async def api_save_defaults(request: Request):
+    """Saves the app-wide industry defaults used by the margin tracker and
+    pre-filled into the /plan form."""
+    body = await request.json()
+    conn = get_conn()
+    try:
+        saved = app_defaults.save_defaults(conn, body)
+    finally:
+        conn.close()
+    return {"ok": True, "defaults": saved}
 
 
 @app.post("/api/settings/client-id")
@@ -1771,8 +1827,12 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
         row = conn.execute("SELECT name FROM sde_types WHERE type_id=?", (int(product_param),)).fetchone()
         if row:
             product_param = row[0]
-    # Preserve station when switching character
+    # Preserve station when switching character; otherwise fall back to the
+    # app-wide default from Settings so the form opens ready to run.
     prefill_station = station.strip() if station.strip().isdigit() else ""
+    _defaults = app_defaults.get_defaults(conn)
+    if not prefill_station and _defaults.get("build_station_id"):
+        prefill_station = str(_defaults["build_station_id"])
     prefill_station_name = ""
     if prefill_station:
         row = conn.execute(
@@ -1800,6 +1860,8 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
         "form_implant_mfg":  "0",
         "mfg_implant_options": _MFG_IMPLANT_OPTIONS,
         "plan_char_id": plan_char_id,
+        "form_facility_tax": str(_defaults.get("facility_tax", 2.5)),
+        "form_reaction_station": str(_defaults.get("reaction_station_id") or ""),
     })
 
 
@@ -2092,10 +2154,35 @@ async def plan_result(
         rate_mfg = mfg_sci * (1.0 - mfg_cost_bonus) + fac_tax_rate + _SCC
         rate_rxn = rxn_sci * (1.0 - rxn_cost_bonus) + rxn_fac_tax_rate + _SCC
 
+        # Pass 1 — a structural resolve purely to discover which products the
+        # tree contains, so their per-run times can be turned into per-product
+        # job splits. Skipped entirely when splitting is off (the default), so
+        # an unconfigured install pays nothing for it.
+        _max_job_days = float(app_defaults.get_defaults(conn).get("max_job_days") or 0)
+        _job_splits: dict[int, int] = {}
+        if _max_job_days > 0:
+            probe = BOMResolver(DB_ABS, blueprints=blueprints, runs_per_job=rpj_int)
+            try:
+                _job_splits = _derive_job_splits(
+                    conn,
+                    probe.resolve(type_id, qty, me=me, mfg_facility=mfg_facility,
+                                  rxn_facility=rxn_facility),
+                    max_days=_max_job_days, te=te,
+                    industry_level=industry_level, adv_industry_level=adv_industry_level,
+                    mfg_facility=mfg_facility, rxn_facility=rxn_facility,
+                    char_skills=char_skills,
+                )
+            finally:
+                probe.close()
+
+        # Pass 2 — the real resolve, with the splits applied. ME rounds once per
+        # job, so the splits reach the material totals here and in build_plan
+        # below; both resolutions must use them or the two views disagree.
         # The resolver gets all of the character's blueprints → per-product ME is
         # looked up for each intermediate step (Capital Armor Plates ME may differ from root ME).
         resolver = BOMResolver(DB_ABS, blueprints=blueprints, runs_per_job=rpj_int,
-                               adjusted_prices=adj_prices, rate_mfg=rate_mfg, rate_rxn=rate_rxn)
+                               adjusted_prices=adj_prices, rate_mfg=rate_mfg, rate_rxn=rate_rxn,
+                               runs_per_job_by_product=_job_splits)
         root = resolver.resolve(type_id, qty, me=me,
                                 mfg_facility=mfg_facility,
                                 rxn_facility=rxn_facility)
@@ -2116,6 +2203,9 @@ async def plan_result(
             mfg_facility=mfg_facility,
             rxn_facility=rxn_facility,
             runs_per_job=rpj_int,
+            # Same splits as the steps resolution above — the Materials tab and
+            # the Jobs list are two separate BOM resolutions and must not disagree.
+            runs_per_job_by_product=_job_splits,
             adjusted_prices=adj_prices,
             rate_mfg=rate_mfg,
             rate_rxn=rate_rxn,
@@ -2172,6 +2262,10 @@ async def plan_result(
                 _prune_bought(root)
 
         plan_data["manufacturing_steps"] = _build_manufacturing_steps(root, prices, available, input_basis)
+        # The materials above were costed as split jobs, so the job list has to
+        # show the same split — otherwise the two views describe different builds.
+        if _job_splits:
+            _split_step_jobs(plan_data["manufacturing_steps"], _job_splits)
 
         # === Manufacturing fees === (fee parameters were resolved up-front,
         # before build_plan, so the make-vs-buy optimizer could weigh them.)
@@ -2228,6 +2322,17 @@ async def plan_result(
             val = get_product_te_multiplier(conn, prod_facility, type_id)
             te_mult_cache[key] = val
             return val
+
+        # Slot capacity from the app-wide defaults. All zero (the default) means
+        # unlimited, which reproduces the previous longest-job-per-level estimate.
+        from app.manufacturing.schedule import SlotLimits as _SlotLimits
+        _plan_defaults = app_defaults.get_defaults(conn)
+        _slot_limits = _SlotLimits(
+            manufacturing=int(_plan_defaults.get("manufacturing_slots") or 0),
+            reaction=int(_plan_defaults.get("reaction_slots") or 0),
+            capital=int(_plan_defaults.get("capital_slots") or 0),
+        )
+        _capital_groups = _capital_group_lookup(conn, plan_data["manufacturing_steps"])
 
         for step in plan_data["manufacturing_steps"]:
             step_mfg_time = 0
@@ -2296,8 +2401,26 @@ async def plan_result(
                         else:
                             step_mfg_time = max(step_mfg_time, job_secs)
 
+            # With slot limits configured, a level is not "as long as its
+            # longest job" — that assumed unlimited parallel slots. Schedule the
+            # level's jobs across the pools instead. With no limits set,
+            # `schedule_level` returns the same longest-job figure as before.
+            if _slot_limits.manufacturing or _slot_limits.reaction or _slot_limits.capital:
+                step_mfg_time, step_rxn_time = _schedule_step(
+                    step, _slot_limits, _capital_groups)
+
             total_mfg_time_s += step_mfg_time
             total_rxn_time_s += step_rxn_time
+
+        # "Jobs to Run" — the same jobs bucketed by what they are, so a build
+        # that expands into hundreds of installs stays readable.
+        from app.manufacturing.schedule import group_jobs as _group_jobs
+        plan_data["job_groups"] = _group_jobs(
+            [job for step in plan_data["manufacturing_steps"] for job in step["jobs"]],
+            _plan_group_ids(conn, plan_data["manufacturing_steps"]),
+            end_product_id=type_id,
+        )
+        plan_data["total_job_count"] = sum(g["job_count"] for g in plan_data["job_groups"])
 
         # Collect unique science skills across all jobs for display in the header.
         # For the same skill across jobs we take the max required_level.
@@ -2582,6 +2705,175 @@ async def _build_stock_station_options(
     ]
     options.sort(key=lambda o: (-o["count"], o["name"]))
     return options
+
+
+def _derive_job_splits(
+    conn: sqlite3.Connection,
+    root,
+    *,
+    max_days: float,
+    te: int,
+    industry_level: int,
+    adv_industry_level: int,
+    mfg_facility,
+    rxn_facility,
+    char_skills: dict,
+) -> dict[int, int]:
+    """Runs-per-job per product, so no single job runs longer than `max_days`.
+
+    A day limit produces a different run count for every product — a 2-hour
+    reaction and a 3-day capital part hit the same ceiling at wildly different
+    run counts — which is why this returns a map rather than one number.
+
+    The per-run time is computed exactly as the job-duration loop below computes
+    it (same TE rule, same skills, same per-product facility multiplier). It has
+    to be: the split decides the material totals, so if this disagreed with the
+    displayed job durations the Materials tab and the Jobs list would drift
+    apart, which is the whole failure this two-pass exists to prevent.
+    """
+    from app.manufacturing.schedule import max_runs_per_job
+
+    if not max_days or max_days <= 0:
+        return {}
+
+    seen: dict[int, tuple[int, str]] = {}       # type_id → (blueprint_id, activity)
+
+    def walk(node):
+        if node.is_leaf or not node.blueprint_type_id:
+            return
+        seen.setdefault(node.type_id,
+                        (node.blueprint_type_id, node.activity or "manufacturing"))
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+    if not seen:
+        return {}
+
+    bp_ids = {bp for bp, _ in seen.values()}
+    ph = ",".join("?" * len(bp_ids))
+    times = {r[0]: (r[1], r[2]) for r in conn.execute(
+        f"SELECT blueprint_type_id, manufacturing_time, reaction_time FROM sde_blueprints "
+        f"WHERE blueprint_type_id IN ({ph})", list(bp_ids))}
+
+    splits: dict[int, int] = {}
+    for type_id, (bp_id, activity) in seen.items():
+        row = times.get(bp_id)
+        if not row:
+            continue
+        is_rxn = activity == "reaction"
+        base_time = row[1] if is_rxn else row[0]
+        if not base_time:
+            continue
+        sci_mult, _details = _science_skill_mult(conn, bp_id, activity, char_skills)
+        per_run = calc_job_time(
+            base_time=base_time,
+            runs=1,
+            te=0 if is_rxn else te,
+            industry_level=industry_level,
+            adv_industry_level=adv_industry_level,
+            facility_te_multiplier=get_product_te_multiplier(
+                conn, rxn_facility if is_rxn else mfg_facility, type_id),
+            is_reaction=is_rxn,
+            science_skill_mult=sci_mult,
+        )
+        limit = max_runs_per_job(per_run, max_days)
+        if limit:
+            splits[type_id] = limit
+    return splits
+
+
+def _split_step_jobs(steps: list[dict], splits: dict[int, int]) -> None:
+    """Expands each aggregated job into the jobs you would actually install.
+
+    `_build_manufacturing_steps` produces one entry per product carrying the
+    whole run count. Once a day limit applies, that single 260-day row is a
+    fiction — the materials were costed as ten separate jobs, so the job list
+    has to show ten. Mutates `steps` in place, preserving order.
+
+    Per-job input quantities are scaled by run share. They are indicative: ME
+    rounds per job, so the true per-job draw varies by a unit here and there.
+    The Materials tab is the authoritative total, and it is computed from the
+    same splits.
+    """
+    for step in steps:
+        expanded: list[dict] = []
+        for job in step["jobs"]:
+            per_job = splits.get(job["type_id"])
+            total_runs = job.get("runs") or 0
+            pieces = _schedule_split_runs(total_runs, per_job)
+            if len(pieces) <= 1:
+                expanded.append(job)
+                continue
+            for runs in pieces:
+                share = runs / total_runs
+                clone = dict(job)
+                clone["runs"] = runs
+                clone["quantity"] = round(job.get("quantity", 0) * share)
+                if job.get("total_price"):
+                    clone["total_price"] = job["total_price"] * share
+                if job.get("input_cost"):
+                    clone["input_cost"] = job["input_cost"] * share
+                clone["inputs"] = [
+                    {**inp,
+                     "quantity": round(inp.get("quantity", 0) * share),
+                     "total_price": (inp["total_price"] * share)
+                                    if inp.get("total_price") else inp.get("total_price")}
+                    for inp in job.get("inputs", [])
+                ]
+                clone["split_of"] = len(pieces)
+                expanded.append(clone)
+        step["jobs"] = expanded
+
+
+def _schedule_split_runs(total_runs: int, per_job: int | None) -> list[int]:
+    from app.manufacturing.schedule import split_runs
+    return split_runs(total_runs, per_job)
+
+
+def _plan_group_ids(conn: sqlite3.Connection, steps: list[dict]) -> dict[int, int]:
+    """type_id → SDE group_id for everything in the plan.
+
+    Classification is by group, never by product name — a rename in a patch
+    must not silently reclassify a job.
+    """
+    ids = {job["type_id"] for step in steps for job in step["jobs"]}
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    return {r[0]: r[1] for r in conn.execute(
+        f"SELECT type_id, group_id FROM sde_types WHERE type_id IN ({ph})", list(ids))}
+
+
+def _capital_group_lookup(conn: sqlite3.Connection, steps: list[dict]) -> set[int]:
+    """type_ids in the plan that are capital components."""
+    from app.manufacturing.schedule import CAPITAL_COMPONENT_GROUPS
+
+    return {tid for tid, gid in _plan_group_ids(conn, steps).items()
+            if gid in CAPITAL_COMPONENT_GROUPS}
+
+
+def _schedule_step(step: dict, limits, capital_ids: set[int]) -> tuple[int, int]:
+    """(manufacturing seconds, reaction seconds) for one level, across slots.
+
+    The two pools run concurrently, so the caller adds each to its own running
+    total exactly as it did when the figure was "longest job in the level".
+    """
+    from app.manufacturing.schedule import Job, _pack, _pack_manufacturing
+
+    reactions, manufacturing = [], []
+    for job in step["jobs"]:
+        secs = job.get("job_duration_seconds")
+        if not secs:
+            continue
+        entry = Job(
+            type_id=job["type_id"], name=job.get("name", ""),
+            activity=job.get("activity", "manufacturing"),
+            runs=job.get("runs", 1) or 1, seconds=secs,
+            is_capital=job["type_id"] in capital_ids,
+        )
+        (reactions if entry.activity == "reaction" else manufacturing).append(entry)
+    return _pack_manufacturing(manufacturing, limits), _pack(reactions, limits.reaction)
 
 
 def _build_manufacturing_steps(root, prices: dict, available: dict,
@@ -6040,21 +6332,18 @@ async def jobs_page(request: Request):
     })
 
 
-@app.get("/planets", response_class=HTMLResponse)
-async def planets_page(request: Request):
-    """Planetary Interaction — colonies per character with extractor expiry
-    countdowns (à la RIFT: the point is knowing when to go reset PI)."""
-    conn = get_conn()
-    chars = list_characters(conn)
-    if not chars:
-        conn.close()
-        return _tr("planets.html", request, {
-            "groups": [], "error": "You are not signed in.",
-            "total_extractors": 0, "expiring_soon": 0, "needs_relogin": []})
+async def _fetch_pi_colonies(conn: sqlite3.Connection, chars) -> list:
+    """Colony list + per-planet detail for every character, concurrently.
 
-    import datetime as _dt
-    now = _dt.datetime.now(_dt.timezone.utc)
+    The single PI fetch path in the app: /planets and /pi-planner both call
+    this, so the two ESI endpoints, the token handling and the "forbidden"
+    contract live in exactly one place.
 
+    Returns [(char_id, result)] where result is one of:
+      (colonies, details) — `details` aligned positionally with `colonies`
+      "forbidden"         — token predates the PI scope; prompt a re-auth
+      None or []          — no token, no colonies, or the fetch failed
+    """
     async def _one(cid: int):
         try:
             tok = _get_valid_token_for(conn, cid)
@@ -6071,7 +6360,25 @@ async def planets_page(request: Request):
         except Exception:
             return cid, None
 
-    results = await asyncio.gather(*[_one(cid) for cid, _ in chars])
+    return await asyncio.gather(*[_one(cid) for cid, _ in chars])
+
+
+@app.get("/planets", response_class=HTMLResponse)
+async def planets_page(request: Request):
+    """Planetary Interaction — colonies per character with extractor expiry
+    countdowns (à la RIFT: the point is knowing when to go reset PI)."""
+    conn = get_conn()
+    chars = list_characters(conn)
+    if not chars:
+        conn.close()
+        return _tr("planets.html", request, {
+            "groups": [], "error": "You are not signed in.",
+            "total_extractors": 0, "expiring_soon": 0, "needs_relogin": []})
+
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    results = await _fetch_pi_colonies(conn, chars)
     char_name = {cid: name for cid, name in chars}
 
     # Ids to resolve: planet names (per-planet endpoint — /universe/names can't do
@@ -6277,6 +6584,136 @@ async def planets_page(request: Request):
         "total_extractors": total_extractors, "expiring_soon": expiring_soon,
         "needs_relogin": needs_relogin,
     })
+
+
+@app.get("/margins", response_class=HTMLResponse)
+async def margins_page(request: Request, msg: str = ""):
+    """Margin Tracker — a persistent watchlist of build margins.
+
+    Prices entirely from cache (market, adjusted prices, cost indices), so
+    rendering a watchlist of any size costs no ESI calls. Refresh the numbers
+    by refreshing prices on /prices as usual.
+    """
+    conn = get_conn()
+    try:
+        view = margins_helper.build_view_model(conn, DB_ABS, message=msg or None)
+    finally:
+        conn.close()
+    return _tr("margins.html", request, view)
+
+
+@app.post("/margins/add")
+async def margins_add(product: str = Form(...), me: str = Form("0"), te: str = Form("0")):
+    conn = get_conn()
+    try:
+        row = _resolve_product_name(conn, product)
+        if row is None:
+            msg = f"No item named “{product}”."
+        else:
+            _ok, msg = margins_helper.add_item(
+                conn, row[0], _safe_int(me, 0), _safe_int(te, 0))
+    finally:
+        conn.close()
+    return RedirectResponse(f"/margins?msg={quote(msg)}", status_code=303)
+
+
+@app.post("/margins/remove")
+async def margins_remove(item_id: int = Form(...)):
+    conn = get_conn()
+    try:
+        margins_helper.remove_item(conn, item_id)
+    finally:
+        conn.close()
+    return RedirectResponse("/margins", status_code=303)
+
+
+@app.post("/margins/clear")
+async def margins_clear():
+    conn = get_conn()
+    try:
+        margins_helper.clear_all(conn)
+    finally:
+        conn.close()
+    return RedirectResponse("/margins", status_code=303)
+
+
+def _safe_int(raw: str, fallback: int) -> int:
+    """ME/TE parser. Negative values are legitimate — an unresearched BPC copy
+    from a bad invention run really does cost more materials."""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _resolve_product_name(conn: sqlite3.Connection, text: str):
+    """Exact name, then a prefix match, then the raw type_id."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return conn.execute(
+            "SELECT type_id, name FROM sde_types WHERE type_id=?", (int(text),)).fetchone()
+    row = conn.execute(
+        "SELECT type_id, name FROM sde_types WHERE LOWER(name)=?", (text.lower(),)).fetchone()
+    if row:
+        return row
+    return conn.execute(
+        "SELECT type_id, name FROM sde_types WHERE LOWER(name) LIKE ? "
+        "ORDER BY LENGTH(name) LIMIT 1", (text.lower() + "%",)).fetchone()
+
+
+@app.get("/pi-planner", response_class=HTMLResponse)
+async def pi_planner_page(
+    request: Request,
+    target: str = "",
+    qty: str = "",
+    period: str = "",
+    derate: str = "",
+    ccu: str = "",
+    me: str = "",
+):
+    """PI planner — works backwards from a target product to colony counts,
+    then cross-references the plan against the character's live colonies.
+
+    The plan itself is static SDE maths (app/planetary/); the "plan vs actual"
+    half reuses the same PI fetch /planets does, so it costs no extra ESI calls.
+    """
+    view = pi_planner_helper.build_view_model(
+        DB_ABS,
+        target=target,
+        quantity=pi_planner_helper.parse_quantity(qty),
+        period=pi_planner_helper.parse_period(period),
+        derate=pi_planner_helper.parse_derate(derate),
+        ccu_level=pi_planner_helper.parse_ccu_level(ccu),
+        me=pi_planner_helper.parse_me(me),
+    )
+    if view["result"]:
+        conn = get_conn()
+        try:
+            chars = list_characters(conn)
+            results = await _fetch_pi_colonies(conn, chars) if chars else []
+            # Shared name cache — the same resolver /planets uses, so a planet
+            # either page has seen costs nothing here.
+            planet_ids = {c["planet_id"]
+                          for _cid, res in results if res and not isinstance(res, str)
+                          for c in res[0]}
+            planet_names = await _resolve_planet_names(conn, planet_ids) if planet_ids else {}
+            view["actual"] = pi_planner_helper.build_plan_vs_actual(
+                conn, results, dict(chars), view["result"]["colonies"],
+                planet_names=planet_names)
+            view["signed_in"] = bool(chars)
+            # Refresh the shared PI alert cache from this (freshest) view, exactly
+            # as /planets does — same store, same per-character replacement, so
+            # the dashboard tile and nav badge stay current either way.
+            try:
+                _store_pi_cache_for_chars(
+                    conn, view["actual"]["ok_char_ids"], view["actual"]["cache_entries"])
+            except Exception as exc:
+                print(f"[pi-planner] pi-cache update failed: {exc}", flush=True)
+        finally:
+            conn.close()
+    return _tr("pi_planner.html", request, view)
 
 
 # ── Character portraits / corp logos: local cache with a long TTL ────────────

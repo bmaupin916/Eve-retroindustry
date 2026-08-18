@@ -89,7 +89,11 @@ def init_db(conn: sqlite3.Connection):
             name            TEXT NOT NULL,
             group_id        INTEGER,
             published       INTEGER DEFAULT 1,
-            market_group_id INTEGER
+            market_group_id INTEGER,
+            -- Packaged volume in m³. Needed for profit-per-m³ in the margin
+            -- tracker; a DB imported before this column existed leaves it NULL
+            -- and callers degrade rather than reporting a wrong density.
+            volume          REAL
         );
 
         CREATE TABLE IF NOT EXISTS sde_blueprint_materials (
@@ -176,11 +180,12 @@ def import_types(conn: sqlite3.Connection) -> dict:
             info.get("groupID"),
             1 if info.get("published", True) else 0,
             info.get("marketGroupID"),
+            info.get("volume"),
         ))
 
     conn.executemany(
-        "INSERT OR REPLACE INTO sde_types (type_id, name, group_id, published, market_group_id)"
-        " VALUES (?,?,?,?,?)",
+        "INSERT OR REPLACE INTO sde_types (type_id, name, group_id, published, market_group_id, volume)"
+        " VALUES (?,?,?,?,?,?)",
         rows
     )
     conn.commit()

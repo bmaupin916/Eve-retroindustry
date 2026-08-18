@@ -55,3 +55,6 @@ icon_cache/
 webview_data/
 webview_data-2/
 webview_data.broken*
+
+# Local reference material (third-party spreadsheets — see docs/design-hosted-v2.md 9.2/9.3)
+docs/reference/
