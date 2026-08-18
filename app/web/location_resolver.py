@@ -142,7 +142,7 @@ async def get_region_for_location(conn: sqlite3.Connection, location_id: int, to
             _, sys_id = await resolve_station_name(client, location_id, token)
         if sys_id:
             conn.execute(
-                "INSERT OR IGNORE INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?)",
+                "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO NOTHING",
                 (location_id, str(location_id), sys_id)
             )
             conn.commit()

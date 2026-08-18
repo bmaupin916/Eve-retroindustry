@@ -62,16 +62,18 @@ def test_no_insert_or_replace_survives():
     for rel, src in _sources():
         if rel == SCHEMA_MODULE:
             continue                                   # documents it in a docstring
-        for m in re.finditer(r"INSERT\s+OR\s+REPLACE", src, re.I):
+        # `OR IGNORE` is the same family: SQLite-only, and `ON CONFLICT DO
+        # NOTHING` says the same thing in both dialects.
+        for m in re.finditer(r"INSERT\s+OR\s+(REPLACE|IGNORE)", src, re.I):
             # A comment explaining why it is gone is not a use of it.
             line = src.splitlines()[_line_of(src, m.start()) - 1].lstrip()
             if line.startswith("#"):
                 continue
-            offenders.append(f"{rel}:{_line_of(src, m.start())}")
+            offenders.append(f"{rel}:{_line_of(src, m.start())} (OR {m.group(1).upper()})")
     assert not offenders, (
-        "INSERT OR REPLACE is SQLite-only and resets unnamed columns: "
-        + ", ".join(offenders)
-        + ". Use app.db.schema.upsert() or an explicit ON CONFLICT clause."
+        "SQLite-only INSERT forms: " + ", ".join(offenders)
+        + ". Use app.db.schema.upsert(), or an explicit "
+          "ON CONFLICT ... DO UPDATE / DO NOTHING clause."
     )
 
 

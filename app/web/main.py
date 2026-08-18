@@ -4804,7 +4804,7 @@ async def fetch_plan_sell_price(request: Request, location_id: int, type_id: int
 
     # Ensure the type_id is present in market_price_cache (the fetchers need it for filtering)
     conn.execute(
-        "INSERT OR IGNORE INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0)",
+        "INSERT INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0) ON CONFLICT (type_id) DO NOTHING",
         (type_id,),
     )
     conn.commit()
@@ -5379,7 +5379,7 @@ async def prices_search(q: str = ""):
         uncached = [r[0] for r in rows if r[5] is None]  # cached_at IS NULL → never fetched
         if uncached:
             conn.executemany(
-                "INSERT OR IGNORE INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0)",
+                "INSERT INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0) ON CONFLICT (type_id) DO NOTHING",
                 [(tid,) for tid in uncached],
             )
             conn.commit()
@@ -5429,7 +5429,7 @@ async def prices_search(q: str = ""):
     uncached = [r[0] for r in rows if r[5] is None]
     if uncached:
         conn.executemany(
-            "INSERT OR IGNORE INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0)",
+            "INSERT INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0) ON CONFLICT (type_id) DO NOTHING",
             [(tid,) for tid in uncached],
         )
         conn.commit()
