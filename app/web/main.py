@@ -346,10 +346,18 @@ def _bundled_sde_path() -> str | None:
     return candidate if os.path.isfile(candidate) else None
 
 
-def _refresh_sde_from_bundle(conn: sqlite3.Connection) -> int:
-    """If the bundled sde_base.db has more types OR more groups than the user's
-    eve_cache.db, replace the SDE tables with fresh data. Return the type count
-    AFTER the refresh (0 = nothing happened).
+def _refresh_sde_from_bundle(
+    conn: sqlite3.Connection, source: str | None = None, force: bool = False
+) -> int:
+    """If `source` has more types OR more groups than the user's eve_cache.db,
+    replace the SDE tables with fresh data. Return the type count AFTER the
+    refresh (0 = nothing happened).
+
+    `source` defaults to the bundled sde_base.db. The downloaded one goes
+    through here too: it used to be moved over eve_cache.db wholesale, which
+    replaced the file and took every character, refresh token, cached price and
+    saved project with it. `force` is for that case — an explicit re-download
+    should apply even when the heuristics say there is nothing to do.
 
     Groups check: v0.5.3 added importing groups.yaml from the SDE (1605 groups
     instead of ~857 from ESI); without a group row, rig_applies_to_product's INNER
@@ -358,7 +366,7 @@ def _refresh_sde_from_bundle(conn: sqlite3.Connection) -> int:
     User data (characters, BP cache, prices, projects, …) is preserved — we only
     change the tables in `_SDE_TABLES_TO_REFRESH`.
     """
-    bundled = _bundled_sde_path()
+    bundled = source or _bundled_sde_path()
     if not bundled:
         return 0
 
@@ -433,7 +441,7 @@ def _refresh_sde_from_bundle(conn: sqlite3.Connection) -> int:
         # neither side records a build we fall back to the old heuristics.
         newer_build = bundled_build > user_build
 
-        if (not newer_build and bundled_count <= user_count
+        if (not force and not newer_build and bundled_count <= user_count
                 and bundled_groups <= user_groups and not missing and not stale):
             return user_count  # up to date on build, types, groups, tables and columns
 
@@ -770,31 +778,32 @@ async def setup_download():
                             pct = int(downloaded * 100 / total) if total else 0
                             yield f"data: {json.dumps({'downloaded': downloaded, 'total': total, 'pct': pct})}\n\n"
 
-            import shutil
-            # Dispose pooled SQLAlchemy connections BEFORE the move — otherwise
-            # they hold an open file descriptor on the empty placeholder DB and
-            # subsequent INSERTs fail with SQLITE_READONLY_DBMOVED ("attempt to
-            # write a readonly database").
-            from app.db.database import engine as _alchemy_engine, ensure_user_tables
-            _alchemy_engine.dispose()
-
-            shutil.move(tmp_path, DB_ABS)
-            # The downloaded file is sde_base.db — has SDE tables only, no
-            # SQLAlchemy user tables. Recreate them now or the next /plan
-            # crashes with "no such table: type_cache".
-            ensure_user_tables()
-            forget_applied(DB_ABS)  # new file: rebuild the schema on next get_conn()
-
-            # Re-run startup population now that SDE is available
-            _SDE_READY[0] = True
+            # Copy the ROWS across, do not move the FILE. This used to be
+            # `shutil.move(tmp_path, DB_ABS)`, which replaced eve_cache.db with
+            # the downloaded sde_base.db — and sde_base.db has SDE tables only,
+            # so every character, refresh token, cached price, project and
+            # watchlist row went with it. The page offering that button is
+            # where the app sends you when `sde_types` is empty, so the one
+            # affordance on the recovery screen destroyed the account it was
+            # recovering.
+            #
+            # `_refresh_sde_from_bundle` already does this correctly for the
+            # bundled file: it touches only `_SDE_TABLES_TO_REFRESH` and leaves
+            # everything else alone. `force` because an explicit download should
+            # apply even when the build numbers match.
             conn = get_conn()
             try:
+                count = _refresh_sde_from_bundle(conn, source=tmp_path, force=True)
+                _SDE_READY[0] = count > 0
                 populate_rig_bonuses(conn)
                 await _ensure_groups_populated(conn)
-            except Exception:
-                pass
             finally:
                 conn.close()
+                # The move used to consume this file. Copying rows does not, so
+                # a ~10 MB download would otherwise be left next to the database
+                # after every run.
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
             yield f"data: {json.dumps({'done': True})}\n\n"
 

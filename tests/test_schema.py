@@ -357,3 +357,162 @@ def test_forgetting_one_database_leaves_the_other_memoized(tmp_path):
     remembered = {entry[0] for entry in schema_mod._APPLIED}
     assert a not in remembered
     assert b in remembered
+
+
+# --- the paths that rebuild the database ------------------------------------
+#
+# Three code paths can replace SDE tables, and each one used to lose something
+# on the way through. They are tested together because the bug is the same
+# every time: rebuilding a database from a file that describes only part of it.
+
+def test_downloading_the_sde_does_not_wipe_the_account(app_module, tmp_path, monkeypatch):
+    """`/setup/download` used to `shutil.move()` the download over eve_cache.db.
+
+    sde_base.db holds static data and nothing else, so the move took every
+    character, refresh token, cached price, saved project and watchlist row
+    with it. What made it serious rather than merely possible: main.py
+    redirects *every* request to `/setup` when `sde_types` is empty, so this
+    was the one button on the screen the app sends you to when something has
+    already gone wrong — and pressing it destroyed the account it was meant to
+    recover.
+    """
+    source = str(tmp_path / "downloaded_sde.db")
+    conn = sqlite3.connect(source)
+    apply_sde_schema(conn)
+    conn.executemany(
+        "INSERT INTO sde_types (type_id, name, group_id, market_group_id) VALUES (?,?,?,?)",
+        [(34, "Tritanium", 18, 1857), (35, "Pyerite", 18, 1857)])
+    conn.execute("INSERT INTO sde_groups VALUES (18, 'Mineral')")
+    conn.commit()
+    conn.close()
+
+    live = str(tmp_path / "eve_cache.db")
+    conn = sqlite3.connect(live)
+    apply_schema(conn)
+    apply_sde_schema(conn)
+    conn.execute(
+        "INSERT INTO characters (character_id, character_name, refresh_token, added_at) "
+        "VALUES (?,?,?,?)", (95465499, "Astroasia", "a-real-refresh-token", 0.0))
+    conn.execute(
+        "INSERT INTO production_projects (name, created_at, updated_at) VALUES (?,?,?)",
+        ("Raven build", 0.0, 0.0))
+    conn.commit()
+
+    app_module._refresh_sde_from_bundle(conn, source=source, force=True)
+
+    assert conn.execute("SELECT refresh_token FROM characters").fetchall() == [
+        ("a-real-refresh-token",)], "the download took the account with it"
+    assert conn.execute("SELECT name FROM production_projects").fetchall() == [
+        ("Raven build",)]
+    assert conn.execute("SELECT COUNT(*) FROM sde_types").fetchone()[0] == 2, \
+        "static data should have been updated"
+    conn.close()
+
+
+def test_an_explicit_download_applies_even_when_nothing_looks_newer(app_module, tmp_path):
+    """The heuristics exist to skip pointless work at startup, not to overrule
+    someone who has deliberately asked for a fresh copy — which they only do
+    when something is already wrong with the data those heuristics read."""
+    source = str(tmp_path / "same.db")
+    live = str(tmp_path / "live.db")
+    for path in (source, live):
+        conn = sqlite3.connect(path)
+        apply_sde_schema(conn)
+        conn.execute(
+            "INSERT INTO sde_types (type_id, name, group_id) VALUES (34, 'Tritanium', 18)")
+        conn.execute("INSERT INTO sde_groups VALUES (18, 'Mineral')")
+        conn.commit()
+        conn.close()
+
+    conn = sqlite3.connect(live)
+    conn.execute("UPDATE sde_types SET name='corrupted'")
+    conn.commit()
+
+    app_module._refresh_sde_from_bundle(conn, source=source, force=True)
+    assert conn.execute("SELECT name FROM sde_types").fetchone()[0] == "Tritanium"
+    conn.close()
+
+
+def test_the_running_app_rebuilds_what_is_missing(app_module):
+    """The claim is about `get_conn()`, so it is asked of `get_conn()` — and
+    asked of a database that is actually missing something.
+
+    The first version of this test checked a database the fixture had copied
+    from `sde_base.db`, which already carries every SDE table and all six
+    indexes. It passed whether or not `get_conn()` did anything at all. So this
+    one takes them away first: four tables that were previously created lazily
+    on whichever page happened to need them, and the indexes an SDE refresh
+    drops. If the startup path stops guaranteeing them, this goes red.
+    """
+    declared_indexes = {
+        ix.name for name in SDE_TABLES for ix in metadata.tables[name].indexes}
+    lazy = {"public_contracts", "public_contract_items", "public_contract_meta",
+            "route_jump_cache"}
+
+    conn = app_module.get_conn()
+    try:
+        for name in lazy:
+            conn.execute(f"DROP TABLE IF EXISTS {name}")
+        for name in declared_indexes:
+            conn.execute(f"DROP INDEX IF EXISTS {name}")
+        conn.commit()
+        remaining = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert not (lazy & remaining), "the fixture did not actually lose anything"
+    finally:
+        conn.close()
+
+    # Next connection, as the app would open it.
+    schema_mod.forget_applied()
+    conn = app_module.get_conn()
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        indexes = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")}
+    finally:
+        conn.close()
+
+    assert APP_TABLES <= tables, f"never rebuilt: {sorted(APP_TABLES - tables)}"
+    assert declared_indexes <= indexes, f"never rebuilt: {sorted(declared_indexes - indexes)}"
+
+
+def test_no_code_path_replaces_the_live_database_file():
+    """A call-site check, because the behavioural test above cannot see this.
+
+    `test_downloading_the_sde_does_not_wipe_the_account` proves that
+    `_refresh_sde_from_bundle` preserves user data. It says nothing about
+    whether the download route still *calls* it — put `shutil.move(tmp, DB_ABS)`
+    back in `setup_download` and that test stays green while the bug returns in
+    full. The claim being made is about call sites, so it is checked at the
+    call sites.
+
+    One path may legitimately install a database file: the fresh-install copy,
+    which only runs when there is no data to lose.
+    """
+    import app.web.main as m
+
+    allowed = {"_startup_populate_groups"}      # the fresh-install copy
+    source = pathlib.Path(m.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name in allowed:
+            continue
+        for inner in ast.walk(node):
+            if (isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr in ("move", "copy", "copy2", "copyfile")
+                    and isinstance(inner.func.value, ast.Name)
+                    and inner.func.value.id == "shutil"):
+                offenders.append(f"{node.name}:{inner.lineno}")
+
+    assert not offenders, (
+        "these replace the database file wholesale rather than copying rows: "
+        + ", ".join(offenders)
+        + ". sde_base.db holds static data only, so moving it over eve_cache.db "
+          "takes every character, token, price and project with it."
+    )
