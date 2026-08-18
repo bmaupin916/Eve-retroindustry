@@ -1158,11 +1158,11 @@ of this work), each mapped to the step that retires it:
 
 | # | Worry | Retired in |
 |---|---|---|
-| W1 | No authentication of any kind; the deploy doc itself warns of it | Step 2 |
+| W1 | No authentication of any kind; the deploy doc itself warns of it | **Step 2 — done, v0.9.27** |
 | W2 | CSRF / DNS-rebinding exposure; `/api/version/apply` executes a downloaded script | Steps 2–3 |
-| W3 | OAuth callback binds all interfaces; `state` generated but never validated | Step 2 |
-| W4 | Refresh tokens plaintext; no file permissions on `eve_cache.db` | Step 2 |
-| W5 | Full tracebacks returned to clients on 500 | Step 2 |
+| W3 | OAuth callback binds all interfaces; `state` generated but never validated | **Step 2 — done, v0.9.27** |
+| W4 | Refresh tokens plaintext; no file permissions on `eve_cache.db` | Permissions **done, v0.9.27**; encryption at rest still Step 5 |
+| W5 | Full tracebacks returned to clients on 500 | **Step 2 — done, v0.9.27** |
 | W6 | `main.py` at 7,352 lines / 80 routes | Step 4 |
 | W7 | Three substantial features sitting uncommitted (PI planner, margins, job splitting) | **Step 0 — done, v0.9.23** |
 | W8 | Invention absent from the data model — every T2 figure optimistic | **Step 1 — done, v0.9.25** |
@@ -1213,10 +1213,40 @@ Two threads recorded in §14 rather than closed: invention is charged at the roo
 `/plan` still under-costs T2 components inside a tree; and the market tax rates are still
 unconfirmed against the live game. *(W8, and the SDE half of W10)*
 
-**Step 2 — Security baseline + ESI citizenship.** Session auth (a single SSO-backed
-account is enough — one user), CSRF tokens, Host validation, state check, JWT verification
-via the discovery document, tracebacks off, DB permissions, User-Agent on every ESI call.
-*(W1–W5)*
+**Step 2 — Security baseline + ESI citizenship. ✅ Done — v0.9.27.** All eight items,
+in dependency order. The findings in §4 were re-verified against the tree first; every one
+of them still held.
+
+| Finding | Shipped | Was |
+|---|---|---|
+| 7 — no ESI User-Agent | `app/version.py` builds one; wired into ESI, both SSO token exchanges, the refresh, and the SDE feed | Unidentified traffic under one applicationID |
+| 6 — tracebacks to clients | Opaque 500; detail stays in the log, `EVE_DEBUG_ERRORS=1` restores it | Paths, SQL and locals in the response body |
+| 5 — DB permissions | `harden_db_permissions()`, re-applied after the SDE swap | Every refresh token world-readable |
+| 9 — hardcoded SSO URLs | `app/auth/sso_metadata.py`, cached an hour, falls back to the old literals | Pinned; CCP says they may move |
+| 7(new) — unverified JWT | `app/auth/jwt_verify.py`: signature + `iss`/`aud`/`exp` | `verify_signature=False` at two call sites |
+| 4, 8 — `state` unchecked | Constant-time compare in both flows | Generated, returned, never compared |
+| 3 — callback on all interfaces | Two loopback sockets driven as one unit | `("::", 5173)` with `IPV6_V6ONLY` cleared |
+| 1, 2 — no auth, no CSRF, no Host check | `app/web/security.py`: DB-backed sessions, per-session CSRF, Host allowlist | Nothing at all |
+
+Three things this turned up that were not in the plan:
+
+* **CCP's own metadata document is wrong about signing algorithms.** It advertises
+  `id_token_signing_alg_values_supported: ["HS256"]`; the live JWKS serves RS256 and
+  ES256. HS256 is symmetric and could never appear in a JWKS. An implementation that
+  trusted the advertised list would be open to algorithm confusion — a token forged by
+  HMAC-ing with the RSA *public* key. The algorithm list is therefore **pinned in code,
+  not discovered**, and a test forges exactly that token and asserts rejection.
+* **Binding `::1` does not accept IPv4, even with `IPV6_V6ONLY` cleared** (measured).
+  IPv4-mapped `127.0.0.1` is `::ffff:127.0.0.1`, a different address, so the obvious
+  one-line fix for finding 3 would have broken login for anyone whose browser resolves
+  `localhost` to IPv4 — the exact bug the dual-stack server was written to prevent. Two
+  sockets is the only way to get both loopbacks without also getting the world.
+* **Verifying RS256 needs `cryptography`**, which was not a dependency. Added.
+
+Recorded rather than closed: **owner-on-first-login is trust-on-first-use.** With no
+`EVE_OWNER_CHARACTER_ID` set, the first character to complete SSO claims the instance —
+fine on a laptop, a real if narrow window between deploying and first login. Step 3 should
+set that variable as part of deploying. *(W1–W5)*
 
 **Step 3 — Go hosted, single-user.** Strip the desktop shell (launcher, tray, updater and
 `/api/version/*`, PyInstaller/installer/APK pipeline). Deploy on the VPS behind nginx +
