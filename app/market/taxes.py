@@ -18,8 +18,18 @@ tool that reports one while you do the other is wrong in the direction that
 flatters it. `SellingCosts` carries the two components separately so the UI can
 show which is which.
 
-Rates verified against the EVE University Trading page (read 2026-08-17); the
-7.5% sales tax base was raised from 4% in Version 22.02 (2025-03-12).
+Rates come from the Version 22.02 patch note (2025-03-12, "Sales Tax has been
+increased from 4% to 7.5%") and the EVE University *Tax* page, read 2026-08-18.
+
+**Not yet confirmed in game.** EVE Uni's *Trading* page carries a worked total
+("between 5.1% and 11%") that contradicts the sales-tax formula printed beside
+it — those figures only resolve at an 8% base — so secondary sources have
+already proved unreliable for exactly these numbers. The cross-check that gives
+confidence is the broker floor: the wiki gives 1% minimum at Broker Relations V
+with maximum standings, and 3 − 1.5 − 0.3 − 0.2 = 1.0 exactly, which confirms
+the per-level and per-standing coefficients independently of the base rate.
+The conclusive test is still to sell one item and read the wallet journal.
+Tracked as open question 7 in docs/design-hosted-v2.md.
 
 Not modelled yet: the **relist fee** for adjusting an order that has not sold,
 and **Margin Trading** (which affects the escrow on *buy* orders, not what a

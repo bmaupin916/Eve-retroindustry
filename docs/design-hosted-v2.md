@@ -1256,6 +1256,14 @@ past the first joiner. Do not.
 5. Does `planetResources.csv` replace the hardcoded matrix in `planet_data.py` (§8)?
 6. Reactions board — inside Step 1, or its own step? It is the biggest quick win and the
    most tempting scope creep inside a correctness sprint.
+7. **Verify the market tax rates in game.** `app/market/taxes.py` ships 7.5% sales tax,
+   3% NPC broker fee, −11%/level Accounting and −0.3%/level Broker Relations. These come
+   from the Version 22.02 patch note and the EVE University *Tax* page, cross-checked
+   against the 1% NPC broker floor — but the *Trading* page on the same wiki was found to
+   carry stale worked totals, so secondary sources have already failed once here. The
+   check is cheap and conclusive: sell one item, then compare the wallet journal's
+   transaction tax and broker fee against what the tool predicts. Re-check after any patch
+   touching market fees. Until then every profit figure inherits this assumption.
 
 ### Reference material not yet read
 
