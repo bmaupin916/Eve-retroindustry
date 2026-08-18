@@ -1,0 +1,330 @@
+{% extends "base.html" %}
+{% block title %}Margin Tracker — EVE Retroindustry{% endblock %}
+{% block content %}
+
+<style>
+  .mg-band { background: linear-gradient(90deg, rgba(230,184,74,.12), rgba(230,184,74,.02)); }
+  .mg-note { font-size: .78rem; }
+  .mg-num  { font-variant-numeric: tabular-nums; }
+  .mg-up   { color: #3fb950; }
+  .mg-down { color: #f85149; }
+  .mg-thin { opacity: .55; }
+  .suggest-item:hover, .suggest-active { background: #21262d; }
+</style>
+
+<div class="row mb-3 align-items-center">
+  <div class="col">
+    <h4 class="mb-0"><i class="bi bi-graph-up-arrow me-2 text-primary"></i>Margin Tracker
+      {% if rows %}<span class="badge bg-secondary ms-2">{{ rows | length }} item{{ 's' if rows | length != 1 }}</span>{% endif %}
+    </h4>
+    <div class="text-muted mg-note mt-1">
+      Build margins for a watchlist you keep. Priced entirely from cached market data —
+      refresh on <a href="/prices">Prices</a> to move these numbers.
+      {% if station_name %}Building at <strong>{{ station_name }}</strong>{% if reaction_station_name and reaction_station_name != station_name %},
+      reactions at <strong>{{ reaction_station_name }}</strong>{% endif %}.{% endif %}
+    </div>
+  </div>
+</div>
+
+{% if message %}
+<div class="alert alert-info py-2 mg-note"><i class="bi bi-info-circle me-2"></i>{{ message }}</div>
+{% endif %}
+
+{% if not configured %}
+<div class="alert alert-warning py-2 mg-note">
+  <i class="bi bi-exclamation-triangle me-2"></i>
+  No default build station set, so job fees have no system cost index behind them and
+  structure bonuses are not applied — profit will read high.
+  Set one in <a href="/settings">Settings</a>.
+</div>
+{% endif %}
+
+{% if not sci_cached and configured %}
+<div class="alert alert-warning py-2 mg-note">
+  <i class="bi bi-exclamation-triangle me-2"></i>
+  No cached system cost index for your station's system yet — job fees currently cover
+  facility tax only. Run a plan on <a href="/plan">Plan</a> once to populate it.
+</div>
+{% endif %}
+
+{# ── add ───────────────────────────────────────────────────────────────── #}
+<div class="card mb-3">
+  <div class="card-body py-3">
+    <form method="post" action="/margins/add" class="row g-2 align-items-end">
+      <div class="col-12 col-lg-5" style="position:relative">
+        <label class="form-label mb-1"><i class="bi bi-box me-1"></i>Product</label>
+        <input type="text" name="product" id="mg-product" class="form-control form-control-sm"
+               placeholder="Start typing — “ish” finds Ishtar…" required autocomplete="off">
+        <div id="mg-suggestions" style="
+          display:none; position:absolute; z-index:1000; left:12px; right:12px;
+          background:#1c2128; border:1px solid #30363d; border-radius:6px;
+          box-shadow:0 8px 24px rgba(0,0,0,.5); max-height:380px; overflow-y:auto;
+          font-size:.875rem; margin-top:2px;
+        "></div>
+      </div>
+      <div class="col-4 col-lg-2">
+        <label class="form-label mb-1" title="Material Efficiency of the blueprint you'd use. Negative values are allowed.">Material Efficiency</label>
+        <input type="number" name="me" id="mg-me" class="form-control form-control-sm" value="0" step="1">
+      </div>
+      <div class="col-4 col-lg-2">
+        <label class="form-label mb-1" title="Time Efficiency of the blueprint you'd use. Negative values are allowed.">Time Efficiency</label>
+        <input type="number" name="te" id="mg-te" class="form-control form-control-sm" value="0" step="1">
+      </div>
+      <div class="col-4 col-lg-1 d-grid">
+        <button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-plus-lg me-1"></i>Add</button>
+      </div>
+      <div class="col-12 col-lg-2 d-grid">
+        {% if rows %}
+        <button type="submit" form="mg-clear" class="btn btn-sm btn-ghost"
+                onclick="return confirm('Remove every tracked item and its history?')">Clear All</button>
+        {% endif %}
+      </div>
+    </form>
+    <form id="mg-clear" method="post" action="/margins/clear" class="d-none"></form>
+  </div>
+</div>
+
+{% if not rows %}
+<div class="card"><div class="text-muted text-center py-4">
+  <i class="bi bi-graph-up-arrow mb-2" style="font-size:2rem;opacity:.3"></i><br>
+  Nothing tracked yet. Add a product above to start watching its build margin.
+</div></div>
+{% else %}
+
+{% if any_unpriced %}
+<div class="alert alert-warning py-2 mg-note">
+  <i class="bi bi-exclamation-triangle me-2"></i>
+  Rows marked <span class="badge bg-danger" style="font-size:.62rem">unpriced</span> have
+  materials with no cached price. Their cost is understated and the profit shown is
+  optimistic — refresh on <a href="/prices">Prices</a> to fill the gaps.
+</div>
+{% endif %}
+
+<div class="card mb-3">
+  <div class="card-header mg-band py-2">
+    <span class="d-flex align-items-center gap-2 flex-wrap">
+      <i class="bi bi-table" style="color:var(--eve-gold)"></i>
+      <strong>Tracked items</strong>
+      <span class="text-muted mg-note">
+        profit is per unit, built from raw materials at
+        {{ 'buy' if defaults.input_basis == 'buy' else 'sell' }} prices
+      </span>
+    </span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover tbl-compact table-sm mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Group</th>
+          <th class="text-end">ME</th>
+          <th class="text-end">TE</th>
+          <th class="text-end">Sell Price</th>
+          <th class="text-end">Profit</th>
+          <th class="text-end">Margin</th>
+          <th class="text-end" title="Change in profit margin since the previous day's reading">Δ</th>
+          <th class="text-end" title="Average profit margin over the last {{ avg_window }} daily readings">{{ avg_window }}d avg</th>
+          {% if volume_supported %}<th class="text-end">Profit/m³</th>{% endif %}
+          <th class="text-end" title="Average units traded per day in Jita">Day Volume</th>
+          <th class="text-end" title="Profit per hour of build time, whole tree">Profit/hour</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in rows %}
+        {% set r = e.row %}
+        <tr>
+          <td>
+            <span class="d-inline-flex align-items-center gap-2">
+              <img loading="lazy" src="/icon/{{ r.type_id }}?size=32" width="24" height="24"
+                   class="rounded" onerror="this.style.visibility='hidden'">
+              {{ r.name }}
+              {% if r.error %}
+              <span class="badge bg-danger" style="font-size:.62rem" title="{{ r.error }}">error</span>
+              {% elif r.unpriced %}
+              <span class="badge bg-danger" style="font-size:.62rem"
+                    title="No cached price for: {{ r.unpriced[:8] | join(', ') }}{% if r.unpriced | length > 8 %} and {{ r.unpriced | length - 8 }} more{% endif %}">unpriced</span>
+              {% endif %}
+            </span>
+          </td>
+          <td class="text-muted">{{ r.group_name }}</td>
+          <td class="text-end mg-num">{{ r.me }}</td>
+          <td class="text-end mg-num">{{ r.te }}</td>
+          <td class="text-end mg-num">{{ r.sell_price | isk0 if r.sell_price else '—' }}</td>
+          <td class="text-end mg-num {{ 'text-profit' if r.profit and r.profit > 0 else 'text-loss' if r.profit else '' }}">
+            {{ r.profit | isk0 if r.profit is not none else '—' }}
+          </td>
+          <td class="text-end mg-num {{ 'text-profit' if r.margin_pct and r.margin_pct > 0 else 'text-loss' if r.margin_pct is not none else '' }}">
+            {{ '%.1f%%' % r.margin_pct if r.margin_pct is not none else '—' }}
+          </td>
+          <td class="text-end mg-num {{ 'mg-up' if e.change and e.change > 0 else 'mg-down' if e.change and e.change < 0 else 'text-muted' }}">
+            {% if e.change is not none %}
+              {{ '%+.1f' % e.change }}
+            {% else %}
+              <span class="mg-thin" title="No earlier reading yet — the first comparison appears tomorrow">—</span>
+            {% endif %}
+          </td>
+          <td class="text-end mg-num">
+            {% if e.avg_margin is not none %}
+              <span class="{{ '' if e.avg_full else 'mg-thin' }}"
+                    title="{{ e.avg_days }} daily reading{{ 's' if e.avg_days != 1 }} so far{{ '' if e.avg_full else ' — not a full week yet' }}">
+                {{ '%.1f%%' % e.avg_margin }}{% if not e.avg_full %}<sup>{{ e.avg_days }}d</sup>{% endif %}
+              </span>
+            {% else %}—{% endif %}
+          </td>
+          {% if volume_supported %}
+          <td class="text-end mg-num">{{ r.profit_per_m3 | isk0 if r.profit_per_m3 is not none else '—' }}</td>
+          {% endif %}
+          <td class="text-end mg-num text-muted">{{ r.day_volume | round | int | format_number if r.day_volume else '—' }}</td>
+          <td class="text-end mg-num {{ 'text-profit' if r.profit_per_hour and r.profit_per_hour > 0 else 'text-loss' if r.profit_per_hour else '' }}">
+            {{ r.profit_per_hour | isk0 if r.profit_per_hour is not none else '—' }}
+          </td>
+          <td class="text-end">
+            <form method="post" action="/margins/remove" class="d-inline">
+              <input type="hidden" name="item_id" value="{{ e.item_id }}">
+              <button class="btn btn-sm btn-link text-danger p-0" title="Stop tracking"
+                      style="font-size:.8rem"><i class="bi bi-x-lg"></i></button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="px-3 py-2 border-top text-muted mg-note" style="border-color:var(--eve-border) !important">
+    {% if not volume_supported %}
+    <div class="mb-1">
+      <i class="bi bi-info-circle me-1"></i>
+      Profit/m³ is hidden because this database predates the packaged-volume column.
+      Re-run the SDE import to add it.
+    </div>
+    {% endif %}
+    <div>
+      Cost is the full build: raw materials at market plus every job fee down the tree,
+      manufacturing at your build station and reactions at your reaction station.
+      Component blueprints use the ME of blueprints you own; the tracked ME/TE applies to
+      the product's own blueprint. Δ and the {{ avg_window }}-day average come from one
+      reading per day, taken when this page is loaded.
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
+{% block scripts %}
+<script>
+// As-you-type product search, against the same /api/suggest endpoint the Plan
+// form uses — so both pages search the same set (everything with a blueprint)
+// and behave identically. Picking one of your own blueprints fills in its real
+// ME/TE, which is almost always the row you meant to track.
+(function () {
+  const input = document.getElementById('mg-product');
+  const box   = document.getElementById('mg-suggestions');
+  if (!input || !box) return;
+
+  let timer, activeIdx = -1, items = [];
+
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    // Under two characters the result set is the whole market — the endpoint
+    // returns nothing, so don't spend a round-trip discovering that.
+    if (q.length < 2) { hide(); return; }
+    timer = setTimeout(() => search(q), 200);
+  });
+
+  input.addEventListener('keydown', e => {
+    if (box.style.display !== 'block') return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); move(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); }
+    else if (e.key === 'Enter' && activeIdx >= 0) { e.preventDefault(); pick(items[activeIdx]); }
+    else if (e.key === 'Escape') { hide(); }
+  });
+
+  document.addEventListener('click', e => {
+    if (!box.contains(e.target) && e.target !== input) hide();
+  });
+
+  function move(dir) {
+    activeIdx = Math.max(0, Math.min(items.length - 1, activeIdx + dir));
+    paintActive();
+    const el = box.querySelectorAll('.suggest-item')[activeIdx];
+    if (el) el.scrollIntoView({block: 'nearest'});
+  }
+
+  function paintActive() {
+    box.querySelectorAll('.suggest-item').forEach((el, i) =>
+      el.classList.toggle('suggest-active', i === activeIdx));
+  }
+
+  function pick(item) {
+    if (!item) return;
+    input.value = item.name;
+    // Owned blueprints carry their researched ME/TE; anything else keeps
+    // whatever is already typed rather than guessing.
+    if (item.me !== undefined) document.getElementById('mg-me').value = item.me;
+    if (item.te !== undefined) document.getElementById('mg-te').value = item.te;
+    hide();
+    input.focus();
+  }
+
+  function hide() { box.style.display = 'none'; activeIdx = -1; }
+
+  function header(text, first) {
+    return `<div class="px-3 py-1" style="color:#8b949e;font-size:.75rem;
+      text-transform:uppercase;letter-spacing:.06em;
+      border-bottom:1px solid #30363d;${first ? '' : 'border-top:1px solid #30363d;'}
+      padding-top:8px!important">${text}</div>`;
+  }
+
+  function row(item, extra) {
+    return `<div class="suggest-item d-flex align-items-center gap-2 px-3 py-2" style="cursor:pointer">
+      <img loading="lazy" src="/icon/${item.type_id}?size=32" width="26" height="26"
+           class="rounded" style="flex-shrink:0" onerror="this.style.visibility='hidden'">
+      <div style="flex:1;min-width:0">
+        <div class="text-truncate">${escHtml(item.name)}</div>
+        ${extra || ''}
+      </div></div>`;
+  }
+
+  async function search(q) {
+    let data;
+    try {
+      const r = await fetch('/api/suggest?q=' + encodeURIComponent(q));
+      data = await r.json();
+    } catch (e) { return; }
+    // A slower earlier request must not overwrite a newer query's results.
+    if (input.value.trim() !== q) return;
+
+    items = [...(data.owned || []), ...(data.other || [])];
+    if (!items.length) { hide(); return; }
+
+    let html = '';
+    if (data.owned && data.owned.length) {
+      html += header('My blueprints', true);
+      data.owned.forEach(item => {
+        const kind = item.is_original
+          ? '<span class="badge badge-bpo" style="font-size:.62rem">BPO</span>'
+          : '<span class="badge badge-bpc" style="font-size:.62rem">BPC</span>';
+        html += row(item, `<div class="d-flex align-items-center gap-1 mt-1">${kind}
+          <span style="color:#3fb950;font-size:.72rem">ME ${item.me}</span>
+          <span style="color:#8b949e;font-size:.72rem">·</span>
+          <span style="color:#e3b341;font-size:.72rem">TE ${item.te}</span></div>`);
+      });
+    }
+    if (data.other && data.other.length) {
+      html += header('All blueprints', !(data.owned && data.owned.length));
+      data.other.forEach(item => { html += row(item); });
+    }
+
+    box.innerHTML = html;
+    box.style.display = 'block';
+    activeIdx = -1;
+    box.querySelectorAll('.suggest-item').forEach((el, i) => {
+      el.addEventListener('mouseenter', () => { activeIdx = i; paintActive(); });
+      el.addEventListener('click', () => pick(items[i]));
+    });
+  }
+})();
+</script>
+{% endblock %}

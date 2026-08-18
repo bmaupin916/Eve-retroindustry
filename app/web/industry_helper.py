@@ -453,6 +453,19 @@ def _sci_is_fresh(conn: sqlite3.Connection, solar_system_id: int, activity: str)
     return (time.time() - row[0]) < 3600  # 1 h
 
 
+def get_adjusted_prices_cached(conn: sqlite3.Connection) -> dict[int, float]:
+    """Cache-only sibling of `get_adjusted_prices` — never fetches.
+
+    The margin tracker prices a whole watchlist on every page load; going to
+    ESI for adjusted prices there would turn one page view into a market-wide
+    refresh. Returns whatever is cached, stale or empty included, and lets the
+    caller decide what to say about it.
+    """
+    ensure_industry_tables(conn)
+    return {r[0]: r[1] for r in
+            conn.execute("SELECT type_id, adjusted FROM adjusted_price_cache").fetchall()}
+
+
 async def get_adjusted_prices(conn: sqlite3.Connection) -> dict[int, float]:
     """Return {type_id: adjusted_price} from cache or ESI (GET /markets/prices/)."""
     ensure_industry_tables(conn)
