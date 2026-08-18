@@ -81,6 +81,36 @@ DEFAULTS: dict[str, tuple[object, type]] = {
     # Invention is modelled only when this is on, so an install that buys its
     # T2 BPCs rather than inventing them is not charged for invention.
     "invent_t2":             (1, int),
+
+    # ── Sourcing: raw vs intermediate ────────────────────────────────────
+    # `input_basis` above is one toggle for every input, which the reactions
+    # spreadsheet has always distinguished — and it materially changes cost.
+    # Raw materials (moon goo, ice, PI) are things you sit on buy orders for
+    # and wait; intermediates are things you want *now*, off sell orders, so
+    # a reaction is not held up. Defaults follow the sheet: raw BUY, intermediate
+    # SELL. `input_basis` is kept as the fallback for anything not yet migrated
+    # to these two, so existing pages are unaffected.
+    "raw_input_basis":          ("buy", str),    # "buy" = place orders, patient
+    "intermediate_input_basis": ("sell", str),   # "sell" = instant, off sell orders
+
+    # ── Freight ──────────────────────────────────────────────────────────
+    # ISK per m³, import and export kept separate because alliance jump-freight
+    # is priced that way and the two legs are rarely the same number. Export is
+    # what it costs to move finished output to a market hub; import is what it
+    # costs to bring inputs in. 0 = no freight modelled, which is correct for
+    # anyone building and selling in the same station.
+    "freight_import_isk_m3": (0.0, float),
+    "freight_export_isk_m3": (0.0, float),
+
+    # ── Where you sell ───────────────────────────────────────────────────
+    # 0 = Jita (the app-wide reference in market_price_cache, and the baseline
+    # against which any other venue has an "advantage"). Otherwise a region id
+    # from app.market.prices.TRADE_HUBS, priced out of hub_price_cache, or a
+    # player structure id priced from its own market. Selling locally avoids the
+    # export freight to Jita, which is the whole point of the comparison — a
+    # worse local price can still win once hauling is paid for.
+    "sell_hub_region_id":    (0, int),
+    "sell_structure_id":     (0, int),
 }
 
 

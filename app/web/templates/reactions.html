@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+{% block title %}Reactions Board — EVE Retroindustry{% endblock %}
+{% block content %}
+{% macro pill(m) -%}
+  {% if m is not none %}<span class="rx-pill {% if m >= 25 %}rx-p3{% elif m >= 10 %}rx-p2{% elif m >= 0 %}rx-p1{% elif m >= -25 %}rx-n1{% else %}rx-n2{% endif %}">{{ '{:.1f}%'.format(m) }}</span>{% else %}<span class="rx-thin">—</span>{% endif %}
+{%- endmacro %}
+
+<style>
+  .rx-note { font-size: .78rem; }
+  .rx-num  { font-variant-numeric: tabular-nums; }
+  .rx-thin { opacity: .55; }
+  .rx-tag  { font-size: .68rem; letter-spacing: .02em; }
+
+  /* Profit colouring. Two channels rather than one: a left edge that scans down
+     the table at a glance, and a tinted margin pill for the precise read. */
+  .rx-row-win  td:first-child { box-shadow: inset 3px 0 0 #3fb950; }
+  .rx-row-loss td:first-child { box-shadow: inset 3px 0 0 #f85149; }
+  .rx-row-win  td { background: rgba(63,185,80,.045); }
+  .rx-row-loss td { background: rgba(248,81,73,.05); }
+  .rx-row-dead td { background: rgba(139,148,158,.05); }
+
+  .rx-pill {
+    display: inline-block; min-width: 4.2rem; padding: .1rem .4rem;
+    border-radius: .25rem; font-variant-numeric: tabular-nums; font-weight: 600;
+  }
+  /* Banded rather than continuous: the exact percentage is already in the text,
+     so the colour only has to answer "good, thin, or losing". */
+  .rx-p3 { background: rgba(63,185,80,.28);  color: #7ee787; }
+  .rx-p2 { background: rgba(63,185,80,.16);  color: #7ee787; }
+  .rx-p1 { background: rgba(210,153,34,.16); color: #e3b341; }
+  .rx-n1 { background: rgba(248,81,73,.16);  color: #ff7b72; }
+  .rx-n2 { background: rgba(248,81,73,.28);  color: #ff7b72; }
+
+  .rx-up   { color: #3fb950; }
+  .rx-down { color: #f85149; }
+
+  /* Sortable headers */
+  th.rx-sort a { color: inherit; text-decoration: none; white-space: nowrap; }
+  th.rx-sort a:hover { color: #e3b341; }
+  th.rx-sort .rx-arrow { opacity: .35; font-size: .7rem; }
+  th.rx-sort.rx-active a { color: #e3b341; }
+  th.rx-sort.rx-active .rx-arrow { opacity: 1; }
+  /* Demoted rows keep their numbers but must not read as a recommendation. */
+  tr.rx-unreliable td:not(:first-child) { opacity: .5; }
+</style>
+
+<div class="row mb-3 align-items-center">
+  <div class="col">
+    <h4 class="mb-0"><i class="bi bi-thermometer-half me-2 text-primary"></i>Reactions Board</h4>
+    <div class="text-muted rx-note mt-1">
+      Every published reaction, priced and ranked — including the ones losing money, which a
+      watchlist cannot show you because you would have to add the loser first.
+      Costed on <strong>direct inputs at market</strong>: what it costs to buy the moon goo and
+      intermediates and react them. Figures are per <strong>{{ period_label }}</strong> - a week of one slot, jobs floored.
+      Priced from cache, refresh on <a href="/prices">Prices</a>.
+    </div>
+  </div>
+</div>
+
+{% if not configured %}
+  <div class="alert alert-warning py-2 rx-note">
+    <i class="bi bi-exclamation-triangle me-2"></i>
+    No build station is set, so there is no system cost index and every profit figure would be
+    fiction. Set one in <a href="/settings" class="alert-link">Settings</a>.
+  </div>
+{% else %}
+
+<div class="d-flex flex-wrap gap-3 align-items-center mb-3">
+  <form method="get" action="/reactions" class="d-flex align-items-center gap-2">
+    <input type="hidden" name="sort" value="{{ sort }}">
+    <input type="hidden" name="dir" value="{{ dir }}">
+    <label class="form-label small mb-0 text-muted" for="rx-group">Filter</label>
+    <select name="group" id="rx-group" class="form-select form-select-sm"
+            style="width:auto" onchange="this.form.submit()">
+      <option value="">All groups ({{ counts.total }})</option>
+      {% for g in groups %}
+        <option value="{{ g }}"{% if group == g %} selected{% endif %}>{{ g }}</option>
+      {% endfor %}
+    </select>
+    {% if group %}
+      <a href="/reactions?sort={{ sort }}&dir={{ dir }}" class="btn btn-sm btn-outline-secondary">Clear</a>
+    {% endif %}
+  </form>
+
+  <div class="ms-auto text-muted rx-note text-end">
+    <div><span class="rx-up">{{ counts.profitable }} profitable</span> ·
+         <span class="rx-down">{{ counts.unprofitable }} at a loss</span></div>
+    {% if counts.unreliable %}
+      <div class="rx-thin">{{ counts.unreliable }} ranked below the rest — unpriced inputs or no real market</div>
+    {% endif %}
+  </div>
+</div>
+
+{% if not sci_cached %}
+  <div class="alert alert-warning py-2 rx-note">
+    <i class="bi bi-exclamation-triangle me-2"></i>
+    System cost indices are not cached, so install fees fall back to defaults.
+  </div>
+{% endif %}
+
+<div class="table-responsive">
+  <table class="table table-sm table-hover align-middle">
+    <thead>
+      <tr class="text-muted rx-note">
+        {% for key, heading, align in columns %}
+          {# Clicking the active column flips it; any other column starts descending,
+             which is the useful default for money. #}
+          {% set next_dir = ('asc' if (sort == key and dir == 'desc') else 'desc') %}
+          <th class="rx-sort text-{{ align }}{% if sort == key %} rx-active{% endif %}">
+            <a href="?sort={{ key }}&dir={{ next_dir }}{% if group %}&group={{ group | urlencode }}{% endif %}"
+               title="Sort by {{ heading }}, {{ 'ascending' if next_dir == 'asc' else 'descending' }}">
+              {{ heading }}
+              <span class="rx-arrow">{% if sort == key %}{{ '▲' if dir == 'asc' else '▼' }}{% else %}↕{% endif %}</span>
+            </a>
+          </th>
+        {% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+      {% if wide %}
+        {% for r in rows %}
+        <tr class="{% if r.net_int is none %}rx-row-dead{% elif r.net_int > 0 %}rx-row-win{% else %}rx-row-loss{% endif %}{% if not r.reliable %} rx-unreliable{% endif %}">
+          <td>
+            <div>{{ r.name }}</div>
+            <div class="text-muted rx-note">
+              {{ '{:,}'.format(r.per_run) }}/run &middot; {{ r.jobs_per_month }} jobs / {{ period_label }}
+              {% if r.unpriced %}
+                <span class="badge bg-secondary rx-tag ms-1"
+                      title="No cached price for: {{ r.unpriced | join(', ') }} - costed at zero, so this profit is optimistic.">{{ r.unpriced | length }} unpriced</span>
+              {% endif %}
+              {% if r.raw_unpriced %}
+                <span class="badge bg-secondary rx-tag ms-1"
+                      title="Building from raw needs prices this cache does not have: {{ r.raw_unpriced | join(', ') }}. The raw columns are blank rather than understated.">raw incomplete</span>
+              {% endif %}
+              {% if r.thin_market %}
+                <span class="badge bg-danger rx-tag ms-1"
+                      title="Sell {{ '{:,.0f}'.format(r.sell_price) }} against a buy of {{ '{:,.0f}'.format(r.buy_price) }} - nobody is trading this at the asking price.">thin market</span>
+              {% endif %}
+            </div>
+          </td>
+          <td class="text-end rx-num">{{ r.gross | isk if r.gross is not none else '—' }}</td>
+          <td class="text-end rx-num rx-thin">{{ r.cost_int | isk if r.cost_int is not none else '—' }}</td>
+          <td class="text-end rx-num rx-thin">{{ r.cost_raw | isk if r.cost_raw is not none else '—' }}</td>
+          <td class="text-end rx-num rx-thin">{{ r.export | isk if r.export is not none else '—' }}</td>
+          <td class="text-end rx-num {% if r.net_int is not none %}{{ 'rx-up' if r.net_int > 0 else 'rx-down' }}{% endif %}">{{ r.net_int | isk if r.net_int is not none else '—' }}</td>
+          <td class="text-end rx-num {% if r.net_raw is not none %}{{ 'rx-up' if r.net_raw > 0 else 'rx-down' }}{% endif %}">{{ r.net_raw | isk if r.net_raw is not none else '—' }}</td>
+          <td class="text-end rx-num {% if r.slot_hour_int is not none %}{{ 'rx-up' if r.slot_hour_int > 0 else 'rx-down' }}{% endif %}">{{ r.slot_hour_int | isk if r.slot_hour_int is not none else '—' }}</td>
+          <td class="text-end rx-num {% if r.slot_hour_raw is not none %}{{ 'rx-up' if r.slot_hour_raw > 0 else 'rx-down' }}{% endif %}">{{ r.slot_hour_raw | isk if r.slot_hour_raw is not none else '—' }}</td>
+          <td class="text-end">{{ pill(r.margin_int) }}</td>
+          <td class="text-end">{{ pill(r.margin_raw) }}</td>
+          <td class="text-end rx-num {% if r.build_advantage is not none %}{{ 'rx-up' if r.build_advantage > 0 else 'rx-down' }}{% endif %}"
+              title="Margin building the intermediates minus margin buying them. Positive means build them.">
+            {{ '{:+.1f}%'.format(r.build_advantage) if r.build_advantage is not none else '—' }}
+          </td>
+          <td class="text-end rx-num {% if r.sell_advantage is not none %}{{ 'rx-up' if r.sell_advantage > 0 else 'rx-down' }}{% endif %}">
+            {{ '{:+.1f}%'.format(r.sell_advantage * 100) if r.sell_advantage is not none else '—' }}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="{{ columns | length }}" class="text-muted text-center py-4">No reactions to show.</td></tr>
+        {% endfor %}
+      {% else %}
+        {% for r in rows %}
+        <tr class="{% if r.per_job_profit is none %}rx-row-dead{% elif r.per_job_profit > 0 %}rx-row-win{% else %}rx-row-loss{% endif %}{% if not r.reliable %} rx-unreliable{% endif %}">
+          <td>
+            <div>{{ r.name }}</div>
+            <div class="text-muted rx-note">
+              {{ r.group_name }} &middot; {{ '{:,}'.format(r.per_run) }}/run
+              {% if r.is_alchemy %}
+                <span class="badge bg-warning text-dark rx-tag ms-1"
+                      title="Alchemy: the output is meant to be reprocessed, not sold as-is. This row prices the unrefined item at its own market value, which is not why the reaction is run.">alchemy</span>
+              {% endif %}
+              {% if r.unpriced %}
+                <span class="badge bg-secondary rx-tag ms-1"
+                      title="No cached price for: {{ r.unpriced | join(', ') }} - costed at zero, so this profit is optimistic.">{{ r.unpriced | length }} unpriced</span>
+              {% endif %}
+              {% if r.thin_market %}
+                <span class="badge bg-danger rx-tag ms-1"
+                      title="Sell {{ '{:,.0f}'.format(r.sell_price) }} against a buy of {{ '{:,.0f}'.format(r.buy_price) }} - nobody is trading this at the asking price, so the revenue is not realisable.">thin market</span>
+              {% endif %}
+            </div>
+          </td>
+          <td class="text-end rx-num">{{ '{:,.2f}'.format(r.sell_price) if r.sell_price else '—' }}</td>
+          <td class="text-end rx-num rx-thin">{{ r.material_cost | isk }}</td>
+          <td class="text-end rx-num rx-thin">{{ r.job_fee | isk }}</td>
+          <td class="text-end rx-num {% if r.per_job_profit is not none %}{{ 'rx-up' if r.per_job_profit > 0 else 'rx-down' }}{% endif %}">
+            {{ r.per_job_profit | isk if r.per_job_profit is not none else '—' }}
+          </td>
+          <td class="text-end">{{ pill(r.margin_pct) }}</td>
+          <td class="text-end rx-num {% if r.isk_per_slot_hour is not none %}{{ 'rx-up' if r.isk_per_slot_hour > 0 else 'rx-down' }}{% endif %}">
+            {{ r.isk_per_slot_hour | isk if r.isk_per_slot_hour is not none else '—' }}
+          </td>
+          <td class="text-end rx-num rx-thin">{{ r.jobs_per_month or '—' }}</td>
+          <td class="text-end rx-num {% if r.monthly_profit is not none %}{{ 'rx-up' if r.monthly_profit > 0 else 'rx-down' }}{% endif %}">
+            {{ r.monthly_profit | isk if r.monthly_profit is not none else '—' }}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="{{ columns | length }}" class="text-muted text-center py-4">No reactions to show.</td></tr>
+        {% endfor %}
+      {% endif %}
+    </tbody>
+  </table>
+</div>
+
+<div class="text-muted rx-note mt-2">
+  <div>
+    <strong>Profit</strong> is net of the install fee and of selling costs
+    ({{ '%.2f' % selling.pct }}% — {{ '%.2f' % (selling.sales_tax * 100) }}% sales tax{% if selling.broker_fee %}
+    plus {{ '%.2f' % (selling.broker_fee * 100) }}% broker's fee{% endif %}).
+  </div>
+  <div>
+    <strong>Jobs / month</strong> is floored over 30 days: a job that takes 25 days fits once,
+    not 1.2 times. <strong>ISK / slot-hour</strong> is the unfloored rate — the two disagree
+    exactly where a long job would otherwise flatter itself.
+  </div>
+  <div>
+    Faded rows have an unpriced input or no real market, so their numbers are not earned —
+    they stay last whichever column you sort by.
+  </div>
+</div>
+
+{% endif %}
+{% endblock %}
