@@ -1027,6 +1027,52 @@ production, which is the invention gap in §8.
 
 ---
 
+### 9.5 Discord bot
+
+Requested 2026-08-17, not yet designed. Recorded here so the shape is not re-derived later.
+
+**Why it fits.** The coordination flow in §7 is mostly *notification*: an alliance posts an
+order, corps commit, a director assigns, a job starts, a job finishes. Every one of those is
+an event someone needs to hear about, and alliances already live in Discord. A builder who
+has to remember to open a web page is a builder who does not see the order. This is the
+difference between a tool people check and a tool that reaches them.
+
+**What it should do**, roughly in value order:
+
+1. **Announce and chase orders.** New alliance order → post to a channel. Corp commits →
+   confirm. Assignment made → DM the assignee. Job overdue or unstarted → nudge.
+2. **Report progress at the coarse level §7 specifies** — "50 in build, 25 days remaining",
+   never "player 1 is building this at that station". The alliance read model is already
+   designed to be safe to show broadly, which makes it the natural thing to post publicly.
+3. **Answer queries in channel** — price, margin, what a build needs. Cheap once the read
+   models exist, and the most likely thing to get used daily.
+4. **Alerts** that already have somewhere to go: PI extractor expiry, job completion.
+
+**Three things that decide the design:**
+
+* **It is a second front-end, not a second application.** It must read the same read models
+  the web UI reads. Any logic reimplemented in the bot is a place the two can disagree, and
+  a coordination tool that disagrees with itself is worse than no tool.
+* **Identity mapping is the real work.** A Discord user has to be linked to an account, and
+  therefore to characters and a corp/alliance role. That is a linking flow with its own
+  verification, and it inherits every tenancy question in §6 — a bot that answers the wrong
+  person's data is the same leak as the web UI doing it, with a wider audience.
+* **Channel scope is a permission boundary.** Alliance-level figures posted into a corp
+  channel are a disclosure. Whatever posts where has to be derived from the group model,
+  not from whoever invited the bot.
+
+**Where it lands.** After **Step 6** — the bot is a view onto orders, commitments and
+assignments, so it needs those to exist. Two things it depends on earlier: the sync worker
+in Step 4 has to emit events rather than only refreshing caches (a bot that polls the
+database for changes is a bot that misses them), and Step 5's account scoping is what makes
+"who is this Discord user" answerable at all. Worth keeping in mind when designing the
+worker, because retrofitting event emission is more work than building it in.
+
+**Hosting note:** a bot is a long-lived gateway connection, so it is a second process
+alongside the web app on the VPS, with its own restart and secret handling.
+
+---
+
 ## 10. Cross-cutting decisions
 
 * **Pricing model.** Three input bases (raw / intermediate / output, each buy-or-sell);
