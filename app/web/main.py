@@ -120,8 +120,10 @@ from app.web.projects_helper import (
     get_project_detail,
 )
 
-# Path resolution — works in dev mode and when frozen by PyInstaller.
-# launcher.py sets EVE_APP_DIR / EVE_BUNDLE_DIR before importing this module.
+# Path resolution. EVE_APP_DIR is the writable data directory and is what a
+# deployment sets; EVE_BUNDLE_DIR is a leftover seam from the retired desktop
+# build, where read-only bundled files lived apart from writable ones. Both
+# default to the project root, which is correct for a server install.
 _APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..")
 )

@@ -53,8 +53,14 @@ sudo apt update && sudo apt install -y python3 python3-venv python3-pip git ngin
 
 ```bash
 sudo adduser --system --group --home /opt/eve-retroindustry eve
-sudo -u eve git clone https://github.com/EVERetroIndustry/Eve-retroindustry.git /opt/eve-retroindustry
+sudo -u eve git clone https://github.com/bmaupin916/Eve-retroindustry.git /opt/eve-retroindustry
 ```
+
+Clone the repository that actually holds what you intend to run. The hosted work
+— session login, CSRF, Host validation, the corrected SDE — lives here; deploying
+from a repository that predates it puts an unauthenticated app on a public
+address, which is precisely what this guide's opening paragraph says is no longer
+the case.
 
 ## 3. Virtual environment
 
@@ -67,15 +73,23 @@ sudo -u eve python3 -m venv .venv
 sudo -u eve .venv/bin/pip install -r requirements.txt
 ```
 
-## 4. Import the SDE
+## 4. Import the SDE — optional on a first install
+
+**You can skip this step.** The repository ships `sde_base.db`, and the app
+copies it into place on first startup: a fresh install has a complete, working
+SDE without touching the network.
+
+Run the importer only to get a build *newer* than the bundled one:
 
 ```bash
 sudo -u eve .venv/bin/python import_sde.py
 ```
 
-Takes a few minutes and several hundred MB of downloads. The build number it
+That is a few minutes and several hundred MB of downloads. The build number it
 pins is recorded in the database, so a later run knows whether it has anything
-to do.
+to do — and so does startup, which upgrades an existing database from the
+bundle whenever the bundle is newer or carries a table or column the database
+lacks. Schema changes therefore arrive with `git pull`, not with a migration.
 
 ## 5. Configuration
 
