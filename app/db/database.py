@@ -47,6 +47,30 @@ engine = create_engine(
 Base.metadata.create_all(engine)
 
 
+def harden_db_permissions() -> None:
+    """Restrict eve_cache.db to the owning user.
+
+    The DB holds every character's refresh token in `characters`. `.eve_config.json`
+    has been chmod 0600 since forever (token_store.py) but only carries the client
+    ID; the file with the actual secrets in it had no permissions set at all.
+    Baseline finding 5.
+
+    Called on import and again from ensure_user_tables(), because the SDE download
+    replaces the file wholesale via shutil.move() and the replacement arrives with
+    whatever permissions the temp file had.
+
+    On Windows this only clears the read-only bit — POSIX modes are not enforced —
+    so it is effectively a no-op in desktop dev. The VPS is the target.
+    """
+    try:
+        os.chmod(DB_PATH, 0o600)
+    except OSError:
+        pass  # missing file or a filesystem without modes; not worth failing startup
+
+
+harden_db_permissions()
+
+
 def get_session() -> Session:
     return Session(engine)
 
@@ -60,3 +84,4 @@ def ensure_user_tables() -> None:
     (type_cache, blueprint_cache) must be recreated.
     """
     Base.metadata.create_all(engine)
+    harden_db_permissions()
