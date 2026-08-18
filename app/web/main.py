@@ -147,11 +147,6 @@ DB_ABS = os.path.join(_APP_DIR, "eve_cache.db")
 TEMPLATES_DIR = Path(_BUNDLE_DIR) / "app" / "web" / "templates"
 STATIC_DIR = Path(_BUNDLE_DIR) / "app" / "web" / "static"
 
-SDE_DOWNLOAD_URL = (
-    "https://github.com/EVERetroIndustry/Eve-retroindustry"
-    "/releases/latest/download/sde_base.db"
-)
-
 # Set to True once SDE tables are confirmed present. Guards the setup gate.
 _SDE_READY: list[bool] = [False]
 
@@ -318,217 +313,11 @@ async def _security_gate(request: Request, call_next):
     return await call_next(request)
 
 
-_SDE_TABLES_TO_REFRESH = (
-    "sde_types",
-    "sde_groups",
-    "sde_blueprints",
-    "sde_blueprint_materials",
-    "sde_blueprint_products",
-    "sde_blueprint_skills",
-    "sde_skill_time_bonus",
-    "sde_planet_schematics",           # v0.8.106 (PI factory chains)
-    "sde_planet_schematic_materials",  # v0.8.106
-    "sde_build",                       # v0.9.24 (which SDE build this came from)
-    "sde_decryptors",                  # v0.9.25 (invention)
-    "sde_datacore_skills",             # v0.9.25 (invention)
-    "sde_type_materials",              # v0.9.26 (reprocessing yields)
-    "sde_market_groups",               # v0.9.26 (market hierarchy)
-)
-
-
-def _bundled_sde_path() -> str | None:
-    """Return the path to sde_base.db bundled in the PyInstaller package, or None.
-
-    Bundle dir = sys._MEIPASS (frozen) / project root (dev). In dev mode
-    sde_base.db sits directly in the project root.
-    """
-    candidate = os.path.join(_BUNDLE_DIR, "sde_base.db")
-    return candidate if os.path.isfile(candidate) else None
-
-
-def _refresh_sde_from_bundle(
-    conn: sqlite3.Connection, source: str | None = None, force: bool = False
-) -> int:
-    """If `source` has more types OR more groups than the user's eve_cache.db,
-    replace the SDE tables with fresh data. Return the type count AFTER the
-    refresh (0 = nothing happened).
-
-    `source` defaults to the bundled sde_base.db. The downloaded one goes
-    through here too: it used to be moved over eve_cache.db wholesale, which
-    replaced the file and took every character, refresh token, cached price and
-    saved project with it. `force` is for that case — an explicit re-download
-    should apply even when the heuristics say there is nothing to do.
-
-    Groups check: v0.5.3 added importing groups.yaml from the SDE (1605 groups
-    instead of ~857 from ESI); without a group row, rig_applies_to_product's INNER
-    JOIN silently drops all rig bonuses for that product.
-
-    User data (characters, BP cache, prices, projects, …) is preserved — we only
-    change the tables in `_SDE_TABLES_TO_REFRESH`.
-    """
-    bundled = source or _bundled_sde_path()
-    if not bundled:
-        return 0
-
-    def _counts(c) -> tuple[int, int]:
-        types = c.execute("SELECT COUNT(*) FROM sde_types").fetchone()[0]
-        try:
-            groups = c.execute("SELECT COUNT(*) FROM sde_groups").fetchone()[0]
-        except sqlite3.OperationalError:
-            groups = 0
-        return types, groups
-
-    def _build(c) -> int:
-        """The SDE build this database was imported from, 0 if unknown.
-
-        The authoritative answer to "is this stale?". Row counts cannot give
-        one: build 3470007 has FIVE FEWER blueprint material rows than the
-        bundle shipped with v0.9.23, because CCP rebalanced a handful of
-        blueprints. A comparison that only fires when the bundle has *more*
-        rows can never deliver a build that removes something.
-        """
-        try:
-            row = c.execute("SELECT build_number FROM sde_build WHERE id=1").fetchone()
-        except sqlite3.OperationalError:
-            return 0
-        return int(row[0]) if row and row[0] else 0
-
-    user_count, user_groups = _counts(conn)
-    # ATTACH-free: we read from the bundled DB via a separate connection and copy
-    # rows in Python. ATTACH DATABASE may not be reliable on Chaquopy (Android),
-    # and the earlier variant could leave the SDE tables dropped on a partial
-    # failure. We read EVERYTHING first (if the bundle is unreadable we don't even
-    # touch the user's tables), and only then replace.
-    bsrc = sqlite3.connect(bundled)
-    try:
-        bundled_count, bundled_groups = _counts(bsrc)
-
-        # Also refresh when a table the app now needs is MISSING from the user's
-        # DB but present in the bundle — e.g. a new SDE table (PI schematics,
-        # v0.8.106) added without the type/group counts changing. Without this,
-        # an existing eve_cache.db never gains the new table and queries 500.
-        user_tables = {
-            r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        bundle_tables = {
-            r[0] for r in bsrc.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        missing = any(
-            t in bundle_tables and t not in user_tables
-            for t in _SDE_TABLES_TO_REFRESH
-        )
-
-        # ...and when a table the user already has is missing a COLUMN the bundle
-        # now carries — e.g. sde_types.volume (v0.9.23, profit-per-m3 in the
-        # margin tracker). Counts cannot see this: the same 52,848 types arrive
-        # either way, so without a column check the new field never lands and the
-        # feature that needs it stays silently dark on every existing install.
-        def _columns(c, table: str) -> set:
-            return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
-
-        stale = any(
-            t in bundle_tables and t in user_tables
-            and (_columns(bsrc, t) - _columns(conn, t))
-            for t in _SDE_TABLES_TO_REFRESH
-        )
-
-        user_build, bundled_build = _build(conn), _build(bsrc)
-        # A newer build always wins, in either direction of row count. When
-        # neither side records a build we fall back to the old heuristics.
-        newer_build = bundled_build > user_build
-
-        if (not force and not newer_build and bundled_count <= user_count
-                and bundled_groups <= user_groups and not missing and not stale):
-            return user_count  # up to date on build, types, groups, tables and columns
-
-        print(f"[sde] refreshing SDE tables: user={user_count}, bundled={bundled_count}, "
-              f"build {user_build} -> {bundled_build}, "
-              f"missing_table={missing}, stale_columns={stale}", flush=True)
-        payload = []
-        for table in _SDE_TABLES_TO_REFRESH:
-            ddl = bsrc.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            ).fetchone()
-            if not ddl or not ddl[0]:
-                continue
-            rows = bsrc.execute(f"SELECT * FROM {table}").fetchall()
-            payload.append((table, ddl[0], rows))
-    finally:
-        bsrc.close()
-
-    for table, ddl, rows in payload:
-        conn.execute(f"DROP TABLE IF EXISTS {table}")
-        conn.execute(ddl)
-        if rows:
-            ph = ",".join("?" * len(rows[0]))
-            conn.executemany(f"INSERT INTO {table} VALUES ({ph})", rows)
-    # DROP TABLE drops that table's indexes with it, and `ddl` above is the
-    # CREATE TABLE read from sqlite_master — which never carries indexes. So
-    # every refresh since indexes were introduced has silently un-indexed the
-    # SDE, turning "which blueprint makes this item" into a full scan of
-    # sde_blueprint_products on every node of every bill of materials. The
-    # bundled file has them; a refreshed database did not.
-    for stmt in sde_index_ddl(table for table, _ddl, _rows in payload):
-        conn.execute(stmt)
-    conn.commit()
-    return conn.execute("SELECT COUNT(*) FROM sde_types").fetchone()[0]
-
-
 @app.on_event("startup")
 async def _startup_populate_groups():
     """Check SDE readiness, refresh from bundled DB if outdated, then
     load group names and rig bonuses."""
-    # Fresh install — if eve_cache.db doesn't exist and we have a bundled SDE,
-    # copy it straight over (bypasses the old /setup/download page).
-    # NOTE: app.db.database already called create_all at import time (before this
-    # handler runs), which created eve_cache.db with only the user tables.
-    # So if the DB exists but is practically empty (no SDE tables), we replace
-    # it with the bundle too. After replacing we must recreate the user tables,
-    # otherwise SQLAlchemy fails with "no such table: type_cache".
-    try:
-        bundled = _bundled_sde_path()
-        if bundled:
-            need_copy = False
-            if not os.path.exists(DB_ABS):
-                need_copy = True
-            else:
-                # Exists, but it may be just an empty shell from SQLAlchemy
-                try:
-                    probe = sqlite3.connect(DB_ABS)
-                    # Rows, not existence. The schema bootstrap creates
-                    # sde_types empty, so "the table is there" stopped being
-                    # evidence that anything is in it — the same
-                    # present-but-empty trap that stranded installs on a
-                    # download page they could never leave.
-                    try:
-                        has_sde = probe.execute(
-                            "SELECT 1 FROM sde_types LIMIT 1").fetchone() is not None
-                    except sqlite3.OperationalError:
-                        has_sde = False
-                    probe.close()
-                    need_copy = not has_sde
-                except Exception:
-                    pass
-            if need_copy:
-                import shutil
-                from app.db.database import engine as _alchemy_engine, ensure_user_tables
-                _alchemy_engine.dispose()
-                shutil.copy2(bundled, DB_ABS)
-                ensure_user_tables()
-                forget_applied(DB_ABS)
-                print(f"[sde] copied bundled SDE to {DB_ABS} + recreated user tables",
-                      flush=True)
-    except Exception as exc:
-        print(f"[sde] fresh-install copy failed: {exc}", flush=True)
-
-    # Migrations run here and not earlier: the block above can replace the
-    # database file wholesale, and a migration applied to a file that is about
-    # to be overwritten has achieved nothing. Deploying stays `git pull` and a
-    # restart — the schema catches itself up.
+    # Deploying is `git pull` and a restart; the schema catches itself up.
     try:
         revision = upgrade_to_head()
         print(f"[db] schema at revision {revision}", flush=True)
@@ -545,23 +334,17 @@ async def _startup_populate_groups():
         except sqlite3.OperationalError:
             count = 0
 
-        # Attempted even when count == 0. A database whose SDE tables *exist but
-        # are empty* was otherwise stranded: the fresh-install copy above only
-        # fires when `sde_types` is missing entirely, and this refresh used to
-        # require rows to already be there — so nothing could ever fill it, and
-        # the app sent the user to /setup to re-download an SDE that was sitting
-        # in the repo the whole time. The refresh is row-level and touches only
-        # _SDE_TABLES_TO_REFRESH, so the market cache and everything else the
-        # user has accumulated survive it, which the whole-file copy would not.
-        try:
-            count = _refresh_sde_from_bundle(conn) or count
-        except Exception as exc:
-            print(f"[sde] refresh failed: {exc}", flush=True)
-
         _SDE_READY[0] = count > 0
         if _SDE_READY[0]:
             populate_rig_bonuses(conn)
             await _ensure_groups_populated(conn)
+        else:
+            # Nothing here copies a database into place any more. Static data
+            # arrives by running the importer against CCP's build-pinned feed,
+            # which is the difference between "as current as our last release"
+            # and "current".
+            print("[sde] no static data in this database. Run:  python import_sde.py",
+                  flush=True)
         conn.close()
     except Exception:
         _SDE_READY[0] = False
@@ -692,7 +475,7 @@ def _tr(name: str, request: Request, context: dict) -> HTMLResponse:
 
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request):
-    return _tr("setup.html", request, {"sde_url": SDE_DOWNLOAD_URL})
+    return _tr("setup.html", request, {"command": "python import_sde.py"})
 
 
 # CCP issues client IDs as a 32-character hex string. Matched loosely (letters
@@ -755,68 +538,6 @@ async def setup_client_id_save(request: Request):
 
     save_client_id(client_id)
     return RedirectResponse("/auth/login", status_code=303)
-
-
-@app.get("/setup/download")
-async def setup_download():
-    """SSE stream: downloads sde_base.db, writes to eve_cache.db, sets _SDE_READY."""
-
-    async def _stream():
-        tmp_path = DB_ABS + ".download"
-        try:
-            async with esi_client(follow_redirects=True, timeout=120) as client:
-                async with client.stream("GET", SDE_DOWNLOAD_URL) as r:
-                    if r.status_code != 200:
-                        yield f"data: {json.dumps({'error': f'HTTP {r.status_code}'})}\n\n"
-                        return
-                    total = int(r.headers.get("content-length", 0))
-                    downloaded = 0
-                    with open(tmp_path, "wb") as f:
-                        async for chunk in r.aiter_bytes(65536):
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            pct = int(downloaded * 100 / total) if total else 0
-                            yield f"data: {json.dumps({'downloaded': downloaded, 'total': total, 'pct': pct})}\n\n"
-
-            # Copy the ROWS across, do not move the FILE. This used to be
-            # `shutil.move(tmp_path, DB_ABS)`, which replaced eve_cache.db with
-            # the downloaded sde_base.db — and sde_base.db has SDE tables only,
-            # so every character, refresh token, cached price, project and
-            # watchlist row went with it. The page offering that button is
-            # where the app sends you when `sde_types` is empty, so the one
-            # affordance on the recovery screen destroyed the account it was
-            # recovering.
-            #
-            # `_refresh_sde_from_bundle` already does this correctly for the
-            # bundled file: it touches only `_SDE_TABLES_TO_REFRESH` and leaves
-            # everything else alone. `force` because an explicit download should
-            # apply even when the build numbers match.
-            conn = get_conn()
-            try:
-                count = _refresh_sde_from_bundle(conn, source=tmp_path, force=True)
-                _SDE_READY[0] = count > 0
-                populate_rig_bonuses(conn)
-                await _ensure_groups_populated(conn)
-            finally:
-                conn.close()
-                # The move used to consume this file. Copying rows does not, so
-                # a ~10 MB download would otherwise be left next to the database
-                # after every run.
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-
-            yield f"data: {json.dumps({'done': True})}\n\n"
-
-        except Exception as exc:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-
-    return StreamingResponse(
-        _stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
 
 
 # `get_conn()` is on the hot path — runs on every request, so the table

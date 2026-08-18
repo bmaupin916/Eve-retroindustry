@@ -47,11 +47,14 @@ Small and quick now — the desktop GUI stack (pywebview, PyQt6, QtWebEngine) wa
 retired in v0.9.28 along with the desktop app, and it accounted for most of the
 old ~150 MB install.
 
-> You don't need to run `import_sde.py` for normal development. `sde_base.db` is committed at the repo
-> root and the app copies the SDE tables out of it into `eve_cache.db` automatically on first startup.
+> **You do need to run `import_sde.py` once.** The app no longer copies a prebuilt
+> `sde_base.db` into place — that file is a test fixture now, not a runtime source, so a
+> fresh `eve_cache.db` has no game data until you import some. Every page redirects to
+> `/setup` until you have.
 
-It is safe to run when you *do* want to refresh the game data — it downloads CCP's static data export
-itself and needs nothing that isn't already in `requirements.txt`:
+It downloads CCP's static data export itself and needs nothing that isn't already in
+`requirements.txt`. If you already have an archive under `data/sde-archives/`, point at it
+with `--zip` and the import takes seconds instead of minutes:
 
 ```powershell
 python import_sde.py --out sde_base.db --fresh

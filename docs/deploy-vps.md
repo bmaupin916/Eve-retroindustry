@@ -87,17 +87,31 @@ sudo -u eve python3 -m venv .venv
 sudo -u eve .venv/bin/pip install -r requirements.txt
 ```
 
-## 4. Import the SDE — optional on a first install
+## 4. Import the SDE — required
 
-**You can skip this step.** The repository ships `sde_base.db`, and the app
-copies it into place on first startup: a fresh install has a complete, working
-SDE without touching the network.
-
-Run the importer only to get a build *newer* than the bundled one:
+The app cannot calculate anything without CCP's static data, and it no longer
+installs any for you. Run:
 
 ```bash
 sudo -u eve .venv/bin/python import_sde.py
 ```
+
+It fetches a **build-pinned** archive from CCP's static-data service, so an
+import is reproducible rather than "whatever was live that day". Expect a few
+minutes and several hundred MB the first time. Re-running it is cheap: the
+build number is recorded in the database and a run with nothing to do says so
+and stops.
+
+Until it has run, every page redirects to `/setup`, which tells you this.
+
+> **Why not ship a prebuilt file?** Earlier versions committed `sde_base.db`
+> and copied it into place. Three separate defects lived in that machinery —
+> an SDE refresh that silently dropped every index, four tables that existed
+> only if you had visited the right page, and a "download" button that
+> replaced the whole database and took every character and token with it. The
+> importer writes rows into whatever database it is pointed at, which is also
+> what makes a Postgres target possible at all. `sde_base.db` remains in the
+> repository as a test fixture only.
 
 That is a few minutes and several hundred MB of downloads. The build number it
 pins is recorded in the database, so a later run knows whether it has anything

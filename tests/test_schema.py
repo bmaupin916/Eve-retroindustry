@@ -208,52 +208,6 @@ def test_the_orm_models_agree_with_the_schema():
 
 # --- the regression this consolidation surfaced ------------------------------
 
-def test_sde_indexes_survive_a_refresh(app_module, tmp_path, monkeypatch):
-    """An SDE refresh used to leave the database with no indexes at all.
-
-    `_refresh_sde_from_bundle` replays each table's DDL from
-    `sqlite_master WHERE type='table'`, which does not carry indexes, after a
-    DROP TABLE that removes them. So the bundled file shipped with six indexes
-    and the first refresh silently removed all six — including the one that
-    makes "which blueprint makes this item" a lookup rather than a full scan
-    of `sde_blueprint_products`, which every node of every bill of materials
-    performs.
-    """
-    bundle = str(tmp_path / "sde_base.db")
-    user = str(tmp_path / "eve_cache.db")
-
-    def build(path, rows):
-        conn = sqlite3.connect(path)
-        apply_sde_schema(conn)
-        conn.executemany(
-            "INSERT INTO sde_types (type_id, name, group_id, market_group_id) "
-            "VALUES (?,?,?,?)", rows)
-        conn.execute("INSERT INTO sde_groups VALUES (18, 'Mineral')")
-        conn.executemany(
-            "INSERT INTO sde_blueprint_products "
-            "(blueprint_type_id, activity, product_type_id, quantity) VALUES (?,?,?,?)",
-            [(681, "manufacturing", 34, 1)])
-        conn.commit()
-        conn.close()
-
-    build(bundle, [(34, "Tritanium", 18, 1857), (35, "Pyerite", 18, 1857)])
-    build(user, [(34, "Tritanium", 18, 1857)])
-    monkeypatch.setattr(app_module, "_bundled_sde_path", lambda: bundle)
-
-    conn = sqlite3.connect(user)
-    before = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")}
-    assert "idx_bp_product" in before, "fixture should start out indexed"
-
-    app_module._refresh_sde_from_bundle(conn)
-
-    after = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")}
-    conn.close()
-    assert "idx_bp_product" in after, "the refresh dropped the index and never rebuilt it"
-    assert before <= after
-
-
 def test_the_blueprint_product_lookup_uses_its_index(tmp_path):
     """Not "the index exists" — "the query planner uses it".
 
@@ -365,74 +319,6 @@ def test_forgetting_one_database_leaves_the_other_memoized(tmp_path):
 # on the way through. They are tested together because the bug is the same
 # every time: rebuilding a database from a file that describes only part of it.
 
-def test_downloading_the_sde_does_not_wipe_the_account(app_module, tmp_path, monkeypatch):
-    """`/setup/download` used to `shutil.move()` the download over eve_cache.db.
-
-    sde_base.db holds static data and nothing else, so the move took every
-    character, refresh token, cached price, saved project and watchlist row
-    with it. What made it serious rather than merely possible: main.py
-    redirects *every* request to `/setup` when `sde_types` is empty, so this
-    was the one button on the screen the app sends you to when something has
-    already gone wrong — and pressing it destroyed the account it was meant to
-    recover.
-    """
-    source = str(tmp_path / "downloaded_sde.db")
-    conn = sqlite3.connect(source)
-    apply_sde_schema(conn)
-    conn.executemany(
-        "INSERT INTO sde_types (type_id, name, group_id, market_group_id) VALUES (?,?,?,?)",
-        [(34, "Tritanium", 18, 1857), (35, "Pyerite", 18, 1857)])
-    conn.execute("INSERT INTO sde_groups VALUES (18, 'Mineral')")
-    conn.commit()
-    conn.close()
-
-    live = str(tmp_path / "eve_cache.db")
-    conn = sqlite3.connect(live)
-    apply_schema(conn)
-    apply_sde_schema(conn)
-    conn.execute(
-        "INSERT INTO characters (character_id, character_name, refresh_token, added_at) "
-        "VALUES (?,?,?,?)", (95465499, "Astroasia", "a-real-refresh-token", 0.0))
-    conn.execute(
-        "INSERT INTO production_projects (name, created_at, updated_at) VALUES (?,?,?)",
-        ("Raven build", 0.0, 0.0))
-    conn.commit()
-
-    app_module._refresh_sde_from_bundle(conn, source=source, force=True)
-
-    assert conn.execute("SELECT refresh_token FROM characters").fetchall() == [
-        ("a-real-refresh-token",)], "the download took the account with it"
-    assert conn.execute("SELECT name FROM production_projects").fetchall() == [
-        ("Raven build",)]
-    assert conn.execute("SELECT COUNT(*) FROM sde_types").fetchone()[0] == 2, \
-        "static data should have been updated"
-    conn.close()
-
-
-def test_an_explicit_download_applies_even_when_nothing_looks_newer(app_module, tmp_path):
-    """The heuristics exist to skip pointless work at startup, not to overrule
-    someone who has deliberately asked for a fresh copy — which they only do
-    when something is already wrong with the data those heuristics read."""
-    source = str(tmp_path / "same.db")
-    live = str(tmp_path / "live.db")
-    for path in (source, live):
-        conn = sqlite3.connect(path)
-        apply_sde_schema(conn)
-        conn.execute(
-            "INSERT INTO sde_types (type_id, name, group_id) VALUES (34, 'Tritanium', 18)")
-        conn.execute("INSERT INTO sde_groups VALUES (18, 'Mineral')")
-        conn.commit()
-        conn.close()
-
-    conn = sqlite3.connect(live)
-    conn.execute("UPDATE sde_types SET name='corrupted'")
-    conn.commit()
-
-    app_module._refresh_sde_from_bundle(conn, source=source, force=True)
-    assert conn.execute("SELECT name FROM sde_types").fetchone()[0] == "Tritanium"
-    conn.close()
-
-
 def test_the_running_app_rebuilds_what_is_missing(app_module):
     """The claim is about `get_conn()`, so it is asked of `get_conn()` — and
     asked of a database that is actually missing something.
@@ -487,12 +373,14 @@ def test_no_code_path_replaces_the_live_database_file():
     full. The claim being made is about call sites, so it is checked at the
     call sites.
 
-    One path may legitimately install a database file: the fresh-install copy,
-    which only runs when there is no data to lose.
+    Nothing is allowed to do it any more. The fresh-install copy was the last
+    legitimate case, and it went when static data stopped being distributed as
+    a file: the importer writes rows into whatever database it is pointed at,
+    so no code path needs to install one.
     """
     import app.web.main as m
 
-    allowed = {"_startup_populate_groups"}      # the fresh-install copy
+    allowed: set[str] = set()
     source = pathlib.Path(m.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
 
@@ -516,3 +404,49 @@ def test_no_code_path_replaces_the_live_database_file():
         + ". sde_base.db holds static data only, so moving it over eve_cache.db "
           "takes every character, token, price and project with it."
     )
+
+
+def test_the_importer_indexes_what_it_builds():
+    """The index guarantee, now that the bundled file is gone.
+
+    Indexes used to arrive inside `sde_base.db` and get destroyed by the first
+    refresh that dropped a table. Static data now arrives only by running
+    `import_sde.py`, so the importer is the single place that has to get this
+    right — and it does it by calling the same declaration everything else uses.
+    """
+    import import_sde
+
+    assert import_sde.init_db.__module__ == "import_sde"
+    declared = {ix.name for name in SDE_TABLES
+                for ix in metadata.tables[name].indexes}
+    assert declared, "the SDE declares no indexes at all"
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        import_sde.init_db(conn)
+        built = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")}
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+    assert declared <= built, f"importer skipped: {sorted(declared - built)}"
+    assert SDE_TABLES <= tables
+
+
+def test_static_data_is_no_longer_distributed_as_a_file():
+    """`sde_base.db` is a test fixture now, not a runtime source.
+
+    It stays in the repository so the suite is hermetic and needs no network.
+    What changed is that nothing at runtime reads it: the app cannot copy a
+    database into place, so what is in the database is whatever the importer
+    last put there — current by construction rather than as current as the last
+    release.
+    """
+    import app.web.main as m
+
+    source = pathlib.Path(m.__file__).read_text(encoding="utf-8")
+    for gone in ("_bundled_sde_path", "_refresh_sde_from_bundle",
+                 "SDE_DOWNLOAD_URL", "_SDE_TABLES_TO_REFRESH"):
+        assert gone not in source, f"{gone} is still referenced in main.py"

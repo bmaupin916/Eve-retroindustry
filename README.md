@@ -75,11 +75,16 @@ python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\act
 pip install -r requirements.txt
 ```
 
-Import the Static Data Export (SDE) into the local database:
+Import the Static Data Export (SDE) — required, not optional. The app ships no
+game data and cannot calculate anything without it:
 
 ```bash
 python import_sde.py
 ```
+
+It pulls a build-pinned archive straight from CCP, so what you get is current
+rather than as current as the last release. Until it has run, every page
+redirects to a page telling you so.
 
 Run the dev server:
 
