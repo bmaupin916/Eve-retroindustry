@@ -1073,6 +1073,61 @@ alongside the web app on the VPS, with its own restart and secret handling.
 
 ---
 
+### 9.6 Dashboard — from landing page to actual dashboard
+
+Requested 2026-08-17. The dashboard today is character-centric: a card per character with
+corp, wallet, location and skill queue, plus asset value, available cash, PI extractors and
+a prices-updated stamp. It answers *"what do I have?"*. It should also answer **"what should
+I do next?"** — which is what a dashboard is for.
+
+**Widgets to start with** (small, each earning its square):
+
+| Widget | Shows | Data source |
+|---|---|---|
+| Top margins | Best 3–5 rows from the watchlist | `margin_snapshot` |
+| Job status | Running / finishing soon / ready to deliver | `char_industry_jobs_cache` |
+| PI status | Extractors expiring, colonies idle | `_pi_alert_summary()` |
+| Build capacity | Slots used vs configured | jobs + `app_defaults` slots |
+| Market freshness | How stale the prices behind every figure are | `market_price_cache` |
+
+**The pattern to preserve is already there and is the hard part.** `dashboard()` renders
+from cache only and never calls ESI; `/api/dashboard/live` fills the ESI-backed fields
+afterwards. That exists because a slow or rate-limited ESI used to make the whole app look
+frozen. Every widget must therefore have a **cache-only first render**, with anything
+needing ESI arriving in the second phase. A widget that blocks the home page on a fetch
+re-creates precisely the bug this design already solved.
+
+**Widgets read existing read models; they do not invent queries.** Two of the five are
+nearly free today:
+
+* **Top margins must read `margin_snapshot`, not recompute.** `build_view_model` prices the
+  entire watchlist — a full BOM resolve per item — which is acceptable on a page you visit
+  deliberately and *not* acceptable on the home page. The daily snapshot already exists for
+  the Δ and rolling-average columns, and reading the latest row per item is one indexed
+  query. This also makes the widget honest about being a daily reading rather than implying
+  a live figure.
+* **PI status already has `_pi_alert_summary()`**, cache-only, currently feeding the navbar
+  badge. The widget is a second view onto the same call.
+
+**Two things to decide when it is built**, neither urgent:
+
+* **Configurability.** Which widgets, in what order. `app_defaults` is a key/value table
+  chosen precisely so additions do not need a migration, so a stored layout costs nothing.
+  Worth resisting a general-purpose drag-and-drop grid: a fixed set with show/hide is most
+  of the value for a fraction of the work.
+* **Ownership after Step 5.** Every widget is a per-account view, so they must go through
+  the account-scoped query layer like everything else. Cheaper to write them that way than
+  to retrofit — but note this only matters once tenancy exists, so building widgets *before*
+  Step 5 is fine as long as they use the same helpers the rest of the app does.
+
+**Where it lands.** Not blocking anything, and not dependent on the hosted migration —
+these are reads over data the app already holds. Natural home is **Step 7**, but the two
+cheap widgets (top margins, PI status) could ride along earlier if the dashboard is being
+touched anyway. Worth doing after Step 4, though: the sync worker changes when caches are
+filled, and a dashboard built on the current refresh timing may need re-tuning afterwards.
+
+---
+
 ## 10. Cross-cutting decisions
 
 * **Pricing model.** Three input bases (raw / intermediate / output, each buy-or-sell);
