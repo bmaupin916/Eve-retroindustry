@@ -3,6 +3,8 @@ import asyncio
 import time
 from typing import Optional
 
+from app.version import USER_AGENT
+
 ESI_BASE = "https://esi.evetech.net/latest"
 FUZZWORK_BASE = "https://www.fuzzwork.co.uk"
 ESI_HOST = "esi.evetech.net"
@@ -11,6 +13,10 @@ ESI_HOST = "esi.evetech.net"
 # so future breaking changes don't break us. Change the date only on a deliberate switch
 # to newer API behavior. /latest in the URL still works; the header takes precedence.
 ESI_COMPAT_DATE = "2026-07-17"
+
+# USER_AGENT is sent on every request this client makes — including the non-ESI
+# hosts (GitHub, images), where it is harmless. See app/version.py for why CCP
+# cares. This closes finding 7 of the design doc's security baseline.
 
 
 # The connection pool must cover our concurrency (semaphores up to 30), otherwise refresh
@@ -254,7 +260,7 @@ def esi_client(**kwargs) -> httpx.AsyncClient:
     ESI error-limit governor (see _ErrorLimitGovernor). For non-ESI hosts
     (GitHub, images) both header and governor are harmless. Per-request headers
     are merged with the client header; the caller can override limits via kwargs."""
-    headers = {"X-Compatibility-Date": ESI_COMPAT_DATE}
+    headers = {"X-Compatibility-Date": ESI_COMPAT_DATE, "User-Agent": USER_AGENT}
     headers.update(kwargs.pop("headers", None) or {})
     limits = kwargs.pop("limits", _ESI_LIMITS)
     # A custom transport takes over pool sizing, so feed it the limits. Passing

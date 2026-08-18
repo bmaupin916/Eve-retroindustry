@@ -36,15 +36,14 @@ from typing import Callable, Iterator
 
 import httpx
 
+from app.version import user_agent
+
 SDE_BASE = "https://developers.eveonline.com/static-data/tranquility"
 
-# CCP asks for an identifying User-Agent on their services. The app does not set
-# one on ESI yet (that is Step 2's work); there is no reason to repeat the
-# omission in new code.
-USER_AGENT = (
-    "EVE-Retroindustry/import_sde "
-    "(brian.maupin@gmail.com; +https://github.com/EVERetroIndustry/Eve-retroindustry)"
-)
+# CCP asks for an identifying User-Agent on their services. Step 2 gave the whole
+# app one; this tags it with the subsystem so a spike on the SDE feed is
+# distinguishable from ESI traffic in CCP's logs.
+USER_AGENT = user_agent("import_sde")
 
 # The build number is stamped inside every archive, in this dataset. Checking it
 # after download is a better integrity test than a checksum would be: the ETag on

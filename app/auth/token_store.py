@@ -24,6 +24,8 @@ import threading
 import time
 import httpx
 
+from app.version import USER_AGENT
+
 _APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.join(
     os.path.dirname(__file__), "..", ".."
 )
@@ -312,7 +314,8 @@ def get_valid_token(conn: sqlite3.Connection, character_id: int) -> str | None:
                     "refresh_token": refresh,
                     "client_id":     client_id,
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "User-Agent": USER_AGENT},
                 timeout=15,
             )
         except Exception as exc:
