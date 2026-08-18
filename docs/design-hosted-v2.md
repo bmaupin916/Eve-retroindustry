@@ -1140,10 +1140,23 @@ Note the live install still shows no profit-per-m³: the column exists in the sc
 `sde_base.db` predates it, so the value lands only when the SDE is re-imported and the
 bundle rebuilt. The page says so rather than showing a blank column.
 
-**Step 1 — Correctness sprint.** SDE importer to CCP's JSONL feed with build pinning and
-the changes feed; invention + copying activities; `typeMaterials`, `portionSize`,
-`marketGroups`; trading taxes in every profit figure; reactions board if appetite allows.
-Fixes numbers that are wrong today and is needed forever, under any architecture. *(W8)*
+**Step 1 — Correctness sprint. ✅ Done — v0.9.24–v0.9.26.** Every number the tool reports
+changed, and four of them were wrong before:
+
+| Item | Shipped | Was |
+|---|---|---|
+| Trading taxes in every profit figure | v0.9.26 branch, `app/market/taxes.py` | Profit overstated by 4.4–10.5% of sale price |
+| SDE importer on CCP's JSONL feed, build-pinned | v0.9.24 | Deprecated YAML, undeclared PyYAML dep, silently stale |
+| `packaged_volume` (was assembled `volume`) | v0.9.24 | 8.65× wrong on a Nidhoggur |
+| Invention + copying activities | v0.9.25 | Every T2 blueprint free |
+| `typeMaterials`, `portionSize`, `marketGroups` | v0.9.26 | Absent |
+
+Not done, and deliberately: the **reactions board**, which was always conditional ("if
+appetite allows"). It belongs with Step 7's feature buildout now that the data exists.
+
+Two threads recorded in §14 rather than closed: invention is charged at the root only, so
+`/plan` still under-costs T2 components inside a tree; and the market tax rates are still
+unconfirmed against the live game. *(W8, and the SDE half of W10)*
 
 **Step 2 — Security baseline + ESI citizenship.** Session auth (a single SSO-backed
 account is enough — one user), CSRF tokens, Host validation, state check, JWT verification
