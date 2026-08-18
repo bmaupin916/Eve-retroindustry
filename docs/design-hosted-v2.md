@@ -494,6 +494,14 @@ skills — it is what caught both bugs above.
 The base probabilities in the SDE match EVE University's published table exactly, which is
 a useful cross-check but never the source.
 
+⚠️ **Known limitation: invention is charged at the root only.** `compute_margin` applies it
+to the product being priced, so `/margins` is correct. It is **not** wired into
+`BOMResolver`, so a T2 *component* nested inside a larger build tree still resolves with a
+free blueprint — and `/plan` therefore still understates any build containing T2 parts.
+Capital builds are the obvious case. Closing this means adding invention as a per-node cost
+in the resolver, which is the shape §8 originally proposed; it was left out of v0.9.25 to
+keep that commit reviewable, not because it is unnecessary.
+
 ### Invention specifically
 
 `import_sde.py:283` imports only `manufacturing` and `reaction`. So a T2 item resolves its
@@ -1327,7 +1335,10 @@ past the first joiner. Do not.
 5. ~~Does `planetResources` replace the hardcoded matrix in `planet_data.py`?~~ **No — answered 2026-08-18.** `planetResources.jsonl` is 25,798 records keyed by *planet id* carrying `power` and `workforce`: the Equinox sovereignty system, nothing to do with PI extraction. The P0-per-planet-type matrix in `planet_data.py` stays hardcoded.
 6. Reactions board — inside Step 1, or its own step? It is the biggest quick win and the
    most tempting scope creep inside a correctness sprint.
-7. **Verify the market tax rates in game.** `app/market/taxes.py` ships 7.5% sales tax,
+7. **Wire invention into `BOMResolver`.** v0.9.25 charges it at the root only, so `/plan`
+   still treats T2 components inside a tree as having free blueprints. See the limitation
+   note in §8. This is the last known correctness gap from Step 1.
+8. **Verify the market tax rates in game.** `app/market/taxes.py` ships 7.5% sales tax,
    3% NPC broker fee, −11%/level Accounting and −0.3%/level Broker Relations. These come
    from the Version 22.02 patch note and the EVE University *Tax* page, cross-checked
    against the 1% NPC broker floor — but the *Trading* page on the same wiki was found to
