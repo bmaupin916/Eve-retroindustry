@@ -46,6 +46,7 @@
 
 <div class="card mb-3 p-3 plan-form">
   <form method="post" action="/plan" id="plan-form">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <input type="hidden" name="plan_char_id" value="{{ plan_char_id or active_char_id or '' }}">
     <input type="hidden" name="form_industry"     value="{{ form_industry or '0' }}">
     <input type="hidden" name="form_adv_industry" value="{{ form_adv_industry or '0' }}">

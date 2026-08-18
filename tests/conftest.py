@@ -67,6 +67,11 @@ def app_module():
     shutil.copy2(os.path.join(REPO, "sde_base.db"), os.path.join(tmp, "eve_cache.db"))
     os.environ["EVE_APP_DIR"] = tmp
     os.environ["EVE_BUNDLE_DIR"] = REPO
+    # TestClient sends "Host: testserver"; the security gate rejects unknown
+    # hosts, which is the point of it. Tests opt that name in rather than
+    # switching the check off, so the Host path stays exercised.
+    os.environ["EVE_ALLOWED_HOSTS"] = "testserver,localhost,127.0.0.1"
+    os.environ.pop("EVE_OWNER_CHARACTER_ID", None)
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
 
@@ -90,7 +95,42 @@ def app_module():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+# The character conftest logs in as; must match a row created by _seed().
+OWNER_CHARACTER_ID = 900000001
+
+
+def _login(m) -> tuple[str, str]:
+    """Mint a real session for the seeded owner. Returns (session_id, csrf_token).
+
+    Tests authenticate the way the app does rather than bypassing the gate, so
+    the session and CSRF paths are covered by every route test instead of being
+    a hole nothing walks through.
+    """
+    from app.web import security
+
+    conn = m.get_conn()
+    try:
+        security.ensure_sessions_table(conn)
+        security.claim_owner(conn, OWNER_CHARACTER_ID)
+        return security.create_session(conn, OWNER_CHARACTER_ID)
+    finally:
+        conn.close()
+
+
 @pytest.fixture(scope="session")
 def client(app_module):
+    from fastapi.testclient import TestClient
+    from app.web import security
+
+    session_id, csrf_token = _login(app_module)
+    c = TestClient(app_module.app)
+    c.cookies.set(security.SESSION_COOKIE, session_id)
+    c.headers.update({security.CSRF_HEADER: csrf_token})
+    return c
+
+
+@pytest.fixture(scope="session")
+def anon_client(app_module):
+    """A client with no session — for asserting the gate actually refuses."""
     from fastapi.testclient import TestClient
     return TestClient(app_module.app)

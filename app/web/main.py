@@ -1,7 +1,9 @@
 """FastAPI web application for EVE Retroindustry."""
 from __future__ import annotations
 
-APP_VERSION = "0.9.26"
+from app.version import APP_VERSION  # single source of truth (app/version.py)
+from app.web import security
+from app.web.security import ensure_sessions_table
 
 import asyncio
 import datetime
@@ -200,23 +202,111 @@ if STATIC_DIR.is_dir():
 templates.env.globals["IS_ANDROID"] = bool(os.environ.get("EVE_ANDROID"))
 
 
+# Set EVE_DEBUG_ERRORS=1 to put the traceback back in the HTTP response. Off by
+# default: hosted, the response body goes to whoever made the request, and these
+# tracebacks carry absolute filesystem paths, SQL and local variable values. The
+# server log keeps the full detail either way, which is where it was actually
+# useful for debugging console=False desktop bundles. (Baseline finding 6.)
+_DEBUG_ERRORS = bool(os.environ.get("EVE_DEBUG_ERRORS"))
+
+
 @app.exception_handler(Exception)
 async def _log_unhandled(request: Request, exc: Exception):
-    """Log every uncaught exception with traceback so console=False bundles can be debugged."""
+    """Log every uncaught exception with its traceback; return an opaque 500."""
     import traceback
     from fastapi.responses import PlainTextResponse
     tb = traceback.format_exc()
     print(f"[error] {request.method} {request.url.path} -> {type(exc).__name__}: {exc}\n{tb}",
           flush=True)
-    return PlainTextResponse(f"Internal Server Error\n\n{type(exc).__name__}: {exc}\n\n{tb}",
-                             status_code=500)
+    if _DEBUG_ERRORS:
+        return PlainTextResponse(f"Internal Server Error\n\n{type(exc).__name__}: {exc}\n\n{tb}",
+                                 status_code=500)
+    return PlainTextResponse("Internal Server Error", status_code=500)
 
 
 @app.middleware("http")
 async def _setup_gate(request: Request, call_next):
-    """Redirect every request to /setup until SDE data is available."""
-    if not _SDE_READY[0] and not request.url.path.startswith("/setup"):
+    """Redirect every request to /setup until SDE data is available.
+
+    Public auth paths are exempt, or a fresh install deadlocks: /setup needs a
+    session, and getting a session needs /auth/login, which this would bounce
+    back to /setup.
+    """
+    path = request.url.path
+    if not _SDE_READY[0] and not path.startswith("/setup")             and not security.is_public_path(path):
         return RedirectResponse("/setup")
+    return await call_next(request)
+
+
+def _wants_html(request: Request) -> bool:
+    return "text/html" in request.headers.get("accept", "")
+
+
+def _deny(request: Request, status: int, message: str):
+    """Refuse a request the way its caller can understand."""
+    from fastapi.responses import JSONResponse, PlainTextResponse
+
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"ok": False, "error": message}, status_code=status)
+    if status == 401 and _wants_html(request):
+        return RedirectResponse("/auth/login", status_code=303)
+    return PlainTextResponse(message, status_code=status)
+
+
+# Registered after _setup_gate, so it runs *before* it: Starlette wraps each new
+# middleware around the previous one. Host and identity are checked before the
+# app decides whether it has data to show.
+@app.middleware("http")
+async def _security_gate(request: Request, call_next):
+    """Host validation, session authentication and CSRF, in that order.
+
+    Baseline findings 1 and 2. The three belong together because each depends on
+    the one before: a Host check makes the origin trustworthy, a session makes
+    the caller known, and the CSRF token is bound to that session.
+    """
+    # 1. Host. Rejecting an unexpected Host is what actually stops DNS
+    #    rebinding — the browser will happily send our own cookies to a name
+    #    the attacker controls that resolves to loopback, and only the Host
+    #    header distinguishes that from a real visit.
+    if not security.host_is_allowed(request.headers.get("host")):
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("Bad Host header", status_code=400)
+
+    path = request.url.path
+    if security.is_public_path(path):
+        return await call_next(request)
+
+    conn = get_conn()
+    try:
+        session = security.load_session(conn, request.cookies.get(security.SESSION_COOKIE))
+    finally:
+        conn.close()
+
+    if session is None:
+        return _deny(request, 401, "Not authenticated")
+
+    # 2. CSRF on anything that changes state. The token lives in the session and
+    #    arrives either as a header (the fetch wrapper in base.html) or as a form
+    #    field (the server-rendered forms). A session cookie alone is not enough,
+    #    which is the entire point.
+    if request.method in security._UNSAFE_METHODS:
+        form_token = None
+        content_type = request.headers.get("content-type", "")
+        if content_type.startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
+            # body() before form(): reading the body here would otherwise leave
+            # the route with an exhausted stream and every form POST failing 422.
+            # Starlette's BaseHTTPMiddleware replays a cached `_body` downstream,
+            # but only when body() was the thing that consumed it — form() alone
+            # marks the stream consumed without caching anything to replay.
+            await request.body()
+            form = await request.form()
+            form_token = form.get(security.CSRF_FIELD)
+        if not security.csrf_ok(session["csrf_token"],
+                                request.headers.get(security.CSRF_HEADER),
+                                form_token):
+            return _deny(request, 403, "CSRF token missing or invalid")
+
+    request.state.session = session
     return await call_next(request)
 
 
@@ -538,6 +628,10 @@ def _tr(name: str, request: Request, context: dict) -> HTMLResponse:
     context.setdefault("character", active)
     context.setdefault("all_characters", all_chars)
     context.setdefault("active_char_id", active[0] if active else None)
+    # Every rendered page carries the session's CSRF token, so base.html can put
+    # it in a <meta> for the fetch wrapper and forms can put it in a hidden field.
+    session = getattr(request.state, "session", None)
+    context.setdefault("csrf_token", session["csrf_token"] if session else "")
     return templates.TemplateResponse(request, name, context)
 
 
@@ -632,6 +726,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_industry_tables(conn)
     ensure_project_tables(conn)
     ensure_characters_table(conn)
+    ensure_sessions_table(conn)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sde_groups (
             group_id INTEGER PRIMARY KEY,
@@ -1270,16 +1365,61 @@ async def _bg_initial_sync():
 
 @app.get("/auth/sync", response_class=HTMLResponse)
 async def auth_sync(request: Request):
+    """Land here after SSO. Redeems the pending login for a session cookie.
+
+    Public, because the caller cannot have a session yet — that is what it is
+    here to hand out. The login ticket is what makes that safe: it exists only
+    between a successful token exchange and the first request that redeems it,
+    it is single-use, and it expires in five minutes.
+    """
+    from app.auth.esi_oauth import consume_login_ticket
+
     conn = get_conn()
     try:
         if not has_any_character(conn):
             return RedirectResponse("/")
+
+        session = security.load_session(conn, request.cookies.get(security.SESSION_COOKIE))
+        new_session_id = None
+
+        if session is None:
+            character_id = consume_login_ticket()
+            if character_id is None:
+                # No session and nothing to redeem — an old tab, a refresh, or
+                # somebody guessing the URL. None of them get a session.
+                return RedirectResponse("/auth/login")
+            if not security.may_sign_in(conn, character_id):
+                owner = security.get_owner_id(conn)
+                print(f"[auth] refused session for character {character_id}: this "
+                      f"instance belongs to {owner}", flush=True)
+                return _deny(request, 403, "This instance belongs to another character.")
+            new_session_id, _ = security.create_session(conn, character_id)
     finally:
         conn.close()
+
     if not _sync_state["running"] and not _sync_state["done"]:
         _sync_reset()
         asyncio.create_task(_bg_initial_sync())
-    return _tr("sync.html", request, {})
+
+    resp = _tr("sync.html", request, {})
+    if new_session_id:
+        security.set_session_cookie(resp, new_session_id)
+    return resp
+
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request):
+    """Drop this session. The character's ESI tokens are untouched."""
+    from fastapi.responses import JSONResponse
+
+    conn = get_conn()
+    try:
+        security.delete_session(conn, request.cookies.get(security.SESSION_COOKIE))
+    finally:
+        conn.close()
+    resp = JSONResponse({"ok": True})
+    security.clear_session_cookie(resp)
+    return resp
 
 
 @app.get("/api/sync-status")

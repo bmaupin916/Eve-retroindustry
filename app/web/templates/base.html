@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}EVE Retroindustry{% endblock %}</title>
+  <meta name="csrf-token" content="{{ csrf_token }}">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='3' fill='%230d1117'/%3E%3Cpolygon points='16,2 29,9.5 29,22.5 16,30 3,22.5 3,9.5' fill='none' stroke='%23e3b341' stroke-width='1.5'/%3E%3Crect x='10' y='11' width='4' height='11' fill='%23e3b341'/%3E%3Crect x='19' y='14' width='4' height='8' fill='%23e3b341'/%3E%3Crect x='6' y='20' width='20' height='7' fill='%23e3b341'/%3E%3Crect x='13' y='22' width='6' height='5' fill='%230d1117'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/bootstrap.min.css">
   <link rel="stylesheet" href="/static/bootstrap-icons.min.css">
@@ -199,6 +200,34 @@ window.escHtml = function (s) {
 };
 </script>
 </head>
+<script>
+// Attach the CSRF token to every same-origin state-changing fetch.
+//
+// Wrapping fetch once here is what keeps the ~20 fetch call sites across these
+// templates unchanged: none of them has to know CSRF exists. Same-origin only,
+// so the token is never attached to a request leaving this app, and an explicit
+// header on the call site still wins.
+(function () {
+  var meta = document.querySelector('meta[name="csrf-token"]');
+  var token = meta ? meta.getAttribute('content') : '';
+  if (!token) return;
+  var SAFE = { GET: 1, HEAD: 1, OPTIONS: 1, TRACE: 1 };
+  var native = window.fetch;
+  window.fetch = function (input, init) {
+    init = init || {};
+    var method = (init.method || (input && input.method) || 'GET').toUpperCase();
+    var url = typeof input === 'string' ? input : (input && input.url) || '';
+    var sameOrigin = !/^https?:\/\//i.test(url) ||
+                     url.indexOf(window.location.origin) === 0;
+    if (!SAFE[method] && sameOrigin) {
+      var headers = new Headers(init.headers || (input && input.headers) || {});
+      if (!headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', token);
+      init = Object.assign({}, init, { headers: headers });
+    }
+    return native.call(this, input, init);
+  };
+})();
+</script>
 <body>
 <div id="app-progress" aria-hidden="true"></div>
 <nav class="navbar navbar-expand-lg navbar-dark sticky-top" style="background:#0f141b; border-bottom:1px solid var(--eve-border);">

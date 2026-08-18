@@ -51,6 +51,7 @@
 <div class="card mb-3">
   <div class="card-body py-3">
     <form method="post" action="/margins/add" class="row g-2 align-items-end">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <div class="col-12 col-lg-5" style="position:relative">
         <label class="form-label mb-1"><i class="bi bi-box me-1"></i>Product</label>
         <input type="text" name="product" id="mg-product" class="form-control form-control-sm"
@@ -80,7 +81,7 @@
         {% endif %}
       </div>
     </form>
-    <form id="mg-clear" method="post" action="/margins/clear" class="d-none"></form>
+    <form id="mg-clear" method="post" action="/margins/clear" class="d-none"><input type="hidden" name="_csrf" value="{{ csrf_token }}"></form>
   </div>
 </div>
 
@@ -182,6 +183,7 @@
           </td>
           <td class="text-end">
             <form method="post" action="/margins/remove" class="d-inline">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
               <input type="hidden" name="item_id" value="{{ e.item_id }}">
               <button class="btn btn-sm btn-link text-danger p-0" title="Stop tracking"
                       style="font-size:.8rem"><i class="bi bi-x-lg"></i></button>
