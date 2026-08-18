@@ -14,7 +14,10 @@ could not price and the UI marks it rather than showing a confident wrong number
 
 The model is a full build: buy the raw leaves at market, run every job in the
 tree yourself, manufacturing jobs at the build station and reactions at the
-reaction station, each with its own system cost index and tax.
+reaction station, each with its own system cost index and tax — and then *sell*
+it, which is not free. Sales tax and broker's fee come off the top via
+`app.market.taxes`; between 4.4% and 10.5% of the sale price never reaches the
+wallet, which on a thin margin is the entire margin.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ import sqlite3
 
 from app.bom.resolver import BOMResolver, StationFacility
 from app.manufacturing.planner import calc_job_time
+from app.market.taxes import selling_costs
 
 # Sales tax component of the official job-cost formula:
 #   fee = EIV × (SCI × (1 − structure bonus) + facility tax + SCC)
@@ -44,7 +48,12 @@ class MarginRow:
     sell_price: float | None = None       # per unit
     material_cost: float = 0.0            # per unit
     job_fee: float = 0.0                  # per unit
-    profit: float | None = None           # per unit
+    # What selling costs, per unit: sales tax always, broker's fee only when
+    # listing an order. Held apart from `profit` so the UI can show why the
+    # number is lower than the naive sell-minus-cost figure.
+    selling_cost: float = 0.0             # per unit
+    selling_cost_pct: float = 0.0         # % of sell price
+    profit: float | None = None           # per unit, net of everything
     margin_pct: float | None = None
     volume_m3: float | None = None        # packaged volume of one unit
     profit_per_m3: float | None = None
@@ -276,7 +285,10 @@ def compute_margin(
         if sell is None:
             row.unpriced.append(row.name)
         else:
-            row.profit = sell - row.material_cost - row.job_fee
+            costs = selling_costs(defaults)
+            row.selling_cost = costs.on(sell)
+            row.selling_cost_pct = costs.pct
+            row.profit = sell - row.material_cost - row.job_fee - row.selling_cost
             row.margin_pct = (row.profit / sell * 100) if sell else None
             if row.volume_m3:
                 row.profit_per_m3 = row.profit / row.volume_m3

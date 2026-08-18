@@ -45,6 +45,7 @@ from app.character import planets as planets_api
 from app.web import contracts_helper
 from app.web import pi_planner_helper
 from app.web import app_defaults
+from app.market.taxes import selling_costs
 from app.web import margins_helper
 from app.character.assets import (
     fetch_assets, ensure_assets_table, assets_at_location,
@@ -2470,10 +2471,17 @@ async def plan_result(
         buy_cost = plan_data.get("total_buy") or 0.0
         rev = plan_data.get("revenue")
 
-        # Market profit: revenue − all materials at market price − job fee
-        profit_market = (rev - full_mat_cost - total_job_fee) if rev is not None else None
-        # Profit with stock: revenue − only missing materials − job fee
-        profit_stock  = (rev - buy_cost - total_job_fee) if rev is not None else None
+        # Selling is not free: sales tax always, broker's fee when listing an
+        # order. Between 4.4% and 10.5% of revenue, which on a thin margin is
+        # the whole margin — so it comes off both profit figures, not just the
+        # headline one.
+        _sell_costs = selling_costs(_plan_defaults)
+        selling_cost = _sell_costs.on(rev) if rev is not None else 0.0
+
+        # Market profit: revenue − all materials at market price − job fee − selling
+        profit_market = (rev - full_mat_cost - total_job_fee - selling_cost) if rev is not None else None
+        # Profit with stock: revenue − only missing materials − job fee − selling
+        profit_stock  = (rev - buy_cost - total_job_fee - selling_cost) if rev is not None else None
 
         total_time_s = total_mfg_time_s + total_rxn_time_s
         plan_data["fees"] = {
@@ -2496,6 +2504,11 @@ async def plan_result(
             "mfg_me_pct":          round((1 - mfg_me_mult) * 100, 2),
             "rxn_me_pct":          round((1 - rxn_me_mult) * 100, 2) if sep_rxn_station else None,
             "full_mat_cost":       full_mat_cost,
+            "selling_cost":        selling_cost,
+            "selling_cost_pct":    _sell_costs.pct,
+            "sales_tax_pct":       _sell_costs.sales_tax * 100,
+            "broker_fee_pct":      _sell_costs.broker_fee * 100,
+            "sales_method":        _sell_costs.method,
             "profit_market":       profit_market,
             "profit_stock":        profit_stock,
         }

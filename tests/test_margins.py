@@ -73,9 +73,13 @@ def test_profit_is_sell_minus_materials_and_fees(db):
     assert row.unpriced == []
     assert row.sell_price == 500_000_000.0
     assert row.material_cost > 0
-    # profit = sell − materials − fees, and margin is that over the sell price.
+    # profit = sell − materials − job fee − what selling costs.
     assert row.profit == pytest.approx(
-        row.sell_price - row.material_cost - row.job_fee)
+        row.sell_price - row.material_cost - row.job_fee - row.selling_cost)
+    # An unconfigured install assumes untrained skills and no standings, which
+    # is the *pessimistic* end: 7.5% sales tax + 3% broker fee on a listed order.
+    assert row.selling_cost_pct == pytest.approx(10.5)
+    assert row.selling_cost == pytest.approx(row.sell_price * 0.105)
     assert row.margin_pct == pytest.approx(row.profit / row.sell_price * 100)
     assert row.build_seconds > 0
     assert row.profit_per_hour == pytest.approx(

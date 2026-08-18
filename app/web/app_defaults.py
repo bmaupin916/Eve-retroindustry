@@ -45,6 +45,26 @@ DEFAULTS: dict[str, tuple[object, type]] = {
     # with 10 capital-capable means at most 10 concurrent capital jobs out of
     # those 20 — not 30 slots.
     "capital_slots":         (0, int),
+
+    # ── Selling costs ────────────────────────────────────────────────────
+    # Between 4.4% and 10.5% of the sale price never reaches your wallet. See
+    # app/market/taxes.py. Defaults are the *pessimistic* end — untrained
+    # skills, no standings — so an unconfigured install understates profit
+    # rather than overstating it. Every other default here follows the same
+    # rule, because a tool that flatters you is worse than one that does not.
+    #
+    # "orders"    — you list a sell order: broker fee AND sales tax
+    # "immediate" — you sell into existing buy orders: sales tax only
+    "sales_method":          ("orders", str),
+    "accounting_skill":      (0, int),      # −11% of the sales tax base per level
+    "broker_relations_skill": (0, int),     # −0.3% broker fee per level
+    # Where you list. NPC stations take skills and standings into account;
+    # Upwell structures charge a flat SCC surcharge plus the owner's cut and
+    # ignore skills entirely.
+    "sell_venue":            ("npc", str),  # "npc" | "upwell"
+    "faction_standing":      (0.0, float),  # −0.03% broker fee per point
+    "corp_standing":         (0.0, float),  # −0.02% broker fee per point
+    "structure_broker_pct":  (0.0, float),  # owner-set %, Upwell only
 }
 
 

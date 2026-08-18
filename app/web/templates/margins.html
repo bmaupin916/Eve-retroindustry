@@ -151,7 +151,8 @@
           <td class="text-end mg-num">{{ r.me }}</td>
           <td class="text-end mg-num">{{ r.te }}</td>
           <td class="text-end mg-num">{{ r.sell_price | isk0 if r.sell_price else '—' }}</td>
-          <td class="text-end mg-num {{ 'text-profit' if r.profit and r.profit > 0 else 'text-loss' if r.profit else '' }}">
+          <td class="text-end mg-num {{ 'text-profit' if r.profit and r.profit > 0 else 'text-loss' if r.profit else '' }}"
+              {% if r.profit is not none %}title="{{ r.sell_price | isk0 }} sell &minus; {{ r.material_cost | isk0 }} materials &minus; {{ r.job_fee | isk0 }} job fee &minus; {{ r.selling_cost | isk0 }} selling ({{ '%.2f' % r.selling_cost_pct }}%)"{% endif %}>
             {{ r.profit | isk0 if r.profit is not none else '—' }}
           </td>
           <td class="text-end mg-num {{ 'text-profit' if r.margin_pct and r.margin_pct > 0 else 'text-loss' if r.margin_pct is not none else '' }}">
@@ -199,6 +200,17 @@
       Re-run the SDE import to add it.
     </div>
     {% endif %}
+    <div class="mb-1">
+      <i class="bi bi-percent me-1"></i>
+      Selling costs <strong>{{ '%.2f' % selling.pct }}%</strong> of the sale price
+      ({{ '%.2f' % (selling.sales_tax * 100) }}% sales tax{% if selling.broker_fee %}
+      + {{ '%.2f' % (selling.broker_fee * 100) }}% broker's fee{% endif %}), already
+      deducted from every profit figure above.
+      {%- if selling.method == 'immediate' %}
+      You sell into buy orders, so no broker's fee applies.
+      {%- endif %}
+      <a href="/settings" class="text-decoration-none">Change</a>.
+    </div>
     <div>
       Cost is the full build: raw materials at market plus every job fee down the tree,
       manufacturing at your build station and reactions at your reaction station.

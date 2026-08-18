@@ -462,8 +462,9 @@ function switchPlanChar(charId) {
 
 {# ──── Financial summary ──── #}
 {% if result.total_buy is not none %}
-{% set mfg_total_cost  = full_cost + (result.fees.total_job_fee if result.fees else 0) %}
-{% set stock_total_cost = (result.total_buy or 0) + (result.fees.total_job_fee if result.fees else 0) %}
+{% set selling_cost = result.fees.selling_cost if result.fees else 0 %}
+{% set mfg_total_cost  = full_cost + (result.fees.total_job_fee if result.fees else 0) + selling_cost %}
+{% set stock_total_cost = (result.total_buy or 0) + (result.fees.total_job_fee if result.fees else 0) + selling_cost %}
 {% set m_profit = result.fees.profit_market if result.fees else ((result.revenue - full_cost) if result.revenue is not none else none) %}
 {% set s_profit = result.fees.profit_stock  if result.fees else result.profit %}
 <div class="card mb-3" style="overflow:hidden">
@@ -547,6 +548,14 @@ function switchPlanChar(charId) {
           <td class="text-muted">Job installation fee</td>
           <td class="text-end" style="color:#e3b341">{{ result.fees.total_job_fee | isk }}</td>
         </tr>
+        <tr>
+          <td class="text-muted"
+              title="{{ '%.2f' % result.fees.sales_tax_pct }}% sales tax{% if result.fees.broker_fee_pct %} + {{ '%.2f' % result.fees.broker_fee_pct }}% broker's fee{% endif %}{% if result.fees.sales_method == 'immediate' %} (selling into buy orders, so no broker's fee){% endif %}. Set in Settings.">
+            Selling costs
+            <span style="font-size:.72rem;opacity:.7">({{ '%.2f' % result.fees.selling_cost_pct }}%)</span>
+          </td>
+          <td class="text-end" style="color:#e3b341">{{ result.fees.selling_cost | isk }}</td>
+        </tr>
         {% endif %}
         <tr style="border-top:1px solid #21262d">
           <td class="text-muted pt-2">Total costs</td>
@@ -590,6 +599,14 @@ function switchPlanChar(charId) {
         <tr>
           <td class="text-muted">Job installation fee</td>
           <td class="text-end" style="color:#e3b341">{{ result.fees.total_job_fee | isk }}</td>
+        </tr>
+        <tr>
+          <td class="text-muted"
+              title="{{ '%.2f' % result.fees.sales_tax_pct }}% sales tax{% if result.fees.broker_fee_pct %} + {{ '%.2f' % result.fees.broker_fee_pct }}% broker's fee{% endif %}{% if result.fees.sales_method == 'immediate' %} (selling into buy orders, so no broker's fee){% endif %}. Set in Settings.">
+            Selling costs
+            <span style="font-size:.72rem;opacity:.7">({{ '%.2f' % result.fees.selling_cost_pct }}%)</span>
+          </td>
+          <td class="text-end" style="color:#e3b341">{{ result.fees.selling_cost | isk }}</td>
         </tr>
         {% endif %}
         <tr style="border-top:1px solid #21262d">

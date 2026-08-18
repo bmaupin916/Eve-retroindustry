@@ -488,8 +488,19 @@ journal *labels* (`app/character/wallet.py:150-151`). Per EVE University's Tradi
 * **Broker's fee** in NPC stations is `3% − 0.3%×BrokerRelations − 0.03%×faction standing
   − 0.02%×corp standing`; in Upwell structures it is a flat `0.5% SCC surcharge + owner %`
   and **skills do not apply**.
-* A station trader with zero standings pays **between 5.1% (max skills) and 11%** of order
-  price in fees and taxes; 4.6% with max skills and max standings.
+* A seller pays **10.5%** of sale price at zero skills, **4.875%** at Accounting V +
+  Broker Relations V, and **4.375%** with max standings on top.
+
+  ⚠️ **Corrected 2026-08-18.** This bullet previously read "between 5.1% (max skills) and
+  11%; 4.6% with max standings", quoting the Trading page's prose. Those figures are stale
+  and contradict the sales-tax formula printed on the *same* page — they only resolve at a
+  **8%** base, not the current 7.5%. Verified against the Version 22.02 patch note
+  (2025-03-12, "Sales Tax has been increased from 4% to 7.5%") and the EVE Uni *Tax* page.
+  The decisive cross-check is the broker floor: the wiki states 1% minimum at Broker
+  Relations V with max faction and corp standings, and `3 − 1.5 − 0.3 − 0.2 = 1.0` exactly,
+  which confirms the per-level and per-standing coefficients independently. Implemented in
+  `app/market/taxes.py`; treat the wiki's *formulas* as authoritative and its *worked
+  totals* as suspect.
 
 So **every margin, profit, ISK/hour and profit-per-m³ figure in the app is currently
 overstated by roughly 5–11% of the sale price.** That is broader than the invention gap —

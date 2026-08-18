@@ -22,6 +22,7 @@ import sqlite3
 
 from app.manufacturing.margins import MarginRow, compute_margin, _station_context
 from app.web.app_defaults import get_defaults, is_configured
+from app.market.taxes import selling_costs
 
 # Days of history behind the rolling average.
 AVG_WINDOW_DAYS = 7
@@ -171,6 +172,9 @@ def build_view_model(conn: sqlite3.Connection, db_path: str,
         "volume_supported": _volume_column_present(conn),
         "sci_cached": True,
         "any_unpriced": False,
+        # What selling costs under the current settings. Shown in the footer so
+        # the deduction is visible rather than buried in each row's profit.
+        "selling": selling_costs(defaults),
     }
     if not items:
         return view
