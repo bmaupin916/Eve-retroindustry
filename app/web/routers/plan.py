@@ -524,19 +524,26 @@ async def plan_result(
         # job splits. Skipped entirely when splitting is off (the default), so
         # an unconfigured install pays nothing for it.
         from app.db.conn import connect as _connect, connect_to_path
-        sde_conn = connect_to_path(database_path())       # for the converted BOMResolver
-        # Read once, into a plain dict, and close. The defaults are wanted as
-        # data in three places further down; holding a pooled connection open
-        # across all of them would leak one per plan run on any path that
-        # raises. Not `sde_conn` either: that one is pinned to the SQLite file
-        # by path, and the defaults belong to the configured database.
-        with _connect() as _dc:
-            _plan_defaults_all = app_defaults.get_defaults(_dc)
-        _max_job_days = float(_plan_defaults_all.get("max_job_days") or 0)
-        _job_splits: dict[int, int] = {}
-        if _max_job_days > 0:
-            probe = BOMResolver(sde_conn, blueprints=blueprints, runs_per_job=rpj_int)
-            try:
+        # `with`, not a bare open/close: every call between here and the
+        # end of the block can raise — an unknown type, a blueprint with no
+        # product, a split that divides by a zero job time — and each of
+        # those paths used to skip the `close()` that sat at the bottom.
+        # NullPool means one fresh sqlite3 handle per call, so the leak was
+        # a file handle per failed plan run, held until the process exited.
+        # Nothing below the block needs it open: rows leave BOMResolver as
+        # plain dicts, and the defaults were already read into one.
+        with connect_to_path(database_path()) as sde_conn:   # the converted BOMResolver
+            # Read once, into a plain dict, and close. The defaults are wanted as
+            # data in three places further down; holding a pooled connection open
+            # across all of them would leak one per plan run on any path that
+            # raises. Not `sde_conn` either: that one is pinned to the SQLite file
+            # by path, and the defaults belong to the configured database.
+            with _connect() as _dc:
+                _plan_defaults_all = app_defaults.get_defaults(_dc)
+            _max_job_days = float(_plan_defaults_all.get("max_job_days") or 0)
+            _job_splits: dict[int, int] = {}
+            if _max_job_days > 0:
+                probe = BOMResolver(sde_conn, blueprints=blueprints, runs_per_job=rpj_int)
                 _job_splits = _derive_job_splits(
                     conn,
                     probe.resolve(type_id, qty, me=me, mfg_facility=mfg_facility,
@@ -546,32 +553,29 @@ async def plan_result(
                     mfg_facility=mfg_facility, rxn_facility=rxn_facility,
                     char_skills=char_skills,
                 )
-            finally:
-                pass
 
-        # Invention: a T2 item needs an invented BPC, and until v0.9.29 this page
-        # charged nothing for it — not on nested components and not even on the
-        # product itself, since only the margin tracker ever called that code.
-        # Same builder the tracker uses, so the two pages price datacores alike.
-        # `margins` is converted; this router is not. It gets the SQLAlchemy
-        # connection already open for the resolver, and the defaults come from
-        # the engine connection opened above. All three are the same database.
-        inv_params, inv_warnings = build_invention_params(
-            sde_conn, _plan_defaults_all, input_basis, database_path())
+            # Invention: a T2 item needs an invented BPC, and until v0.9.29 this page
+            # charged nothing for it — not on nested components and not even on the
+            # product itself, since only the margin tracker ever called that code.
+            # Same builder the tracker uses, so the two pages price datacores alike.
+            # `margins` is converted; this router is not. It gets the SQLAlchemy
+            # connection already open for the resolver, and the defaults come from
+            # the engine connection opened above. All three are the same database.
+            inv_params, inv_warnings = build_invention_params(
+                sde_conn, _plan_defaults_all, input_basis, database_path())
 
-        # Pass 2 — the real resolve, with the splits applied. ME rounds once per
-        # job, so the splits reach the material totals here and in build_plan
-        # below; both resolutions must use them or the two views disagree.
-        # The resolver gets all of the character's blueprints → per-product ME is
-        # looked up for each intermediate step (Capital Armor Plates ME may differ from root ME).
-        resolver = BOMResolver(sde_conn, blueprints=blueprints, runs_per_job=rpj_int,
-                               adjusted_prices=adj_prices, rate_mfg=rate_mfg, rate_rxn=rate_rxn,
-                               runs_per_job_by_product=_job_splits,
-                               invention=inv_params)
-        root = resolver.resolve(type_id, qty, me=me,
-                                mfg_facility=mfg_facility,
-                                rxn_facility=rxn_facility)
-        sde_conn.close()
+            # Pass 2 — the real resolve, with the splits applied. ME rounds once per
+            # job, so the splits reach the material totals here and in build_plan
+            # below; both resolutions must use them or the two views disagree.
+            # The resolver gets all of the character's blueprints → per-product ME is
+            # looked up for each intermediate step (Capital Armor Plates ME may differ from root ME).
+            resolver = BOMResolver(sde_conn, blueprints=blueprints, runs_per_job=rpj_int,
+                                   adjusted_prices=adj_prices, rate_mfg=rate_mfg, rate_rxn=rate_rxn,
+                                   runs_per_job_by_product=_job_splits,
+                                   invention=inv_params)
+            root = resolver.resolve(type_id, qty, me=me,
+                                    mfg_facility=mfg_facility,
+                                    rxn_facility=rxn_facility)
 
         all_ids = list(set(_collect_type_ids(root) + [type_id]))
         prices = await get_prices_for_ids(conn, all_ids)
