@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.53. **734 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.54. **736 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -99,7 +99,7 @@ it turns up as soon as something low in the stack is converted. `app_defaults`
 is called from `auth.py` and `plan.py`, neither of which is converted. Those
 call sites open their own connection from the engine — `with connect() as c` —
 rather than the whole router being dragged along; `auth.py` was already doing
-exactly that for `invention.list_decryptors`. Two rules learned doing it:
+exactly that for `invention.list_decryptors`. Three rules learned doing it:
 
 * **Read into a plain dict and close.** `plan_result` wants the defaults in
   three places. Holding the connection open across all three leaks one per plan
@@ -110,6 +110,16 @@ exactly that for `invention.list_decryptors`. Two rules learned doing it:
   `connect_to_path(database_path())`. Reusing it would have worked today and
   read the defaults out of the SQLite *file* rather than the configured
   database, which is wrong the moment `EVE_DATABASE_URL` is set.
+* **When a leak rule gets written down, grep the same function for every other
+  connection.** The first bullet was written in v0.9.48 about the defaults.
+  Four lines below where it landed, `sde_conn = connect_to_path(database_path())`
+  had the identical flaw and had had it for far longer: opened, used across
+  `_derive_job_splits`, `build_invention_params` and two `resolve` calls that
+  all raise on bad input, then closed by a bare `sde_conn.close()` at the
+  bottom with no `try`/`finally`. `plan_result` held two connections and only
+  one of them got the lesson. Fixed in v0.9.54 with a `with` block, which the
+  resolver allows: it documents its connection as borrowed rather than owned,
+  and rows leave it as plain dicts, so nothing below the block needs it open.
 Passing the SQLAlchemy connection instead fails with
 `'str' object has no attribute '_execute_on_connection'` from deep inside
 SQLAlchemy, which reads like a query bug rather than a boundary crossing.
@@ -133,6 +143,22 @@ next module is the same until shown otherwise.
   first use and rolls it back on close; `sqlite3`'s default isolation mode
   commits some statements for you. A call site moved without its commit loses
   writes *silently*. This is the one that will cost a debugging session.
+* **A leaked connection inside a route handler has no symptom.** `plan_result`
+  wraps its body in `except Exception` and renders the message into the page's
+  error banner, so a request that leaked a handle is a **200 with a polite red
+  box** — nothing in the response, the logs or the tests goes red. And
+  `connect_to_path` builds its engine with `NullPool`, so each call is a fresh
+  sqlite3 handle rather than one going back to a pool: the leak is a real file
+  handle per failed request, held until the process exits. Assume every
+  `except Exception` route handler is hiding one until checked.
+* **Test connection lifetime by spying, not by inspecting.** Monkeypatch
+  `app.db.conn.connect_to_path` to record what it hands out, drive the route,
+  then assert every recorded connection has `.closed`. Patching the source
+  module is enough because the routers import it *inside* the handler, so the
+  import runs per request. `tests/test_plan_connection_lifetime.py` is the
+  worked example. Pin the happy path as well as the raising one — the old code
+  closed correctly on success, so a raise-only test is also satisfied by
+  moving the close into an `except`, which is not the fix.
 * **`IN ({ph})`** — several sites build placeholder strings by hand
   (`",".join("?" * len(ids))`). Named binds want SQLAlchemy's
   `bindparam(..., expanding=True)`, not string building.
@@ -329,6 +355,17 @@ session cost 25 minutes between them. Most of the 71 told us nothing.
 
 * **Step 3 is still not deployed.** All of this plumbing is being built ahead of
   the hosted tool it is plumbing for, which inverts the order §11 argues for.
+* **`app/manufacturing/planner.py` still leaks the same way `plan_result` did.**
+  `build_plan` opens two connections at lines 210–212 — `connect_to_path(db_path)`
+  and a raw `sqlite3.connect(db_path)` — and closes both twenty lines later with
+  no `try`/`finally`. `find_blueprint_for_product()` and `resolver.resolve()`
+  both sit in that span and both raise on bad input, and `build_plan` is called
+  from the same `except Exception` handler, so it leaks **two** handles per
+  failed plan with no symptom. Left alone deliberately in v0.9.54 to keep that
+  commit to one file. The trap when fixing it: `sqlite3.Connection` as a context
+  manager commits or rolls back and does **not** close, so it needs
+  `contextlib.closing(...)`, not a bare `with`. `pi_planner_helper.py` was
+  checked at the same time and is already correct — it has a real `try`/`finally`.
 * **Open question 8** — verify sales tax and broker's fee in game against the
   wallet journal. Only you can do this one.
 * **The characters were not restored.** `eve_cache.db.bak-before-character-reset`
