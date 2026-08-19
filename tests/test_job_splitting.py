@@ -244,23 +244,24 @@ def test_capital_components_are_classified_from_the_sde_group():
 # ── the two views must describe the same build ───────────────────────────────
 def _plan(client, app_module, **defaults):
     """Runs /plan and returns its view model, with defaults applied first."""
-    import app.web.main as m
+    from app.web.routers import plan as plan_router
 
     client.post("/api/settings/defaults", json=defaults)
     captured = {}
-    original = m._tr
+    original = plan_router._tr
 
     def spy(name, request, context):
         captured["view"] = context
         return original(name, request, context)
 
-    m._tr = spy
+    # /plan resolves _tr in the router's namespace now, so the spy goes there.
+    plan_router._tr = spy
     try:
         client.post("/plan", data={"product": "Wasp II", "qty": "5000",
                                    "station": "60003760", "mode": "full",
                                    "runs_per_job": "0", "form_me": "7"})
     finally:
-        m._tr = original
+        plan_router._tr = original
     return captured["view"].get("result") or {}
 
 
