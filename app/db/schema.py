@@ -172,6 +172,26 @@ char_wallet_cache = Table(
     Column("cached_at", Float, nullable=False),
 )
 
+market_orders_cache = Table(
+    "market_orders_cache", metadata,
+    # Market orders, so /orders renders without waiting on ESI.
+    #
+    # **One table rather than four.** The page has two switches — whose orders
+    # (`?scope=`) and whether they are live (`?state=`) — and the four
+    # combinations are the same shape: a list of order dicts. Four tables would
+    # be four migrations and four fetchers for one concept, and the key here
+    # mirrors what the page already asks for.
+    #
+    # `owner_kind` rather than inferring from the id: character and corporation
+    # ids come from ranges that do not currently collide, and building a cache
+    # on "currently" is how you get a corp's orders shown as a character's.
+    Column("owner_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("owner_kind", Text, primary_key=True),      # "character" | "corporation"
+    Column("state", Text, primary_key=True),           # "active" | "history"
+    Column("data_json", Text, nullable=False),
+    Column("cached_at", Float, nullable=False),
+)
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # Market data

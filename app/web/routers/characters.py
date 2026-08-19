@@ -332,6 +332,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
             "scope": "corp" if is_corp else "personal", "state": state,
             "orders_char_id": None, "all_chars": True, "orders": [],
             "error": None, "corp_error": None, "corp_name": None,
+            "cached_at": 0.0, "unsynced": [],
             "market_hubs": _market_hubs_list(),
         }
         chars = list_characters(conn)
@@ -340,57 +341,60 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
             conn.close()
             return _tr("orders.html", request, ctx)
 
+        # Names the cache has nothing for. Collected rather than counted so the
+        # page can say *who* is missing — "3 characters not synced" sends you
+        # looking, and the answer is usually one character whose token lapsed.
+        unsynced: list[str] = []
+        # The oldest reading in the merged set, because that is the age of the
+        # weakest part of the answer — reporting the newest would describe the
+        # one character that happened to sync last.
+        oldest: list[float] = []
+
         async def _char_orders(cid: int, cname: str) -> list[dict]:
             tok = await _valid_token_async(cid)
-            if not tok:
+            cached, at = orders_api.load_cached_orders(
+                conn, cid, orders_api.CHARACTER, _cache_state(state))
+            if cached is None:
+                unsynced.append(cname or str(cid))
                 return []
-            async with esi_client() as client:
-                if state == "history":
-                    raw = await orders_api.fetch_orders_history(client, cid, tok)
-                else:
-                    raw = await orders_api.fetch_orders(client, cid, tok)
-                decorated = await _finalize_orders(conn, raw, _type_names, tok,
-                                                   resolve_regions=(state != "history"))
+            oldest.append(at)
+            decorated = await _finalize_orders(conn, cached, _type_names, tok,
+                                               resolve_regions=(state != "history"))
             for o in decorated:
                 o["party_id"], o["party_name"], o["party_kind"] = cid, cname, "char"
             return decorated
 
         async def _corp_orders(corp_id: int, corp_name: str, tok: str) -> list[dict]:
-            async with esi_client() as client:
-                if state == "history":
-                    raw = await orders_api.fetch_corp_orders_history(client, corp_id, tok)
-                else:
-                    raw, _err = await orders_api.fetch_corp_orders(client, corp_id, tok)
-                    raw = raw or []
-                decorated = await _finalize_orders(conn, raw, _type_names, tok,
-                                                   resolve_regions=(state != "history"))
+            cached, at = orders_api.load_cached_orders(
+                conn, corp_id, orders_api.CORPORATION, _cache_state(state))
+            if cached is None:
+                unsynced.append(corp_name or str(corp_id))
+                return []
+            oldest.append(at)
+            decorated = await _finalize_orders(conn, cached, _type_names, tok,
+                                               resolve_regions=(state != "history"))
             for o in decorated:
                 o["party_id"], o["party_name"], o["party_kind"] = corp_id, corp_name, "corp"
             return decorated
 
         try:
             if is_corp:
-                # unique corp → token of a character in it
+                # unique corp → token of a character in it. `corporation_id` is
+                # written by the sync worker; a character it has not reached
+                # has no corp here and is reported as unsynced rather than
+                # looked up, which is what keeps this page off ESI.
                 corp_token: dict[int, str] = {}
-                async with esi_client() as client:
-                    for cid, _cn in chars:
-                        tok = await _valid_token_async(cid)
-                        if not tok:
-                            continue
-                        crow = get_character_row(conn, cid) or {}
-                        corp_id = crow.get("corporation_id")
-                        if not corp_id:
-                            try:
-                                cr = await client.get(
-                                    f"https://esi.evetech.net/latest/characters/{cid}/", timeout=10)
-                                if cr.status_code == 200:
-                                    corp_id = cr.json().get("corporation_id")
-                                    if corp_id:
-                                        update_corporation_id(conn, cid, corp_id)
-                            except Exception:
-                                pass
-                        if corp_id and corp_id not in corp_token:
-                            corp_token[corp_id] = tok
+                for cid, cn in chars:
+                    tok = await _valid_token_async(cid)
+                    if not tok:
+                        continue
+                    crow = get_character_row(conn, cid) or {}
+                    corp_id = crow.get("corporation_id")
+                    if not corp_id:
+                        unsynced.append(cn or str(cid))
+                        continue
+                    if corp_id not in corp_token:
+                        corp_token[corp_id] = tok
                 corp_names = await _resolve_party_names(set(corp_token)) if corp_token else {}
                 results = await asyncio.gather(*[
                     _corp_orders(corp_id, corp_names.get(corp_id, str(corp_id)), tok)
@@ -401,6 +405,8 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
             merged = [o for r in results for o in r]
             merged.sort(key=lambda x: x.get("issued", ""), reverse=True)
             ctx["orders"] = merged
+            ctx["unsynced"] = unsynced
+            ctx["cached_at"] = min(oldest) if oldest else 0.0
         except Exception as exc:
             ctx["error"] = f"Error loading orders: {exc}"
         conn.close()
@@ -416,6 +422,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
         "scope": scope, "state": state, "orders_char_id": plan_char_id,
         "all_chars": False,
         "orders": [], "error": None, "corp_error": None, "corp_name": None,
+        "cached_at": 0.0, "unsynced": [],
         "market_hubs": _market_hubs_list(),
     }
     if not plan_char_id:
@@ -430,41 +437,54 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
         return _tr("orders.html", request, ctx)
 
     try:
-        async with esi_client() as client:
-            if scope == "corp":
-                corp_id = row.get("corporation_id")
-                if not corp_id:
-                    cr = await client.get(
-                        f"https://esi.evetech.net/latest/characters/{plan_char_id}/", timeout=10)
-                    if cr.status_code == 200:
-                        corp_id = cr.json().get("corporation_id")
-                        if corp_id:
-                            update_corporation_id(conn, plan_char_id, corp_id)
-                if not corp_id:
-                    ctx["corp_error"] = "Could not determine the character's corporation."
-                else:
-                    cn = await _resolve_party_names({corp_id})
-                    ctx["corp_name"] = cn.get(corp_id, str(corp_id))
-                    if state == "history":
-                        raw_orders = await orders_api.fetch_corp_orders_history(client, corp_id, token)
-                    else:
-                        raw_orders, err = await orders_api.fetch_corp_orders(client, corp_id, token)
-                        ctx["corp_error"] = err
-                        raw_orders = raw_orders or []
-                    ctx["orders"] = await _finalize_orders(conn, raw_orders, _type_names, token,
-                                                           resolve_regions=(state != "history"))
+        if scope == "corp":
+            corp_id = row.get("corporation_id")
+            if not corp_id:
+                # Written by the sync worker. Absent means this character has
+                # not been synced yet, not that it has no corporation — the
+                # page used to ask ESI here, which put a round trip on every
+                # view of a page whose answer changes about once a year.
+                ctx["corp_error"] = ("This character has not been synced yet, so "
+                                     "its corporation is not known.")
             else:
-                if state == "history":
-                    raw_orders = await orders_api.fetch_orders_history(client, plan_char_id, token)
-                else:
-                    raw_orders = await orders_api.fetch_orders(client, plan_char_id, token)
+                cn = await _resolve_party_names({corp_id})
+                ctx["corp_name"] = cn.get(corp_id, str(corp_id))
+                raw_orders, cached_at = orders_api.load_cached_orders(
+                    conn, corp_id, orders_api.CORPORATION, _cache_state(state))
+                if raw_orders is None:
+                    ctx["corp_error"] = _NOT_SYNCED
+                    raw_orders = []
+                ctx["cached_at"] = cached_at
                 ctx["orders"] = await _finalize_orders(conn, raw_orders, _type_names, token,
                                                        resolve_regions=(state != "history"))
+        else:
+            raw_orders, cached_at = orders_api.load_cached_orders(
+                conn, plan_char_id, orders_api.CHARACTER, _cache_state(state))
+            if raw_orders is None:
+                ctx["error"] = _NOT_SYNCED
+                raw_orders = []
+            ctx["cached_at"] = cached_at
+            ctx["orders"] = await _finalize_orders(conn, raw_orders, _type_names, token,
+                                                   resolve_regions=(state != "history"))
     except Exception as exc:
         ctx["error"] = f"Error loading orders: {exc}"
 
     conn.close()
     return _tr("orders.html", request, ctx)
+
+
+#: Shown when the cache has nothing for an owner. Deliberately not "no orders":
+#: the page has not looked yet, and saying otherwise is the bug this whole
+#: cache-only conversion exists to avoid.
+_NOT_SYNCED = ("Not synced yet — the background worker fills this within a few "
+               "minutes of signing in.")
+
+
+def _cache_state(state: str) -> str:
+    """The page's `?state=` mapped onto the cache's. Anything unrecognised is
+    active, matching what the rest of the handler already assumes."""
+    from app.character import orders as _orders
+    return _orders.HISTORY if state == "history" else _orders.ACTIVE
 
 
 async def _finalize_orders(conn, raw_orders: list[dict], type_names_fn, token: str,

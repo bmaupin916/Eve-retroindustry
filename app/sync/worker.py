@@ -45,6 +45,12 @@ from app.auth.token_store import list_characters, update_corporation_id, update_
 from app.character.assets import fetch_assets, fetch_corp_assets
 from app.character.blueprints import fetch_blueprints
 from app.character.jobs import fetch_industry_jobs
+from app.character.orders import (
+    fetch_corp_orders,
+    fetch_corp_orders_history,
+    fetch_orders,
+    fetch_orders_history,
+)
 from app.character.skills import fetch_skills
 from app.db.conn import connect
 from app.esi.client import esi_client
@@ -282,6 +288,20 @@ class SyncWorker:
                     if jobs is not None:
                         changed += self._job_events(char_id, jobs)
 
+                    # /orders reads these and never calls ESI itself. Active
+                    # and history are separate rows because the page asks for
+                    # one or the other and history is the expensive one — four
+                    # paginated calls against ninety days that change once a
+                    # trade closes.
+                    orders = await fetch_orders(client, char_id, token, conn=raw)
+                    changed += self._diff(char_id, "orders", orders)
+
+                    # No event for history: a closed order is not news the
+                    # way a new one is, and the page that reads it is a ledger
+                    # rather than a monitor. It writes nothing when the fetch
+                    # fails, so the previous cache stays the best answer.
+                    await fetch_orders_history(client, char_id, token, conn=raw)
+
                     try:
                         corp_id, corp_assets = await fetch_corp_assets(
                             client, char_id, token, raw)
@@ -290,6 +310,16 @@ class SyncWorker:
                             changed += self._diff(
                                 char_id, "corp_assets", corp_assets,
                                 corporation_id=corp_id)
+                            # Same role requirement as corp assets and the same
+                            # best-effort handling: a 403 returns an error
+                            # string rather than raising, and writes nothing.
+                            corp_orders, _err = await fetch_corp_orders(
+                                client, corp_id, token, conn=raw)
+                            changed += self._diff(
+                                char_id, "corp_orders", corp_orders,
+                                corporation_id=corp_id)
+                            await fetch_corp_orders_history(
+                                client, corp_id, token, conn=raw)
                     except Exception as exc:
                         # Corp assets need a role most characters do not have.
                         # Not a failure of the character, so it is not recorded
@@ -332,8 +362,9 @@ class SyncWorker:
             # First sight is not a change: a process restart must not announce
             # everything the account owns as newly acquired.
             return []
-        kind = ("corporation.assets.changed" if what == "corp_assets"
-                else f"character.{what}.changed")
+        kind = ({"corp_assets": "corporation.assets.changed",
+                 "corp_orders": "corporation.orders.changed"}.get(what)
+                or f"character.{what}.changed")
         return [(kind, {"count": size})]
 
     def _job_events(self, char_id: int, jobs: list) -> list[tuple[str, dict]]:

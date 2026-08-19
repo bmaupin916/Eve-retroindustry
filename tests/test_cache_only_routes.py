@@ -78,7 +78,6 @@ ALLOWED = {
     "assets_page": "TODO: cache-aware fetchers, but still fetches when stale",
     "blueprints_page": "TODO: cache-aware fetchers, but still fetches when stale",
     "wallet_page": "TODO: no cache at all yet",
-    "orders_page": "TODO: no cache at all yet",
     "contracts_page": "TODO: no cache at all yet",
     "api_contract_items": "TODO: no cache at all yet",
     "plan_form": "TODO: cache-aware fetchers, but still fetches when stale",

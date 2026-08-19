@@ -52,12 +52,20 @@ def test_the_page_renders(client):
 def test_the_page_never_calls_esi(client, monkeypatch):
     """The point of the worker is that pages do not fetch. A health page that
     fetched to report on fetching would be the joke version of this."""
+    # Patched where the page would call it from, not on `app.esi.client`:
+    # a router that does `from app.esi.client import esi_client` binds the name
+    # at import, so rebinding the source leaves the router's copy alone. This
+    # module imports only `etag_stats` and `quarantine_state`, so the guard is
+    # against a *future* fetch — and it has to be pointed at the module that
+    # would grow one.
     from app.esi import client as esi
+    from app.web.routers import sync_health as router_module
 
     def _boom(*a, **kw):
         raise AssertionError("the sync-health page called ESI")
 
     monkeypatch.setattr(esi, "esi_client", _boom)
+    monkeypatch.setattr(router_module, "esi_client", _boom, raising=False)
     assert client.get("/sync-health").status_code == 200
 
 

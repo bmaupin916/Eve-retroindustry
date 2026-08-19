@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.48. **681 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.49. **695 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -225,7 +225,12 @@ Ordered by dependency, not by size.
   correct.
 
 * **Cache-only routes** — no route fetches from ESI on the request path.
-  **`/jobs` is done and is the pattern**: a `char_jobs_cache` table filled by
+  **`/jobs` and `/orders` are done; `/orders` is the better example**, because
+  it came with tests. The jobs cache has none: it is covered only by the AST
+  scan, which proves a handler contains no `fetch_` call and nothing at all
+  about whether the cached data is right.
+
+  **`/jobs` is the original pattern**: a `char_jobs_cache` table filled by
   the worker, `load_cached_jobs()` read by the page, and the page saying how old
   its answer is. `None` from the cache means "not synced yet" and `[]` means
   "nothing there" — conflating them makes the page claim a character is idle
@@ -329,3 +334,27 @@ session cost 25 minutes between them. Most of the 71 told us nothing.
   still holds Astroasia and Tracy Juan with their refresh tokens if signing in
   again turns out not to be enough. `app_owner` is empty, so the first real
   login claims the instance.
+
+## Two ways a test can guard nothing
+
+Both found by mutation while doing `/orders` (v0.9.49), both of which had left a
+test green while the thing it named was broken. Neither is specific to that
+page.
+
+* **Patch the module that *calls*, not the module that *defines*.** A router
+  doing `from app.esi.client import esi_client` binds the function at import.
+  `monkeypatch.setattr(app.esi.client, "esi_client", stub)` rebinds the source
+  and leaves every importer pointing at the original, so the guard passes no
+  matter what the page does. This is the W6 lesson about `app_module.X` in a
+  second costume. `tests/test_sync_health.py` had it too and has been fixed.
+* **A stub that raises proves nothing inside a handler that swallows.** These
+  route handlers wrap their bodies in `except Exception` to turn a failure into
+  an error banner, which catches the stub's `AssertionError` along with
+  everything else — 200 returned, test green, page calling ESI on every
+  request. Have the stub append to a list and assert the list is empty; that
+  survives being caught.
+
+The general shape: **a guard that cannot fail looks exactly like a guard that
+passes.** The only way to tell them apart is to break the thing on purpose and
+watch — which is the same rule as "mutate the fix and check the failure shape",
+applied to tests rather than to code.
