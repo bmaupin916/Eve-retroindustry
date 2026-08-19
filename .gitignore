@@ -71,3 +71,9 @@ docs/reference/
 # reason lands after the extension.
 *.db.bak*
 eve_cache.db.bak-*
+
+# Local database and any backups of it — never committed.
+eve_cache.db
+eve_cache.db-wal
+eve_cache.db-shm
+eve_cache.db.bak-*

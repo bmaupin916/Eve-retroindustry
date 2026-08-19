@@ -20,6 +20,11 @@ APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..")
 )
 
+# Frozen at import. Every *other* place that needs this path resolves it at
+# call time (app/auth/esi_oauth.py, app/web/bootstrap.py), and the difference
+# matters: a module imported before EVE_APP_DIR is set binds whatever was
+# there, permanently. That is how the test suite spent a day writing to a
+# real database. tests/conftest.py::pytest_collection_finish is the net.
 DB_PATH = os.path.join(APP_DIR, "eve_cache.db")
 
 
