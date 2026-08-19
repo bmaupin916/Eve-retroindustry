@@ -670,3 +670,180 @@ def test_neither_inventory_page_calls_a_fetcher(client, monkeypatch):
     for url in ("/assets", "/assets?view=all", "/blueprints", "/blueprints?view=all"):
         assert client.get(url).status_code == 200, url
         assert not called, f"{url} called {called}"
+
+
+# ── /planets, /pi-planner and the alert tile ─────────────────────────────────
+
+from app.character import planets as planets_api    # noqa: E402
+
+
+def test_an_unsynced_character_has_no_colonies_rather_than_none(conn):
+    """PI is the one thing in this app you check *because* you expect to have
+    forgotten about it. Showing no colonies for a character nobody looked at is
+    the most misleading version of this failure in the whole conversion."""
+    assert planets_api.load_cached_colonies(conn, ALICE) == (None, 0.0)
+
+
+def test_a_character_with_no_colonies_is_distinguishable_from_an_unsynced_one(conn):
+    planets_api.save_cached_colonies(conn, ALICE, [], [])
+    conn.commit()
+
+    result, at = planets_api.load_cached_colonies(conn, ALICE)
+
+    assert result == ([], []), "synced-and-empty was reported as never-synced"
+    assert at > 0
+
+
+def test_forbidden_is_cached_as_itself(conn):
+    """A token predating the PI scope is a durable fact, not a transient
+    failure: re-discovering it every tick costs a call per character forever,
+    and the UI response is a re-auth prompt rather than a retry."""
+    planets_api.save_cached_colonies(conn, ALICE, [], [], planets_api.FORBIDDEN)
+    conn.commit()
+
+    result, _at = planets_api.load_cached_colonies(conn, ALICE)
+
+    assert result == planets_api.FORBIDDEN
+
+
+def test_colonies_and_details_stay_paired(conn):
+    """`details` is aligned positionally with `colonies`. A detail call that
+    failed leaves None in its slot rather than being dropped — dropping it
+    would silently re-pair every colony after it with another planet's pins."""
+    colonies = [{"planet_id": 1}, {"planet_id": 2}, {"planet_id": 3}]
+    details = [{"pins": ["a"]}, None, {"pins": ["c"]}]
+    planets_api.save_cached_colonies(conn, ALICE, colonies, details)
+    conn.commit()
+
+    (got_colonies, got_details), _at = planets_api.load_cached_colonies(conn, ALICE)
+
+    assert [c["planet_id"] for c in got_colonies] == [1, 2, 3]
+    assert got_details[1] is None, "the failed slot was dropped, shifting the pairing"
+    assert got_details[2] == {"pins": ["c"]}
+
+
+def test_a_failed_colony_list_leaves_the_previous_one(conn):
+    """None from `fetch_planets` is transient — ESI being unavailable must not
+    erase colonies that are still there and still running."""
+    planets_api.save_cached_colonies(conn, ALICE, [{"planet_id": 1}], [{"pins": []}])
+    conn.commit()
+
+    class _NoColonies:
+        async def get(self, *a, **k):
+            raise RuntimeError("ESI down")
+
+    result = asyncio.run(planets_api.fetch_colonies(_NoColonies(), ALICE, "tok", conn=conn))
+
+    assert result is None
+    kept, _at = planets_api.load_cached_colonies(conn, ALICE)
+    assert kept[0] == [{"planet_id": 1}], "a transient failure erased the colonies"
+
+
+def test_planet_names_are_read_without_fetching(conn):
+    """They never change, so the worker resolves each one once, ever. The page
+    reads whatever is known and falls back to the id for the rest."""
+    conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
+                 (4001, "Testworld IV"))
+    conn.commit()
+
+    assert planets_api.load_planet_names(conn, [4001, 4002]) == {4001: "Testworld IV"}
+
+
+def test_the_pi_pages_do_not_call_a_fetcher(client, monkeypatch):
+    """/planets and /pi-planner between them were the most call-hungry pages in
+    the app: one colony-list call per character plus one detail call per
+    planet, on every view."""
+    called: list[str] = []
+
+    def _recorder(name):
+        async def _spy(*a, **kw):
+            called.append(name)
+            return None
+        return _spy
+
+    patched = 0
+    for attr in dir(planets_api):
+        if attr.startswith("fetch_"):
+            monkeypatch.setattr(planets_api, attr, _recorder(attr))
+            patched += 1
+    assert patched >= 3, f"only {patched} fetchers found"
+
+    for url in ("/planets", "/pi-planner", "/api/pi-alert-count", "/api/dashboard/pi-alerts", "/api/dashboard/pi-alerts?force=1"):
+        assert client.get(url).status_code == 200, url
+        assert not called, f"{url} called {called}"
+
+
+def test_forcing_the_alert_tile_wakes_the_worker_instead_of_fetching(client):
+    """`force=1` used to mean "go to ESI now" — up to eighty round trips from a
+    dashboard tile. It asks the worker to, and answers immediately from what is
+    known."""
+    r = client.get("/api/dashboard/pi-alerts?force=1")
+
+    assert r.status_code == 200
+    assert "refresh_requested" in r.json(), (
+        "force no longer reports whether the worker was woken")
+
+
+class _PiClient:
+    """Enough of httpx for `fetch_colonies`: routes by URL shape.
+
+    `list_status` drives the colony-list call; `detail_ok` decides whether the
+    per-planet call succeeds. Both are needed because the two failures mean
+    different things and the fetcher treats them differently.
+    """
+
+    def __init__(self, list_status=200, colonies=None, detail_ok=True):
+        self.list_status, self.colonies, self.detail_ok = list_status, colonies or [], detail_ok
+        self.calls: list[str] = []
+
+    async def get(self, url, **kw):
+        self.calls.append(url)
+        if url.endswith("/planets/"):
+            return _Resp(self.list_status, self.colonies)
+        if not self.detail_ok:
+            raise RuntimeError("detail call failed")
+        return _Resp(200, {"pins": [{"pin_id": 1}], "links": [], "routes": []})
+
+
+def test_a_forbidden_token_is_cached_by_the_fetcher(conn):
+    """Not just storable — actually stored. A 403 means the token predates the
+    PI scope, which is durable: re-discovering it costs one call per character
+    on every tick, forever, and the answer never changes until a re-auth."""
+    client = _PiClient(list_status=403)
+
+    result = asyncio.run(planets_api.fetch_colonies(client, ALICE, "tok", conn=conn))
+    conn.commit()
+
+    assert result == planets_api.FORBIDDEN
+    assert planets_api.load_cached_colonies(conn, ALICE)[0] == planets_api.FORBIDDEN, (
+        "the 403 was returned but not written down, so the next tick asks again")
+
+
+def test_the_fetcher_keeps_a_failed_detail_in_its_slot(conn):
+    """`details` is aligned positionally with `colonies`. Dropping a failed one
+    shifts every colony after it onto another planet's pins — a page that looks
+    entirely plausible and attributes your extractors to the wrong worlds."""
+    client = _PiClient(colonies=[{"planet_id": 1}, {"planet_id": 2}], detail_ok=False)
+
+    result = asyncio.run(planets_api.fetch_colonies(client, ALICE, "tok", conn=conn))
+    conn.commit()
+
+    colonies, details = result
+    assert len(details) == len(colonies) == 2, (
+        f"{len(details)} details for {len(colonies)} colonies — the pairing shifted")
+    assert details == [None, None]
+
+    (_c, cached_details), _at = planets_api.load_cached_colonies(conn, ALICE)
+    assert cached_details == [None, None]
+
+
+def test_a_character_with_no_colonies_is_written_down_as_such(conn):
+    """An empty colony list is conclusive and worth caching: otherwise every
+    tick re-asks, and the page cannot tell "no PI" from "not looked at"."""
+    client = _PiClient(colonies=[])
+
+    result = asyncio.run(planets_api.fetch_colonies(client, ALICE, "tok", conn=conn))
+    conn.commit()
+
+    assert result == ([], [])
+    assert planets_api.load_cached_colonies(conn, ALICE)[0] == ([], [])

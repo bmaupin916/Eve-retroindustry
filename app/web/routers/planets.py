@@ -7,55 +7,53 @@ summary are used by these four routes and nothing else.
 """
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import time as _time
 
-import httpx
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
 from app.auth.token_store import list_characters
 from app.character import planets as planets_api
-from app.esi.client import esi_client
+from app.sync import worker as sync_worker
 from app.web import pi_planner_helper
 from app.db.location import database_path
 from app.db.schema import ensure_schema as ensure_db_schema
-from app.web.deps import _tr, _valid_token_async, get_conn
+from app.web.deps import _tr, get_conn
 
 router = APIRouter()
 
 
-async def _fetch_pi_colonies(conn: sqlite3.Connection, chars) -> list:
-    """Colony list + per-planet detail for every character, concurrently.
+def _load_pi_colonies(conn: sqlite3.Connection, chars) -> list:
+    """Colony list + per-planet detail for every character, from the cache.
 
-    The single PI fetch path in the app: /planets and /pi-planner both call
-    this, so the two ESI endpoints, the token handling and the "forbidden"
-    contract live in exactly one place.
+    The single PI read path in the app: /planets and /pi-planner both call
+    this, so the shape and the "forbidden" contract live in exactly one place.
+    It used to be the single *fetch* path — one colony-list call per character
+    plus one detail call per planet, on every page view, which on a
+    twelve-character account was more than seventy round trips to render a
+    page whose data changes when an extractor program ends.
 
-    Returns [(char_id, result)] where result is one of:
+    The sync worker fills the cache now. Returns [(char_id, result)] where
+    result is one of:
       (colonies, details) — `details` aligned positionally with `colonies`
       "forbidden"         — token predates the PI scope; prompt a re-auth
-      None or []          — no token, no colonies, or the fetch failed
+      None                — never synced
     """
-    async def _one(cid: int):
-        try:
-            tok = await _valid_token_async(cid)
-            if not tok:
-                return cid, None
-            async with esi_client() as client:
-                colonies = await planets_api.fetch_planets(client, cid, tok)
-                if colonies == "forbidden" or colonies is None or not colonies:
-                    return cid, colonies
-                details = await asyncio.gather(*[
-                    planets_api.fetch_planet_detail(client, cid, c["planet_id"], tok)
-                    for c in colonies], return_exceptions=True)
-                return cid, (colonies, details)
-        except Exception:
-            return cid, None
+    return [(cid, planets_api.load_cached_colonies(conn, cid)[0]) for cid, _ in chars]
 
-    return await asyncio.gather(*[_one(cid) for cid, _ in chars])
+
+def _pi_cache_age(conn: sqlite3.Connection, chars) -> float:
+    """The oldest reading across these characters, or 0 if none.
+
+    Oldest rather than newest: it is the age of the weakest part of the answer,
+    and a page that quoted the freshest would be describing whichever character
+    happened to sync last.
+    """
+    ages = [at for cid, _ in chars
+            if (at := planets_api.load_cached_colonies(conn, cid)[1])]
+    return min(ages) if ages else 0.0
 
 
 @router.get("/planets", response_class=HTMLResponse)
@@ -73,7 +71,7 @@ async def planets_page(request: Request):
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc)
 
-    results = await _fetch_pi_colonies(conn, chars)
+    results = _load_pi_colonies(conn, chars)
     char_name = {cid: name for cid, name in chars}
 
     # Ids to resolve: planet names (per-planet endpoint — /universe/names can't do
@@ -145,7 +143,7 @@ async def planets_page(request: Request):
     # Planet names ("Jita IV", already includes the system). Resolved through the
     # shared cache: names never change, so only ids we've never seen cost an ESI
     # call — this page used to re-fetch every planet on every visit.
-    planet_names = await _resolve_planet_names(conn, planet_ids)
+    planet_names = _resolve_planet_names(conn, planet_ids)
 
     def _rem(iso: str):
         try:
@@ -310,13 +308,13 @@ async def pi_planner_page(
         conn = get_conn()
         try:
             chars = list_characters(conn)
-            results = await _fetch_pi_colonies(conn, chars) if chars else []
+            results = _load_pi_colonies(conn, chars) if chars else []
             # Shared name cache — the same resolver /planets uses, so a planet
             # either page has seen costs nothing here.
             planet_ids = {c["planet_id"]
                           for _cid, res in results if res and not isinstance(res, str)
                           for c in res[0]}
-            planet_names = await _resolve_planet_names(conn, planet_ids) if planet_ids else {}
+            planet_names = _resolve_planet_names(conn, planet_ids) if planet_ids else {}
             view["actual"] = pi_planner_helper.build_plan_vs_actual(
                 conn, results, dict(chars), view["result"]["colonies"],
                 planet_names=planet_names)
@@ -338,7 +336,8 @@ async def pi_planner_page(
 # PI is "set and forget until the extractor runs out", so the useful alert is
 # "which extractors expire within 24h (or already have)". We cache the extractor
 # expiry times in the DB so the count can be shown cheaply on every page (nav
-# badge) without hitting ESI; the dashboard tile refreshes the cache live.
+# badge) without hitting ESI. The dashboard tile re-derives them from the colony
+# cache when they age; the sync worker is what refreshes the colonies.
 
 _PI_CACHE_TTL = 900.0   # 15 min — extractor programs run for days, so this is plenty
 
@@ -348,40 +347,20 @@ def _ensure_pi_cache_tables(conn: sqlite3.Connection) -> None:
     ensure_db_schema(conn)
 
 
-async def _resolve_planet_names(conn: sqlite3.Connection, planet_ids) -> dict[int, str]:
-    """Planet names ("Jita IV" — includes the system). Cached permanently in the
-    DB (they never change); only cache-misses hit ESI's per-planet endpoint
-    (/universe/names can't resolve planets)."""
+def _resolve_planet_names(conn: sqlite3.Connection, planet_ids) -> dict[int, str]:
+    """Planet names ("Jita IV" — includes the system), from the cache only.
+
+    They are cached permanently because they never change, and the sync worker
+    fills them as part of the colony fetch: one call per planet this database
+    has never seen, once ever.
+
+    This used to fetch the misses itself. That was defensible — a planet is
+    resolved at most once — but it put a first-sight round trip on a page
+    render, and the first sight of six new colonies is exactly the page load
+    right after somebody sets them up.
+    """
     _ensure_pi_cache_tables(conn)
-    names: dict[int, str] = {}
-    miss: list[int] = []
-    for pid in planet_ids:
-        row = conn.execute("SELECT name FROM planet_name_cache WHERE planet_id=?", (pid,)).fetchone()
-        if row and row[0]:
-            names[pid] = row[0]
-        else:
-            miss.append(pid)
-    if miss:
-        async def _p(client, pid):
-            try:
-                r = await client.get(
-                    f"https://esi.evetech.net/latest/universe/planets/{pid}/",
-                    params={"datasource": "tranquility"}, timeout=8)
-                if r.status_code == 200:
-                    return pid, r.json().get("name")
-            except Exception:
-                pass
-            return pid, None
-        try:
-            async with esi_client(timeout=8) as client:
-                for pid, nm in await asyncio.gather(*[_p(client, p) for p in miss]):
-                    if nm:
-                        names[pid] = nm
-                        conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?) ON CONFLICT (planet_id) DO UPDATE SET name=excluded.name", (pid, nm))
-            conn.commit()
-        except Exception:
-            pass
-    return names
+    return planets_api.load_planet_names(conn, planet_ids)
 
 
 def _store_pi_cache_for_chars(conn: sqlite3.Connection, char_ids, entries) -> None:
@@ -403,58 +382,58 @@ def _store_pi_cache_for_chars(conn: sqlite3.Connection, char_ids, entries) -> No
     conn.commit()
 
 
-async def _pi_fetch_and_cache(conn: sqlite3.Connection, chars) -> None:
-    """Fetch every character's colonies + extractor expiry times and refresh the
-    PI cache. Lightweight vs the full /planets view (extractors only)."""
-    async def _one(cid: int):
-        tok = await _valid_token_async(cid)
-        if not tok:
-            return cid, None
-        try:
-            async with esi_client() as client:
-                colonies = await planets_api.fetch_planets(client, cid, tok)
-                if colonies == "forbidden" or colonies is None:
-                    return cid, colonies
-                if not colonies:
-                    return cid, ([], [])
-                details = await asyncio.gather(*[
-                    planets_api.fetch_planet_detail(client, cid, c["planet_id"], tok)
-                    for c in colonies], return_exceptions=True)
-                return cid, (colonies, details)
-        except Exception:
-            return cid, None
+def _pi_refresh_alerts(conn: sqlite3.Connection, chars) -> None:
+    """Rebuild the extractor-alert cache from the colony cache. No ESI.
 
-    results = await asyncio.gather(*[_one(cid) for cid, _ in chars])
+    This used to fetch: a colony list per character plus a detail call per
+    planet, on any dashboard load where the alert cache had aged past fifteen
+    minutes. That was up to eighty round trips to answer "is anything about to
+    run dry", which the sync worker now keeps the raw material for.
+
+    Planet names come from `planet_name_cache` only. A planet neither page has
+    ever displayed has no name here and falls back to "Planet #id", which is
+    what happened when the name lookup failed before — worth less than a round
+    trip on the request path, and the next visit to /planets fills it in.
+    """
     char_name = {cid: name for cid, name in chars}
-
     type_ids: set[int] = set()
     planet_ids: set[int] = set()
-    raw: list[tuple] = []   # (cid, planet_id, product_id, expiry_iso)
+    raw: list[tuple] = []
     ok_cids: list[int] = []
-    for cid, res in results:
-        if res is None or res == "forbidden":
+
+    for cid, _name in chars:
+        res, _at = planets_api.load_cached_colonies(conn, cid)
+        if res is None or isinstance(res, str):
+            # Never synced, or the token lacks the scope. Either way this
+            # character's existing rows stay: replacing them with nothing would
+            # silently drop an alert for an extractor that is still running.
             continue
         ok_cids.append(cid)
         colonies, details = res
-        det = {c["planet_id"]: (d if isinstance(d, dict) else None)
-               for c, d in zip(colonies, details)}
-        for c in colonies:
-            planet_ids.add(c["planet_id"])
-            d = det.get(c["planet_id"])
-            if not d:
+        for colony, detail in zip(colonies, details):
+            planet_ids.add(colony["planet_id"])
+            if not isinstance(detail, dict):
                 continue
-            for pin in d.get("pins", []):
+            for pin in detail.get("pins", []):
                 ed = pin.get("extractor_details")
                 if ed and pin.get("expiry_time") and ed.get("product_type_id"):
-                    raw.append((cid, c["planet_id"], ed["product_type_id"], pin["expiry_time"]))
+                    raw.append((cid, colony["planet_id"],
+                                ed["product_type_id"], pin["expiry_time"]))
                     type_ids.add(ed["product_type_id"])
 
     type_names: dict[int, str] = {}
     if type_ids:
         ph = ",".join("?" * len(type_ids))
         type_names = {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})", list(type_ids))}
-    planet_names = await _resolve_planet_names(conn, planet_ids)
+            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})",
+            list(type_ids))}
+
+    planet_names: dict[int, str] = {}
+    if planet_ids:
+        pph = ",".join("?" * len(planet_ids))
+        planet_names = {r[0]: r[1] for r in conn.execute(
+            f"SELECT planet_id, name FROM planet_name_cache WHERE planet_id IN ({pph})",
+            list(planet_ids))}
 
     entries = [{
         "char_id": cid, "char_name": char_name.get(cid, str(cid)),
@@ -523,12 +502,19 @@ async def api_pi_alerts(force: int = 0):
         fresh = (age is not None and age < _PI_CACHE_TTL)
         if chars and (force or not fresh):
             try:
-                await _pi_fetch_and_cache(conn, chars)
+                # Re-derived from the colony cache, which costs a few local
+                # reads. Nothing here reaches ESI any more.
+                _pi_refresh_alerts(conn, chars)
                 summary = _pi_alert_summary(conn)
             except Exception as exc:
                 print(f"[pi-alerts] refresh failed: {exc}", flush=True)
         else:
             summary["from_cache"] = True
+        if force:
+            # `force` used to mean "go to ESI now". It means "ask the worker to,
+            # and show me what is known meanwhile" — the response is still
+            # immediate, and the next poll sees the newer colonies.
+            summary["refresh_requested"] = sync_worker.wake()
         return summary
     finally:
         conn.close()

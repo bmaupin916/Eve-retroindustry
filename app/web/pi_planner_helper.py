@@ -285,9 +285,18 @@ def build_plan_vs_actual(
             continue
         if not result or isinstance(result, str):
             continue
+        colonies, details = result
+        # A character synced with zero colonies has answered, but it has not
+        # contributed any PI. Before the colony cache landed this case arrived
+        # as a bare `[]` and was skipped here; keeping the flag on "did anyone
+        # give us colonies" preserves that meaning now that it arrives as an
+        # empty pair. It drives the "PI access not authorized" prompt, and a
+        # pilot who simply does not do PI must not suppress it.
+        if not colonies:
+            ok_char_ids.append(char_id)
+            continue
         fetched_any = True
         ok_char_ids.append(char_id)
-        colonies, details = result
         by_planet = {c["planet_id"]: (d if isinstance(d, dict) else None)
                      for c, d in zip(colonies, details)}
         for colony in colonies:

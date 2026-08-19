@@ -196,6 +196,27 @@ wallet_ledger_cache = Table(
     Column("cached_at", Float, nullable=False),
 )
 
+pi_colony_cache = Table(
+    "pi_colony_cache", metadata,
+    # A character's colonies and every colony's pins, links and routes, so
+    # /planets and /pi-planner render without waiting on ESI. This was the most
+    # call-hungry page in the app: one colony-list call per character plus one
+    # detail call per planet, so a twelve-character account with six colonies
+    # each cost more than seventy round trips per view.
+    #
+    # One row per character holding both halves together, because they are only
+    # meaningful together — `details` is aligned positionally with `colonies`,
+    # and storing them apart would invite a pairing that has drifted.
+    #
+    # `status` carries ESI's answer rather than an absence: "forbidden" means
+    # the token predates the PI scope and the character must re-auth, which is
+    # a different thing from "no colonies" and prompts different UI.
+    Column("char_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("status", Text, nullable=False),          # "ok" | "forbidden"
+    Column("data_json", Text, nullable=False),
+    Column("cached_at", Float, nullable=False),
+)
+
 container_name_cache = Table(
     "container_name_cache", metadata,
     # The name a player typed on a container or an assembled ship. ESI serves

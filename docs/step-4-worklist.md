@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.52. **723 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.53. **734 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -225,8 +225,9 @@ Ordered by dependency, not by size.
   correct.
 
 * **Cache-only routes** — no route fetches from ESI on the request path.
-  **Done: `/jobs`, `/orders`, `/wallet`, `/contracts`, `/assets` and
-  `/blueprints`. `/orders` is the better example**, because it came with tests. The jobs cache has none: it is covered only by the AST
+  **Nine of the eleven handlers are done**; only `plan_form` and
+  `plan_result` are left. `/orders` is the better example to copy, because it
+  came with tests. The jobs cache has none: it is covered only by the AST
   scan, which proves a handler contains no `fetch_` call and nothing at all
   about whether the cached data is right.
 
@@ -441,3 +442,28 @@ other three now do too.
 Worth checking for on the remaining pages: **a fetcher's freshness rule and a
 page's freshness rule are different rules**, and sharing one function for both
 hides which is being applied.
+
+## Testing the store is not testing the contract
+
+Two of the five PI mutations (v0.9.53) went unnoticed on the first pass, and
+both for one reason: the tests exercised `save_cached_colonies` and
+`load_cached_colonies` directly, so they proved the *storage* round-trips and
+said nothing about what `fetch_colonies` decides to store.
+
+The two things they missed were exactly the decisions:
+
+* **A 403 is cached.** "Forbidden" means the token predates the PI scope,
+  which is durable — re-discovering it costs one call per character every tick,
+  forever, and the answer does not change until a re-auth. A test that writes
+  `FORBIDDEN` itself and reads it back cannot see whether the fetcher ever
+  writes it.
+* **A failed detail call stays in its slot as None.** `details` is aligned
+  positionally with `colonies`; dropping a failure shifts every colony after it
+  onto another planet's pins. That is a page which looks entirely plausible and
+  attributes your extractors to the wrong worlds. Again invisible to a test
+  that hands `save_*` an already-correct list.
+
+The general form: **a cache has two contracts, and they need separate tests.**
+The store's contract is "what goes in comes out"; the fetcher's is "what is
+worth storing, and in what shape". Round-tripping the first is easy and proves
+nothing about the second — which is where every decision lives.

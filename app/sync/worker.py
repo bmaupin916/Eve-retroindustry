@@ -50,6 +50,7 @@ from app.character.assets import (
 )
 from app.character.blueprints import fetch_blueprints
 from app.character.jobs import fetch_industry_jobs
+from app.character.planets import fetch_colonies
 from app.character.orders import (
     fetch_corp_orders,
     fetch_corp_orders_history,
@@ -354,6 +355,16 @@ class SyncWorker:
                     contracts = await fetch_character_contracts(
                         client, char_id, token, conn=raw)
                     changed += self._diff(char_id, "contracts", contracts)
+
+                    # Colonies: one list call plus one per planet. Expensive
+                    # enough that doing it per page view was the worst offender
+                    # in the app — and pointless, because what the pages want
+                    # from it is an extractor expiry, which is a fixed future
+                    # timestamp until somebody resets the program.
+                    colonies = await fetch_colonies(client, char_id, token,
+                                                    conn=raw)
+                    if isinstance(colonies, tuple):
+                        changed += self._diff(char_id, "colonies", colonies[0])
 
                     try:
                         corp_id, corp_assets = await fetch_corp_assets(

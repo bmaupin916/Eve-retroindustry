@@ -78,9 +78,6 @@ ALLOWED = {
     # Not yet converted. Each needs a cache the worker fills first; /jobs is
     # the worked example. Remove a name from here when its page stops fetching,
     # never to make this test pass.
-    "planets_page": "TODO: no cache for colony detail yet",
-    "pi_planner_page": "TODO: shares the colony fetch with /planets",
-    "api_pi_alerts": "TODO: refreshes live when the cache is stale",
     "plan_form": "TODO: cache-aware fetchers, but still fetches when stale",
     "plan_result": "TODO: cache-aware fetchers, but still fetches when stale",
 }

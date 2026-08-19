@@ -454,46 +454,57 @@ def _in(hours):
 def stub_pi(app_module, monkeypatch):
     """Installs a fake colony layout for every signed-in test character.
 
-    Takes {planet_id: [pins]} and serves it through the same two functions the
-    real fetch calls, so `_fetch_pi_colonies` is exercised for real.
+    Takes {planet_id: [pins]} and writes it into `pi_colony_cache`, which is
+    what the pages read.
+
+    It used to stub `fetch_planets` and `fetch_planet_detail`. Both pages
+    stopped calling them in v0.9.53 — the sync worker fetches, the pages read —
+    so the stubs were installed and ignored and every assertion here failed
+    against an empty page. Seeding the cache is the repair *and* the more
+    honest fixture: it exercises the path a real request takes rather than one
+    that now exists only under test.
     """
+    from app.character import planets as planets_api
+
     # Start each test from an empty extractor cache — the planner writes to it.
     conn = app_module.get_conn()
     try:
         planets_router._ensure_pi_cache_tables(conn)
         conn.execute("DELETE FROM pi_extractor_cache")
+        conn.execute("DELETE FROM pi_colony_cache")
         conn.commit()
     finally:
         conn.close()
 
     def install(colonies_by_planet, forbidden=False):
-        # Pre-cache planet names. A real install has them from a /planets visit,
-        # and it keeps _resolve_planet_names from reaching for ESI — the one
-        # place this feature could otherwise touch the network.
         conn = app_module.get_conn()
         try:
+            # Planet names, as a real install has them: the worker resolves
+            # them once, permanently, during the colony fetch.
             for planet_id in colonies_by_planet:
                 conn.execute(
                     "INSERT OR REPLACE INTO planet_name_cache (planet_id, name) VALUES (?,?)",
                     (planet_id, f"Testworld {planet_id}"))
+
+            if forbidden:
+                planets_api.save_cached_colonies(
+                    conn, PI_CHAR, [], [], planets_api.FORBIDDEN)
+            else:
+                colonies = [{"planet_id": pid, "planet_type": "barren",
+                             "upgrade_level": 5, "num_pins": len(pins)}
+                            for pid, pins in colonies_by_planet.items()]
+                details = [{"pins": pins, "links": [], "routes": []}
+                           for _pid, pins in colonies_by_planet.items()]
+                planets_api.save_cached_colonies(conn, PI_CHAR, colonies, details)
+
+            # The other seeded character has no PI — synced, and empty, which is
+            # a different thing from never synced and has to be said so.
+            for cid, _name in app_module.list_characters(conn):
+                if cid != PI_CHAR:
+                    planets_api.save_cached_colonies(conn, cid, [], [])
             conn.commit()
         finally:
             conn.close()
-
-        async def fake_fetch_planets(client, char_id, token):
-            if forbidden:
-                return "forbidden"
-            if char_id != PI_CHAR:
-                return []                    # the other seeded character has no PI
-            return [{"planet_id": pid, "planet_type": "barren", "upgrade_level": 5,
-                     "num_pins": len(pins)}
-                    for pid, pins in colonies_by_planet.items()]
-
-        async def fake_fetch_detail(client, char_id, planet_id, token):
-            return {"pins": colonies_by_planet.get(planet_id, []), "links": [], "routes": []}
-
-        monkeypatch.setattr(planets_router.planets_api, "fetch_planets", fake_fetch_planets)
-        monkeypatch.setattr(planets_router.planets_api, "fetch_planet_detail", fake_fetch_detail)
     return install
 
 
@@ -685,9 +696,12 @@ def test_planner_does_not_fetch_planet_names_it_already_has(client, stub_pi, app
     calls = []
     real = planets_router._resolve_planet_names
 
-    async def spy(conn, planet_ids):
+    # Synchronous now: the resolver reads the cache and never fetches, so there
+    # is nothing to await. The sync worker resolves a planet's name once, ever,
+    # during the colony fetch.
+    def spy(conn, planet_ids):
         calls.append(set(planet_ids))
-        return await real(conn, planet_ids)
+        return real(conn, planet_ids)
 
     monkeypatch.setattr(planets_router, "_resolve_planet_names", spy)
     stub_pi({4001: [_factory_pin(COOLANT_SCHEMATIC)]})
