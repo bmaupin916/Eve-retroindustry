@@ -9,7 +9,8 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   Postgres is reachable.
 * **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
-* Step 4 is **3 of 8** items, plus the Postgres groundwork.
+* Step 4 is **3 of 8** items, plus the Postgres groundwork. The query
+  conversion has started: `projects` is done, ten modules to go.
 
 To bring the Postgres tests back:
 
@@ -40,20 +41,32 @@ nobody had thought of.
 `EVE_BUNDLE_DIR` is still frozen, deliberately: it points at the code, and
 getting it wrong renders a 500 rather than deleting a database.
 
-## 1. The query conversion — atomic
+## 1. The query conversion — module by module
 
 **Target:** `app/db/conn.py`, proven on both backends (`tests/test_db_conn.py`,
 `tests/test_postgres_schema.py`).
 
-`?` + tuple → `:name` + dict, then `get_conn()` returns a SQLAlchemy
-`Connection`. Roughly 316 statements. W6 went first so this lands in eleven
-reviewable files instead of one; the routers can be converted one at a time,
-but **the flip itself cannot** — `get_conn()` is shared, so the last commit
-changes every remaining call site at once.
+`?` + tuple → `:name` + dict, and take the connection from
+`app.db.conn.connect()` instead of `deps.get_conn()`. Roughly 316 statements.
 
-Suggested order, smallest first: `projects` (150 lines), `media`, `industry`,
-`contracts`, `characters`, `planets`, `locations`, `prices`, `assets`, `plan`,
-then `deps.py` + `main.py` + the flip.
+**This was written down as atomic and it is not.** A converted module can use
+`connect()` while everything else still uses `get_conn()` — same file, same
+process, each sees the other's committed writes
+(`test_both_connection_styles_work_on_one_database`). So each module ships on
+its own, and what is left at the end is deleting `get_conn()` once nothing
+calls it.
+
+Order, smallest first — `projects` is **done** and is the worked example:
+`media`, `industry`, `contracts`, `characters`, `planets`, `locations`,
+`prices`, `assets`, `plan`, then `deps.py` and `main.py`.
+
+**Convert the router and its `*_helper.py` together.** The helpers take the
+connection as an argument, so half a slice does not run.
+
+**Check coverage before converting, not after.** `projects` had eight write
+endpoints and no test beyond `/projects` returning 200. Writing the tests found
+a live counting bug that had nothing to do with the conversion. Assume the
+next module is the same until shown otherwise.
 
 **Traps, each already pinned by a test or found the hard way:**
 
@@ -69,7 +82,15 @@ then `deps.py` + `main.py` + the flip.
   so readers of results do not have to change.
 * **`upsert()` still emits `?`** by design, because its callers pass tuples. It
   has to start emitting named binds in the same commit as its call sites.
-* **`cursor.lastrowid`** has no direct equivalent; use `RETURNING id`.
+* **`cursor.lastrowid`** has no equivalent; `RETURNING id` replaces it and
+  needs SQLite >= 3.35 (3.49.1 here, asserted rather than assumed).
+* **`ON CONFLICT ... DO UPDATE SET x = x + excluded.x`** — the bare `x` on the
+  right means the stored row on SQLite and the *proposed* row on Postgres.
+  Qualify it: `SET x = tbl.x + excluded.x`.
+* **Two LEFT JOINs off one row is a cartesian product**, so `SUM(CASE ...)`
+  over either of them counts each match once per row of the other. Use
+  `COUNT(DISTINCT CASE WHEN ... THEN id END)`. This was live in
+  `list_projects`.
 
 **Verify:** full suite on SQLite, then the same suite with `EVE_DATABASE_URL`
 pointed at the container. Both must pass before the commit lands.
