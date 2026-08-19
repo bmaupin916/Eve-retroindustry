@@ -172,3 +172,48 @@ def test_an_explicit_url_is_never_overridden(tmp_path, monkeypatch):
 
     assert APP_TABLES <= _tables(target)
     assert not decoy.exists(), "the migration went to the configured database, not the one asked for"
+
+
+def test_a_migration_survives_the_table_already_existing(tmp_path):
+    """`ensure_schema()` and `create_all` both build the whole declaration, and
+    both can run before Alembic does.
+
+    `app/db/database.py` calls `create_all` at *import*, so on an existing
+    deployment every declared table exists by the time the startup handler
+    reaches `upgrade_to_head()`. A migration written the obvious way then fails
+    with "table already exists", the revision is never stamped, and the app
+    logs MIGRATION FAILED on every restart from then on. That is not
+    hypothetical — it is what the first version of 0002 did, found by starting
+    the real app rather than by any test.
+    """
+    import sqlite3
+
+    from app.db.migrate import upgrade_to_head
+    from app.db.schema import apply_schema
+
+    from alembic import command
+
+    from app.db.migrate import alembic_config
+
+    db = tmp_path / "already-there.db"
+    url = f"sqlite:///{db}"
+
+    # An existing deployment: stamped at the previous revision, with every
+    # table the *current* declaration knows about already present, because
+    # `create_all` ran at import before the startup handler got here. A
+    # database with tables and no `alembic_version` takes the stamp path
+    # instead and never runs a migration body at all — which is why the first
+    # version of this test proved nothing.
+    conn = sqlite3.connect(db)
+    apply_schema(conn)
+    conn.close()
+    command.stamp(alembic_config(url), "5c9156e72c43")
+
+    revision = upgrade_to_head(url)        # must not raise
+
+    conn = sqlite3.connect(db)
+    stamped = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    conn.close()
+    assert stamped is not None, "the database was left unstamped"
+    assert revision == stamped[0]
+    assert revision != "5c9156e72c43", "the upgrade did not advance the revision"

@@ -9,8 +9,8 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   Postgres is reachable.
 * **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
-* Step 4 is **6 of 8** items, plus the Postgres groundwork. What is left is
-  the background sync worker and the cache-only routes that depend on it. The query
+* Step 4 is **7 of 8** items, plus the Postgres groundwork. What is left is
+  cache-only routes, and ten modules of query conversion. The query
   conversion has started: `projects` is done, ten modules to go.
 
 To bring the Postgres tests back:
@@ -103,19 +103,15 @@ Ordered by dependency, not by size.
 * ~~**W9 — async token refresh.**~~ **Done.** 22 call sites across six routers.
   The net is `tests/test_async_token_refresh.py`, which scans for the blocking
   call inside any coroutine — keep it green rather than re-auditing by hand.
-* **Background sync worker** — the loop itself. Delay-after-completion plus
-  jitter, so N characters do not stampede ESI in lockstep.
+* ~~**Background sync worker.**~~ **Done.** `app/sync/worker.py`, started from
+  the app's startup handler, stopped on shutdown. `EVE_SYNC_WORKER=0` turns it
+  off; `tests/conftest.py` sets that, because otherwise every
+  `with TestClient(app)` would start a loop against live ESI.
 
-  **The event model is decided and built**: `sync_events` (append-only,
-  monotonic id) and `app/sync/events.py`. The worker emits with `events.emit()`
-  in the same transaction as the cache write it describes, and calls
-  `events.trim()` so the log stays bounded. Add any new kind to
-  `events.KINDS` — a kind that exists only at a call site is a subscriber that
-  silently never fires, and `emit()` refuses one.
+  It syncs blueprints, assets, skills and corp assets. Jobs, planets,
+  contracts, orders and wallet are still fetched on the request path — moving
+  those is the cache-only item below, and the worker is where they go.
 
-  Still to decide when writing the loop: what counts as "changed" for each
-  cache. Comparing whole JSON blobs would emit on every reorder; the cheap
-  honest version is a count and a hash of the sorted ids.
 * **Cache-only routes** — no route fetches from ESI on the request path.
   `margins.py` is the reference, including how it reports what it could not
   price.

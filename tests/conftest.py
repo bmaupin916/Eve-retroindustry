@@ -65,6 +65,10 @@ os.environ["EVE_BUNDLE_DIR"] = REPO
 # check off, so the Host path stays exercised.
 os.environ["EVE_ALLOWED_HOSTS"] = "testserver,localhost,127.0.0.1"
 os.environ.pop("EVE_OWNER_CHARACTER_ID", None)
+# The background sync worker is default-on, because a deployment without it is a
+# set of caches nobody refreshes. A test run is the other case entirely: every
+# `with TestClient(app)` would start a loop that fetches from live ESI.
+os.environ["EVE_SYNC_WORKER"] = "0"
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 

@@ -116,6 +116,7 @@ from app.character.skills import (
     get_mfg_skill_ids,
 )
 from app.db.migrate import upgrade_to_head
+from app.sync import worker as sync_worker
 from app.db.schema import (
     ensure_schema as ensure_db_schema,
     ensure_sde_schema,
@@ -291,6 +292,28 @@ async def _startup_populate_groups():
         conn.close()
     except Exception:
         _SDE_READY[0] = False
+
+    # Last, and outside the try above: a failure to read the SDE must not stop
+    # the caches being kept warm, and a failure to start the worker must not
+    # take the app down with it.
+    try:
+        worker = sync_worker.start()
+        if worker is not None:
+            print(f"[sync] background worker started, every "
+                  f"{worker.interval / 60:.0f} min per character", flush=True)
+        else:
+            print("[sync] background worker disabled (EVE_SYNC_WORKER)", flush=True)
+    except Exception as exc:
+        print(f"[sync] could not start the background worker: {exc}", flush=True)
+
+
+@app.on_event("shutdown")
+async def _shutdown_sync_worker():
+    """Stop the loop so a reload does not leave a second one running."""
+    try:
+        await sync_worker.stop()
+    except Exception:
+        pass
 
 
 _WALLET_CACHE_TTL = 300.0  # 5 minutes

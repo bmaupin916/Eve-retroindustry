@@ -30,7 +30,24 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _has(table: str) -> bool:
+    """Whether the table is already there.
+
+    It legitimately can be. `ensure_schema()` creates every declared table with
+    `CREATE TABLE IF NOT EXISTS` on the first connection of the process, and
+    `app/db/database.py` runs `create_all` at import — so on an existing
+    install the table can exist before Alembic is asked to add it. A migration
+    that assumes otherwise fails on every upgrade of a running deployment,
+    which is exactly what happened the first time this one ran.
+    """
+    return sa.inspect(op.get_bind()).has_table(table)
+
+
 def upgrade() -> None:
+    if _has('sync_events'):
+        # Nothing to build; the revision still gets stamped, which is the point.
+        return
+
     op.create_table(
         'sync_events',
         sa.Column('id', sa.Integer(), nullable=False),
@@ -48,6 +65,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if not _has('sync_events'):
+        return
     op.drop_index('idx_sync_events_character', table_name='sync_events')
     op.drop_index('idx_sync_events_id_kind', table_name='sync_events')
     op.drop_table('sync_events')
