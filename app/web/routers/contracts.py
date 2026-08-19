@@ -333,7 +333,11 @@ async def api_public_index(request: Request, region_id: int):
                 yield chunk
         finally:
             conn.close()
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/api/contracts/public/items")

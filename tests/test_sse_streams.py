@@ -11,8 +11,12 @@ plumbing.
 """
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
+REPO = Path(__file__).resolve().parent.parent
 SSE_BODY = "data: one\n\ndata: two\n\n"
 
 
@@ -112,4 +116,68 @@ def test_the_jita_refresh_stream_also_streams(client, monkeypatch):
 
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/event-stream")
+    assert r.text == SSE_BODY, repr(r.text)
+
+
+# ── every SSE response, not just the ones with a test above ──────────────────
+
+def _sse_responses():
+    """(file, line) for every StreamingResponse declared as text/event-stream."""
+    found = []
+    for path in sorted((REPO / "app").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "StreamingResponse"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            media = kw.get("media_type")
+            if isinstance(media, ast.Constant) and media.value == "text/event-stream":
+                found.append((path.relative_to(REPO).as_posix(), node.lineno, kw))
+    return found
+
+
+def test_every_sse_response_sends_the_anti_buffering_headers():
+    """A scan, not a list — the point is to cover the next one too.
+
+    /api/contracts/public/index was written without these while the three price
+    streams had them, and nothing said so: behind nginx an SSE response without
+    `X-Accel-Buffering: no` is held back and delivered in one lump at the end,
+    which looks exactly like a progress bar that does not move. On the hosted
+    deployment Step 3 is heading for, that is the default configuration.
+    """
+    missing = []
+    for path, lineno, kw in _sse_responses():
+        headers = kw.get("headers")
+        keys = set()
+        if isinstance(headers, ast.Dict):
+            keys = {k.value for k in headers.keys if isinstance(k, ast.Constant)}
+        for needed in ("Cache-Control", "X-Accel-Buffering"):
+            if needed not in keys:
+                missing.append(f"{path}:{lineno} is missing {needed}")
+
+    assert not missing, "SSE responses that will buffer:\n  " + "\n  ".join(missing)
+
+
+def test_the_scan_actually_finds_the_streams():
+    """Guards the test above: a scan that matches nothing passes vacuously."""
+    found = _sse_responses()
+    assert len(found) >= 4, f"expected at least 4 SSE responses, found {found}"
+
+
+def test_public_contract_index_streams(client, monkeypatch):
+    from app.web.routers import contracts as contracts_router
+
+    async def _fake(conn, region_id):
+        yield "data: one\n\n"
+        yield "data: two\n\n"
+
+    monkeypatch.setattr(contracts_router.contracts_helper, "stream_public_index", _fake)
+
+    r = client.get("/api/contracts/public/index?region_id=10000002")
+
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    assert r.headers.get("x-accel-buffering") == "no"
     assert r.text == SSE_BODY, repr(r.text)
