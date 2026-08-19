@@ -9,8 +9,11 @@ board costs no ESI calls.
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from urllib.parse import quote
+
+from sqlalchemy import bindparam, text
+from sqlalchemy import text as sql
+from sqlalchemy.engine import Connection
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -18,10 +21,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from app.auth.token_store import list_characters
 from app.character import jobs as jobs_api
 from app.character.skills import get_cached_skills
-from app.esi.client import esi_client
 from app.web import margins_helper, reactions_helper
 from app.db.location import database_path
-from app.web.deps import _tr, _valid_token_async, get_conn
+from app.db.conn import connect, dbapi
+from app.web.deps import _tr, _valid_token_async
 from app.web.location_resolver import (
     load_location_names_from_db,
     resolve_station_names_bulk,
@@ -54,8 +57,13 @@ _SLOT_ORDER = (
 
 @router.get("/jobs", response_class=HTMLResponse)
 async def jobs_page(request: Request):
-    conn = get_conn()
-    chars = list_characters(conn)
+    conn = connect()
+    # `app/character/*` and `location_resolver` are not converted yet, so they
+    # get the driver connection from underneath this one — same connection,
+    # same transaction. Every `raw` here is a boundary that disappears when
+    # those modules are converted.
+    raw = dbapi(conn)
+    chars = list_characters(raw)
     if not chars:
         conn.close()
         return _tr("jobs.html", request, {"groups": [], "error": "You are not signed in.",
@@ -70,7 +78,7 @@ async def jobs_page(request: Request):
     raw_results = []
     oldest: float | None = None
     for cid, _name in chars:
-        jobs, cached_at = jobs_api.load_cached_jobs(conn, cid)
+        jobs, cached_at = jobs_api.load_cached_jobs(raw, cid)
         raw_results.append((cid, jobs))
         if jobs is not None:
             oldest = cached_at if oldest is None else min(oldest, cached_at)
@@ -93,9 +101,10 @@ async def jobs_page(request: Request):
 
     type_names: dict[int, str] = {}
     if all_type_ids:
-        ph = ",".join("?" * len(all_type_ids))
         type_names = {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})", list(all_type_ids)
+            text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(all_type_ids)},
         ).fetchall()}
     loc_names: dict[int, str] = {}
     if all_loc_ids:
@@ -105,9 +114,10 @@ async def jobs_page(request: Request):
         tokens = await asyncio.gather(*[_valid_token_async(cid) for cid, _ in chars])
         any_tok = next((t for t in tokens if t), None)
         try:
-            loc_names = await resolve_station_names_bulk(list(all_loc_ids), token=any_tok, conn=conn)
+            loc_names = await resolve_station_names_bulk(
+                list(all_loc_ids), token=any_tok, conn=raw)
         except Exception:
-            loc_names = load_location_names_from_db(conn)
+            loc_names = load_location_names_from_db(raw)
 
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc)
@@ -167,7 +177,7 @@ async def jobs_page(request: Request):
 
         # Slot occupancy by category (how many of how many). Max = base 1 +
         # both skill levels; None if the skills aren't synced yet.
-        skills = get_cached_skills(conn, cid)
+        skills = get_cached_skills(raw, cid)
         used = {"manufacturing": 0, "science": 0, "reactions": 0}
         for j in active:
             cat = _SLOT_CATEGORY.get(j.get("activity_id", 0))
@@ -209,7 +219,7 @@ async def reactions_page(request: Request, sort: str = "", dir: str = "",
     119 products and pricing all of them measured well under a second, so the
     page just recomputes rather than storing what it last thought.
     """
-    conn = get_conn()
+    conn = connect()
     try:
         view = reactions_helper.build_board(
             conn, database_path(),
@@ -230,7 +240,7 @@ async def margins_page(request: Request, msg: str = ""):
     rendering a watchlist of any size costs no ESI calls. Refresh the numbers
     by refreshing prices on /prices as usual.
     """
-    conn = get_conn()
+    conn = connect()
     try:
         view = margins_helper.build_view_model(conn, database_path(), message=msg or None)
     finally:
@@ -240,7 +250,7 @@ async def margins_page(request: Request, msg: str = ""):
 
 @router.post("/margins/add")
 async def margins_add(product: str = Form(...), me: str = Form("0"), te: str = Form("0")):
-    conn = get_conn()
+    conn = connect()
     try:
         row = _resolve_product_name(conn, product)
         if row is None:
@@ -255,7 +265,7 @@ async def margins_add(product: str = Form(...), me: str = Form("0"), te: str = F
 
 @router.post("/margins/remove")
 async def margins_remove(item_id: int = Form(...)):
-    conn = get_conn()
+    conn = connect()
     try:
         margins_helper.remove_item(conn, item_id)
     finally:
@@ -265,7 +275,7 @@ async def margins_remove(item_id: int = Form(...)):
 
 @router.post("/margins/clear")
 async def margins_clear():
-    conn = get_conn()
+    conn = connect()
     try:
         margins_helper.clear_all(conn)
     finally:
@@ -282,18 +292,29 @@ def _safe_int(raw: str, fallback: int) -> int:
         return fallback
 
 
-def _resolve_product_name(conn: sqlite3.Connection, text: str):
-    """Exact name, then a prefix match, then the raw type_id."""
-    text = (text or "").strip()
-    if not text:
+def _resolve_product_name(conn: Connection, name: str):
+    """Exact name, then a prefix match, then the raw type_id.
+
+    The parameter used to be called `text`, which now collides with
+    SQLAlchemy's `text()` — hence `sql` as the import alias here and `raw` for
+    the value. A shadowed import fails at the call, not at the import, so it
+    would have looked like a query bug.
+    """
+    raw = (name or "").strip()
+    if not raw:
         return None
-    if text.isdigit():
+    if raw.isdigit():
         return conn.execute(
-            "SELECT type_id, name FROM sde_types WHERE type_id=?", (int(text),)).fetchone()
+            sql("SELECT type_id, name FROM sde_types WHERE type_id = :tid"),
+            {"tid": int(raw)}).fetchone()
     row = conn.execute(
-        "SELECT type_id, name FROM sde_types WHERE LOWER(name)=?", (text.lower(),)).fetchone()
+        sql("SELECT type_id, name FROM sde_types WHERE LOWER(name) = :name"),
+        {"name": raw.lower()}).fetchone()
     if row:
         return row
+    # LENGTH() is in both dialects; CHAR_LENGTH() is the SQL-standard spelling
+    # but SQLite does not have it, so LENGTH() is the portable one here.
     return conn.execute(
-        "SELECT type_id, name FROM sde_types WHERE LOWER(name) LIKE ? "
-        "ORDER BY LENGTH(name) LIMIT 1", (text.lower() + "%",)).fetchone()
+        sql("SELECT type_id, name FROM sde_types WHERE LOWER(name) LIKE :prefix"
+            " ORDER BY LENGTH(name) LIMIT 1"),
+        {"prefix": raw.lower() + "%"}).fetchone()

@@ -35,21 +35,12 @@ basis.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import sqlite3
 
-def _sde_conn(db_path: str):
-    """A portable connection for the parts already converted.
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 
-    `BOMResolver` and `app.manufacturing.invention` take a SQLAlchemy
-    Connection now; everything else in this module still speaks sqlite3 through
-    the `conn` it is handed. Both open the same database and see each other's
-    committed writes, which is exactly the property that lets the query
-    conversion proceed one module at a time. This helper disappears when this
-    module is converted and its caller passes the connection in.
-    """
-    from app.db.conn import connect_to_path
-    return connect_to_path(db_path)
-
+from app.db.conn import (NO_SUCH_TABLE as _NO_SUCH_TABLE, dbapi,
+                         recover_from_missing_table as _recover)
 
 from app.bom.resolver import (
     BOMResolver, InventionParams, StationFacility, total_invention_cost,
@@ -107,7 +98,7 @@ class MarginRow:
         return self.error is None and not self.unpriced and self.sell_price is not None
 
 
-def _cached_prices(conn: sqlite3.Connection,
+def _cached_prices(conn: Connection,
                    type_ids: set[int]) -> tuple[dict[int, tuple], set[int]]:
     """`({type_id: (sell, buy)}, overridden_ids)` — custom overrides winning.
 
@@ -121,20 +112,24 @@ def _cached_prices(conn: sqlite3.Connection,
     """
     if not type_ids:
         return {}, set()
-    placeholders = ",".join("?" * len(type_ids))
     ids = list(type_ids)
     prices = {r[0]: (r[1], r[2]) for r in conn.execute(
-        f"SELECT type_id, sell_price, buy_price FROM market_price_cache "
-        f"WHERE type_id IN ({placeholders})", ids)}
+        text("SELECT type_id, sell_price, buy_price FROM market_price_cache"
+             " WHERE type_id IN :ids")
+        .bindparams(bindparam("ids", expanding=True)),
+        {"ids": ids})}
     overridden: set[int] = set()
     try:
         for type_id, override in conn.execute(
-            f"SELECT type_id, price FROM custom_price_override WHERE type_id IN ({placeholders})", ids
+            text("SELECT type_id, price FROM custom_price_override"
+                 " WHERE type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": ids},
         ):
             prices[type_id] = (override, override)
             overridden.add(type_id)
-    except sqlite3.OperationalError:
-        pass                      # overrides table not created yet
+    except _NO_SUCH_TABLE:
+        _recover(conn)            # overrides table not created yet
     return prices, overridden
 
 
@@ -147,15 +142,16 @@ def _pick(price: tuple | None, basis: str) -> float | None:
     return chosen if chosen else None
 
 
-def _avg_day_volume(conn: sqlite3.Connection, type_id: int, days: int = 30) -> float | None:
+def _avg_day_volume(conn: Connection, type_id: int, days: int = 30) -> float | None:
     """Average units/day traded, from the cached daily history.
 
     Falls back to the 7-day regional figure on `market_price_cache` when no
     history has been pulled for this type.
     """
     row = conn.execute(
-        "SELECT data_json FROM price_history_cache WHERE region_id=? AND type_id=?",
-        (JITA_REGION, type_id),
+        text("SELECT data_json FROM price_history_cache"
+             " WHERE region_id = :region AND type_id = :tid"),
+        {"region": JITA_REGION, "tid": type_id},
     ).fetchone()
     if row and row[0]:
         import json
@@ -167,19 +163,22 @@ def _avg_day_volume(conn: sqlite3.Connection, type_id: int, days: int = 30) -> f
         if recent:
             return sum(recent) / len(recent)
     fallback = conn.execute(
-        "SELECT volume FROM market_price_cache WHERE type_id=?", (type_id,)
+        text("SELECT volume FROM market_price_cache WHERE type_id = :tid"),
+        {"tid": type_id},
     ).fetchone()
     if fallback and fallback[0]:
         return fallback[0] / 7.0          # the cached figure is a 7-day total
     return None
 
 
-def _station_context(conn: sqlite3.Connection, defaults: dict) -> dict:
+def _station_context(conn: Connection, defaults: dict) -> dict:
     """Cost-index and bonus inputs for both activities, read from cache only."""
     from app.web.industry_helper import (
         get_station_cost_bonus, get_station_facility, get_station_te_multiplier,
     )
 
+    # industry_helper is not converted yet, so it gets the driver connection.
+    raw = dbapi(conn)
     build = int(defaults.get("build_station_id") or 0)
     reaction = int(defaults.get("reaction_station_id") or 0) or build
 
@@ -187,8 +186,9 @@ def _station_context(conn: sqlite3.Connection, defaults: dict) -> dict:
         if not location_id:
             return None
         row = conn.execute(
-            "SELECT solar_system_id FROM location_name_cache WHERE location_id=?",
-            (location_id,),
+            text("SELECT solar_system_id FROM location_name_cache"
+                 " WHERE location_id = :lid"),
+            {"lid": location_id},
         ).fetchone()
         return row[0] if row and row[0] else None
 
@@ -199,10 +199,12 @@ def _station_context(conn: sqlite3.Connection, defaults: dict) -> dict:
             return 0.0, False
         try:
             row = conn.execute(
-                "SELECT cost_index FROM sci_cache WHERE solar_system_id=? AND activity=?",
-                (system_id, activity),
+                text("SELECT cost_index FROM sci_cache"
+                     " WHERE solar_system_id = :sid AND activity = :activity"),
+                {"sid": system_id, "activity": activity},
             ).fetchone()
-        except sqlite3.OperationalError:
+        except _NO_SUCH_TABLE:
+            _recover(conn)
             return 0.0, False
         return (row[0], True) if row and row[0] is not None else (0.0, False)
 
@@ -210,8 +212,8 @@ def _station_context(conn: sqlite3.Connection, defaults: dict) -> dict:
     rxn_sci, rxn_cached = _sci(_system(reaction), "reaction")
     mfg_tax = float(defaults.get("facility_tax") or 0) / 100
     rxn_tax = float(defaults.get("reaction_facility_tax") or 0) / 100
-    mfg_bonus = get_station_cost_bonus(conn, build) if build else 0.0
-    rxn_bonus = get_station_cost_bonus(conn, reaction) if reaction else mfg_bonus
+    mfg_bonus = get_station_cost_bonus(raw, build) if build else 0.0
+    rxn_bonus = get_station_cost_bonus(raw, reaction) if reaction else mfg_bonus
 
     return {
         "build_station_id": build,
@@ -219,10 +221,10 @@ def _station_context(conn: sqlite3.Connection, defaults: dict) -> dict:
         "rate_mfg": mfg_sci * (1.0 - mfg_bonus) + mfg_tax + SCC,
         "rate_rxn": rxn_sci * (1.0 - rxn_bonus) + rxn_tax + SCC,
         "sci_cached": mfg_cached and rxn_cached,
-        "mfg_facility": get_station_facility(conn, build) if build else StationFacility(),
-        "rxn_facility": get_station_facility(conn, reaction) if reaction else StationFacility(),
-        "mfg_te_mult": get_station_te_multiplier(conn, build) if build else 1.0,
-        "rxn_te_mult": get_station_te_multiplier(conn, reaction) if reaction else 1.0,
+        "mfg_facility": get_station_facility(raw, build) if build else StationFacility(),
+        "rxn_facility": get_station_facility(raw, reaction) if reaction else StationFacility(),
+        "mfg_te_mult": get_station_te_multiplier(raw, build) if build else 1.0,
+        "rxn_te_mult": get_station_te_multiplier(raw, reaction) if reaction else 1.0,
     }
 
 
@@ -257,7 +259,7 @@ def _build_time(node, te: int, defaults: dict, ctx: dict,
 
 
 def compute_margin(
-    conn: sqlite3.Connection,
+    conn: Connection,
     db_path: str,
     type_id: int,
     me: int,
@@ -271,9 +273,10 @@ def compute_margin(
     `build_invention_params` output — pass both in when pricing a whole
     watchlist so the station and datacore lookups happen once, not per row."""
     name_row = conn.execute(
-        "SELECT t.name, g.name FROM sde_types t "
-        "LEFT JOIN sde_groups g ON g.group_id = t.group_id WHERE t.type_id=?",
-        (type_id,),
+        text("SELECT t.name, g.name FROM sde_types t "
+             "LEFT JOIN sde_groups g ON g.group_id = t.group_id"
+             " WHERE t.type_id = :tid"),
+        {"tid": type_id},
     ).fetchone()
     row = MarginRow(
         type_id=type_id,
@@ -287,16 +290,15 @@ def compute_margin(
     basis = str(defaults.get("input_basis") or "sell")
 
     from app.web.industry_helper import get_adjusted_prices_cached
-    adjusted = get_adjusted_prices_cached(conn)
+    adjusted = get_adjusted_prices_cached(dbapi(conn))   # not converted yet
 
     inv_params, inv_warnings = (
         inv if inv is not None else build_invention_params(
             conn, defaults, basis, db_path))
     row.unpriced.extend(inv_warnings)
 
-    sde = _sde_conn(db_path)
     resolver = BOMResolver(
-        sde,
+        conn,
         blueprints=blueprints or [],
         runs_per_job=None,                # one batched job — this is a rate, not a job queue
         adjusted_prices=adjusted,
@@ -371,10 +373,10 @@ def compute_margin(
         row.day_volume = _avg_day_volume(conn, type_id)
         return row
     finally:
-        sde.close()
+        pass
 
 
-def build_invention_params(conn: sqlite3.Connection, defaults: dict,
+def build_invention_params(conn: Connection, defaults: dict,
                            basis: str, db_path: str) -> tuple[InventionParams | None, list[str]]:
     """Invention settings for the resolver, plus anything left unpriced.
 
@@ -402,13 +404,9 @@ def build_invention_params(conn: sqlite3.Connection, defaults: dict,
     if not int(defaults.get("invent_t2", 1) or 0):
         return None, []
 
-    sde = _sde_conn(db_path)
-    try:
-        decryptor = invention_mod.load_decryptor(
-            sde, int(defaults.get("decryptor_type_id") or 0))
-        wanted = invention_mod.invention_material_ids(sde)
-    finally:
-        sde.close()
+    decryptor = invention_mod.load_decryptor(
+        conn, int(defaults.get("decryptor_type_id") or 0))
+    wanted = invention_mod.invention_material_ids(conn)
     if decryptor:
         wanted.add(decryptor.type_id)
     cached, dc_overridden = _cached_prices(conn, wanted)
@@ -442,7 +440,7 @@ def build_invention_params(conn: sqlite3.Connection, defaults: dict,
     return params, warnings
 
 
-def _packaged_volume(conn: sqlite3.Connection, type_id: int) -> float | None:
+def _packaged_volume(conn: Connection, type_id: int) -> float | None:
     """Packaged m³, or None when the SDE predates the column.
 
     None is deliberate: profit-per-m³ is meaningless without it, and a made-up
@@ -455,8 +453,10 @@ def _packaged_volume(conn: sqlite3.Connection, type_id: int) -> float | None:
     """
     try:
         row = conn.execute(
-            "SELECT packaged_volume FROM sde_types WHERE type_id=?", (type_id,)).fetchone()
-    except sqlite3.OperationalError:
+            text("SELECT packaged_volume FROM sde_types WHERE type_id = :tid"),
+            {"tid": type_id}).fetchone()
+    except _NO_SUCH_TABLE:
+        _recover(conn)
         return None
     return row[0] if row and row[0] else None
 
@@ -468,7 +468,7 @@ def _total_job_fee(node) -> float:
     return total
 
 
-def _blueprint_times(conn: sqlite3.Connection, node) -> dict[int, tuple]:
+def _blueprint_times(conn: Connection, node) -> dict[int, tuple]:
     """{blueprint_type_id: (manufacturing_time, reaction_time)} for the tree."""
     ids: set[int] = set()
 
@@ -481,7 +481,8 @@ def _blueprint_times(conn: sqlite3.Connection, node) -> dict[int, tuple]:
     walk(node)
     if not ids:
         return {}
-    placeholders = ",".join("?" * len(ids))
     return {r[0]: (r[1], r[2]) for r in conn.execute(
-        f"SELECT blueprint_type_id, manufacturing_time, reaction_time FROM sde_blueprints "
-        f"WHERE blueprint_type_id IN ({placeholders})", list(ids))}
+        text("SELECT blueprint_type_id, manufacturing_time, reaction_time"
+             " FROM sde_blueprints WHERE blueprint_type_id IN :ids")
+        .bindparams(bindparam("ids", expanding=True)),
+        {"ids": list(ids)})}

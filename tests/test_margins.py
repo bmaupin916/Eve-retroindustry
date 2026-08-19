@@ -13,13 +13,13 @@ import tempfile
 
 import pytest
 
-from app.db.conn import connect_to_path
+from app.db.conn import connect_to_path, dbapi
 
 
 def _db_file(conn) -> str:
     """The file a sqlite3 connection is attached to. `database_list` returns
     (seq, name, file) per attached database; `main` is the one we opened."""
-    return [r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"][0]
+    return [r[2] for r in conn.exec_driver_sql("PRAGMA database_list") if r[1] == "main"][0]
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SDE = os.path.join(REPO, "sde_base.db")
@@ -36,16 +36,23 @@ def db(tmp_path):
     conn = sqlite3.connect(path)
     from app.market.prices import ensure_price_table
     from app.web.industry_helper import ensure_industry_tables
-    from app.web.margins_helper import ensure_margin_tables
     ensure_price_table(conn)
     ensure_industry_tables(conn)
-    ensure_margin_tables(conn)
-    yield path, conn
+    from app.db.schema import ensure_schema
+    ensure_schema(conn)          # the shim wants a SQLAlchemy conn now
     conn.close()
+
+    # The module under test is on the portable query layer now, so the fixture
+    # hands out a SQLAlchemy connection. Schema creation above stays on the
+    # DBAPI because `app/db/schema.py` has not been converted yet — it is the
+    # same file either way.
+    engine_conn = connect_to_path(path)
+    yield path, engine_conn
+    engine_conn.close()
 
 
 def _price(conn, type_id, sell, buy=None):
-    conn.execute(
+    conn.exec_driver_sql(
         "INSERT OR REPLACE INTO market_price_cache (type_id, sell_price, buy_price, cached_at) "
         "VALUES (?,?,?,?)", (type_id, sell, buy if buy is not None else sell * 0.9, 0))
     conn.commit()
@@ -94,7 +101,7 @@ def test_profit_is_sell_minus_materials_and_fees(db):
     leaves = _price_whole_tree(conn, path, CRANE, me=0, unit_price=10.0)
     _price(conn, CRANE, 500_000_000.0)
 
-    row = compute_margin(conn, path, CRANE, me=0, te=0, defaults=get_defaults(conn))
+    row = compute_margin(conn, path, CRANE, me=0, te=0, defaults=get_defaults(dbapi(conn)))
 
     assert row.name == "Crane"
     assert row.group_name == "Blockade Runner"        # the Group column
@@ -132,13 +139,13 @@ def test_unpriced_material_is_reported_not_treated_as_free(db):
 
     leaves = _price_whole_tree(conn, path, CRANE, me=0, unit_price=10.0)
     _price(conn, CRANE, 500_000_000.0)
-    priced_cost = compute_margin(conn, path, CRANE, 0, 0, get_defaults(conn)).material_cost
+    priced_cost = compute_margin(conn, path, CRANE, 0, 0, get_defaults(dbapi(conn))).material_cost
 
     # Drop one leaf's price and re-price.
     dropped = sorted(leaves)[0]
-    conn.execute("DELETE FROM market_price_cache WHERE type_id=?", (dropped,))
+    conn.exec_driver_sql("DELETE FROM market_price_cache WHERE type_id=?", (dropped,))
     conn.commit()
-    row = compute_margin(conn, path, CRANE, 0, 0, get_defaults(conn))
+    row = compute_margin(conn, path, CRANE, 0, 0, get_defaults(dbapi(conn)))
 
     assert row.unpriced, "a missing price must be reported"
     assert row.priced is False
@@ -154,7 +161,7 @@ def test_negative_me_costs_more(db):
 
     _price_whole_tree(conn, path, CRANE, me=-4, unit_price=10.0)
     _price(conn, CRANE, 500_000_000.0)
-    defaults = get_defaults(conn)
+    defaults = get_defaults(dbapi(conn))
 
     worse = compute_margin(conn, path, CRANE, me=-4, te=0, defaults=defaults)
     better = compute_margin(conn, path, CRANE, me=10, te=0, defaults=defaults)
@@ -169,7 +176,7 @@ def test_unbuildable_product_reports_an_error(db):
     from app.manufacturing.margins import compute_margin
     from app.web.app_defaults import get_defaults
 
-    row = compute_margin(conn, path, TRITANIUM, 0, 0, get_defaults(conn))
+    row = compute_margin(conn, path, TRITANIUM, 0, 0, get_defaults(dbapi(conn)))
     assert row.error is not None
     assert row.profit is None
 
@@ -180,14 +187,14 @@ def test_day_volume_prefers_history_over_the_weekly_total(db):
     import json
     from app.manufacturing.margins import _avg_day_volume, JITA_REGION
 
-    conn.execute(
+    conn.exec_driver_sql(
         "INSERT OR REPLACE INTO market_price_cache (type_id, sell_price, volume, cached_at) "
         "VALUES (?,?,?,?)", (CRANE, 1.0, 700, 0))
     conn.commit()
     assert _avg_day_volume(conn, CRANE) == pytest.approx(100.0)   # 700 / 7
 
     series = [{"date": "2026-08-0%d" % d, "volume": 40} for d in range(1, 8)]
-    conn.execute(
+    conn.exec_driver_sql(
         "INSERT OR REPLACE INTO price_history_cache (region_id, type_id, data_json, cached_at) "
         "VALUES (?,?,?,?)", (JITA_REGION, CRANE, json.dumps(series), 0))
     conn.commit()
@@ -226,12 +233,12 @@ def test_removing_an_item_drops_its_history(db):
 
     mh.add_item(conn, CRANE, 5, 20)
     item_id = mh.list_items(conn)[0]["id"]
-    conn.execute("INSERT INTO margin_snapshot (item_id, day, margin_pct) VALUES (?,?,?)",
+    conn.exec_driver_sql("INSERT INTO margin_snapshot (item_id, day, margin_pct) VALUES (?,?,?)",
                  (item_id, "2026-08-01", 12.5))
     conn.commit()
 
     mh.remove_item(conn, item_id)
-    left = conn.execute("SELECT COUNT(*) FROM margin_snapshot WHERE item_id=?",
+    left = conn.exec_driver_sql("SELECT COUNT(*) FROM margin_snapshot WHERE item_id=?",
                         (item_id,)).fetchone()[0]
     assert left == 0
 
@@ -241,7 +248,7 @@ def _seed_days(conn, item_id, margins_by_offset):
     today = dt.datetime.now(dt.timezone.utc).date()
     for offset, margin in margins_by_offset.items():
         day = (today - dt.timedelta(days=offset)).strftime("%Y-%m-%d")
-        conn.execute(
+        conn.exec_driver_sql(
             "INSERT OR REPLACE INTO margin_snapshot (item_id, day, margin_pct) VALUES (?,?,?)",
             (item_id, day, margin))
     conn.commit()
@@ -285,7 +292,7 @@ def test_unpriced_rows_are_not_recorded_as_history(db):
 
     record_snapshot(conn, 1, MarginRow(type_id=CRANE, name="Crane", group_name="x",
                                        me=0, te=0, margin_pct=None))
-    assert conn.execute("SELECT COUNT(*) FROM margin_snapshot").fetchone()[0] == 0
+    assert conn.exec_driver_sql("SELECT COUNT(*) FROM margin_snapshot").fetchone()[0] == 0
 
 
 # ── defaults ─────────────────────────────────────────────────────────────────
@@ -293,11 +300,11 @@ def test_defaults_round_trip_and_survive_garbage(db):
     path, conn = db
     from app.web.app_defaults import get_defaults, is_configured, save_defaults
 
-    base = get_defaults(conn)
+    base = get_defaults(dbapi(conn))
     assert base["build_station_id"] == 0
     assert is_configured(base) is False
 
-    saved = save_defaults(conn, {"build_station_id": "60003760", "facility_tax": "1.5",
+    saved = save_defaults(dbapi(conn), {"build_station_id": "60003760", "facility_tax": "1.5",
                                  "input_basis": "buy", "not_a_key": "ignored"})
     assert saved["build_station_id"] == 60003760
     assert saved["facility_tax"] == 1.5
@@ -306,9 +313,9 @@ def test_defaults_round_trip_and_survive_garbage(db):
     assert is_configured(saved) is True
 
     # A hand-mangled row must fall back, not take the page down.
-    conn.execute("UPDATE app_defaults SET value='banana' WHERE key='facility_tax'")
+    conn.exec_driver_sql("UPDATE app_defaults SET value='banana' WHERE key='facility_tax'")
     conn.commit()
-    assert get_defaults(conn)["facility_tax"] == 2.5
+    assert get_defaults(dbapi(conn))["facility_tax"] == 2.5
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
@@ -350,7 +357,7 @@ def _margin_on(conn, path, basis, **extra):
     from app.manufacturing.margins import compute_margin
     from app.web.app_defaults import get_defaults
 
-    defaults = dict(get_defaults(conn))
+    defaults = dict(get_defaults(dbapi(conn)))
     defaults["input_basis"] = basis
     defaults.update(extra)
     return compute_margin(conn, path, CRANE, me=0, te=0, defaults=defaults)
@@ -423,7 +430,7 @@ def test_a_custom_override_is_not_marked_up(db):
 
     leaves = _price_tree_flat(conn, path)
     target = next(iter(leaves))
-    conn.execute("INSERT OR REPLACE INTO custom_price_override (type_id, price)"
+    conn.exec_driver_sql("INSERT OR REPLACE INTO custom_price_override (type_id, price)"
                  " VALUES (?,?)", (target, 10.0))
     conn.commit()
 
@@ -431,7 +438,7 @@ def test_a_custom_override_is_not_marked_up(db):
     assert target in overridden, "the override was not reported as one"
 
     with_override = _margin_on(conn, path, "buy", broker_relations_skill=0)
-    conn.execute("DELETE FROM custom_price_override WHERE type_id=?", (target,))
+    conn.exec_driver_sql("DELETE FROM custom_price_override WHERE type_id=?", (target,))
     conn.commit()
     without = _margin_on(conn, path, "buy", broker_relations_skill=0)
 

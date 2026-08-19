@@ -192,6 +192,23 @@ def dispose() -> None:
     _engine, _engine_url = None, None
 
 
+def dbapi(conn: Connection):
+    """The driver connection underneath, for calling a module not yet converted.
+
+    The query conversion goes one module at a time, so a converted module
+    routinely has to call into one that still speaks `sqlite3` — `app_defaults`
+    and `app/db/schema.py` are the two that everything touches. Passing the
+    SQLAlchemy connection there fails with an unhelpful
+    `'str' object has no attribute '_execute_on_connection'` from deep inside
+    SQLAlchemy, which reads like a query bug rather than a boundary crossing.
+
+    It is the same connection and the same transaction; only the interface
+    differs. Every call is a marker of work left to do — `grep -rn "dbapi("` is
+    the list of boundaries still standing, and it should shrink to nothing.
+    """
+    return conn.connection.driver_connection
+
+
 def scalar(conn: Connection, sql: str, params: dict | None = None):
     """First column of the first row, or None.
 

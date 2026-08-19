@@ -36,7 +36,12 @@ distinction decides whether a slot is worth committing.
 """
 from __future__ import annotations
 
-import sqlite3
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
+
+from app.db.conn import (NO_SUCH_TABLE as _NO_SUCH_TABLE,
+                         recover_from_missing_table as _recover)
+from app.db.conn import dbapi
 
 from app.bom.resolver import BOMResolver
 from app.manufacturing.margins import _station_context
@@ -136,28 +141,28 @@ DEFAULT_SORT = "slot_hour"
 DEFAULT_DIR = "desc"
 
 
-def list_reaction_products(conn: sqlite3.Connection) -> list[dict]:
+def list_reaction_products(conn: Connection) -> list[dict]:
     """Every published product with a reaction blueprint, with its group.
 
     Published only: the SDE carries unpublished test and legacy entries that no
     character can build, and they would sit in the ranking as noise.
     """
-    rows = conn.execute("""
+    rows = conn.execute(text("""
         SELECT DISTINCT p.product_type_id, t.name, COALESCE(g.name, '—')
         FROM sde_blueprint_products p
         JOIN sde_types t  ON t.type_id  = p.product_type_id
         LEFT JOIN sde_groups g ON g.group_id = t.group_id
         WHERE p.activity = 'reaction' AND t.published = 1
         ORDER BY g.name, t.name
-    """).fetchall()
-    # Indexed, not keyed: `get_conn()` hands out connections with the default
-    # row factory, so a `dict(row)` here works under the test fixtures (which
-    # set sqlite3.Row) and raises on the real request path. Positional access
-    # behaves the same either way.
+    """)).fetchall()
+    # Indexed, not keyed. SQLAlchemy's Row supports attribute access and
+    # `._mapping`, not string subscripting, and the two backends label the
+    # `COALESCE` column differently — position is the one thing that is the
+    # same everywhere.
     return [{"type_id": r[0], "name": r[1], "group_name": r[2]} for r in rows]
 
 
-def _input_cost(resolver: BOMResolver, conn: sqlite3.Connection, type_id: int,
+def _input_cost(resolver: BOMResolver, conn: Connection, type_id: int,
                 blueprint, prices: dict[int, float | None], ctx: dict,
                 ) -> tuple[float, float, list[str]]:
     """Cost of ONE run priced on the reaction's **direct inputs**, at market.
@@ -269,7 +274,7 @@ def raw_unit_cost(resolver: BOMResolver, type_id: int, prices: dict[int, float |
     return memo[type_id]
 
 
-def _prices(conn: sqlite3.Connection, type_ids: set[int], basis: str,
+def _prices(conn: Connection, type_ids: set[int], basis: str,
             costs: BuyingCosts | None = None) -> dict[int, float | None]:
     """{type_id: unit price} on the given basis, custom overrides winning.
 
@@ -288,32 +293,37 @@ def _prices(conn: sqlite3.Connection, type_ids: set[int], basis: str,
     if not type_ids:
         return {}
     ids = list(type_ids)
-    ph = ",".join("?" * len(ids))
     out: dict[int, float | None] = {}
     for tid, sell, buy in conn.execute(
-        f"SELECT type_id, sell_price, buy_price FROM market_price_cache "
-        f"WHERE type_id IN ({ph})", ids
+        text("SELECT type_id, sell_price, buy_price FROM market_price_cache"
+             " WHERE type_id IN :ids")
+        .bindparams(bindparam("ids", expanding=True)),
+        {"ids": ids},
     ):
         chosen = buy if basis == "buy" else sell
         chosen = chosen or None
         out[tid] = costs.paid(chosen) if costs else chosen
     try:
         for tid, override in conn.execute(
-            f"SELECT type_id, price FROM custom_price_override WHERE type_id IN ({ph})", ids
+            text("SELECT type_id, price FROM custom_price_override"
+                 " WHERE type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": ids},
         ):
             out[tid] = override or None
-    except sqlite3.OperationalError:
-        pass                      # overrides table not created yet
+    except _NO_SUCH_TABLE:
+        _recover(conn)            # overrides table not created yet
     return out
 
 
-def _volumes(conn: sqlite3.Connection) -> dict[int, float]:
+def _volumes(conn: Connection) -> dict[int, float]:
     """{type_id: packaged m³}. Packaged, because that is what a hauler carries."""
-    return {r[0]: r[1] for r in conn.execute(
-        "SELECT type_id, packaged_volume FROM sde_types WHERE packaged_volume IS NOT NULL")}
+    return {r[0]: r[1] for r in conn.execute(text(
+        "SELECT type_id, packaged_volume FROM sde_types"
+        " WHERE packaged_volume IS NOT NULL"))}
 
 
-def _sell_venue(conn: sqlite3.Connection, defaults: dict) -> dict:
+def _sell_venue(conn: Connection, defaults: dict) -> dict:
     """Where output is sold, and the cached prices there.
 
     Jita is the baseline — it is what `market_price_cache` holds and what every
@@ -337,7 +347,8 @@ def _sell_venue(conn: sqlite3.Connection, defaults: dict) -> dict:
         return {"kind": "jita", "name": "Jita", "prices": {}, "fetched": True}
 
     prices = {r[0]: r[1] for r in conn.execute(
-        "SELECT type_id, sell_price FROM hub_price_cache WHERE region_id=?", (region_id,))}
+        text("SELECT type_id, sell_price FROM hub_price_cache"
+             " WHERE region_id = :rid"), {"rid": region_id})}
     return {
         "kind": "hub",
         "name": TRADE_HUBS[region_id]["name"],
@@ -394,7 +405,7 @@ def _job_seconds(base_time: int, defaults: dict, ctx: dict) -> int:
     )
 
 
-def build_board(conn: sqlite3.Connection, db_path: str,
+def build_board(conn: Connection, db_path: str,
                 sort: str = DEFAULT_SORT, direction: str = DEFAULT_DIR,
                 group: str = "") -> dict:
     """Price every reaction and rank it.
@@ -404,7 +415,8 @@ def build_board(conn: sqlite3.Connection, db_path: str,
     rather than the current filter. All three are sanitised here rather than
     trusted: they arrive from a query string a user can hand-edit.
     """
-    defaults = get_defaults(conn)
+    # app_defaults is not converted yet — hand it the driver connection.
+    defaults = get_defaults(dbapi(conn))
     view: dict = {
         "configured": is_configured(defaults),
         "defaults": defaults,
@@ -435,11 +447,9 @@ def build_board(conn: sqlite3.Connection, db_path: str,
     # blueprints), and its ME path is reused so reaction rig and structure
     # bonuses are applied here exactly as they are everywhere else. Its lookups
     # are cached, so this costs one query per product rather than one per call.
-    from app.db.conn import connect_to_path
-    sde = connect_to_path(db_path)                     # for the converted BOMResolver
     resolver = BOMResolver(
-        sde, blueprints=[], runs_per_job=None,
-        adjusted_prices=get_adjusted_prices_cached(conn),
+        conn, blueprints=[], runs_per_job=None,
+        adjusted_prices=get_adjusted_prices_cached(dbapi(conn)),   # not converted yet
         rate_mfg=ctx["rate_mfg"], rate_rxn=ctx["rate_rxn"],
     )
     raw_basis = str(defaults.get("raw_input_basis")
@@ -455,7 +465,8 @@ def build_board(conn: sqlite3.Connection, db_path: str,
     local = _sell_venue(conn, defaults)
     venue_info = local
 
-    all_ids = {r[0] for r in conn.execute("SELECT type_id FROM market_price_cache")}
+    all_ids = {r[0] for r in conn.execute(
+        text("SELECT type_id FROM market_price_cache"))}
     # Inputs carry the acquisition broker fee; the output does not — that side
     # is priced by `selling_costs`, and charging both would double-count.
     raw_prices = _prices(conn, all_ids, raw_basis, buying_costs(raw_basis, defaults))
@@ -550,7 +561,7 @@ def build_board(conn: sqlite3.Connection, db_path: str,
                     type_id, local, ref_sell, volumes.get(type_id, 0.0), export_rate),
             })
     finally:
-        sde.close()
+        pass
 
     counts = view["counts"]
     counts["total"] = len(rows)

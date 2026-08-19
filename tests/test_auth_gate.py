@@ -39,13 +39,15 @@ def scratch_margin(app_module):
     from app.web import margins_helper
 
     def _rows():
-        conn = app_module.get_conn()
-        try:
+        # margins_helper is on the portable query layer now, so its schema shim
+        # unwraps a SQLAlchemy connection. This probe opens its own rather than
+        # borrowing the router's raw one.
+        from app.db.conn import connect
+
+        with connect() as conn:
             margins_helper.ensure_margin_tables(conn)
-            return {tuple(r) for r in conn.execute(
+            return {tuple(r) for r in conn.exec_driver_sql(
                 "SELECT type_id, me, te FROM margin_watchlist")}
-        finally:
-            conn.close()
 
     before = _rows()
     yield

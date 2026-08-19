@@ -539,8 +539,11 @@ async def plan_result(
         # charged nothing for it — not on nested components and not even on the
         # product itself, since only the margin tracker ever called that code.
         # Same builder the tracker uses, so the two pages price datacores alike.
+        # `margins` is converted; this router is not. It gets the SQLAlchemy
+        # connection already open for the resolver, and the defaults still come
+        # from the raw one. Both are the same database.
         inv_params, inv_warnings = build_invention_params(
-            conn, app_defaults.get_defaults(conn), input_basis, database_path())
+            sde_conn, app_defaults.get_defaults(conn), input_basis, database_path())
 
         # Pass 2 — the real resolve, with the splits applied. ME rounds once per
         # job, so the splits reach the material totals here and in build_plan

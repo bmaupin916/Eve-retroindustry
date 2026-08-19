@@ -18,7 +18,13 @@ it a week.
 from __future__ import annotations
 
 import datetime as dt
-import sqlite3
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
+
+from app.db.conn import (NO_SUCH_TABLE as _NO_SUCH_TABLE,
+                         recover_from_missing_table as _recover)
+from app.db.conn import dbapi
 
 from app.manufacturing.margins import (
     MarginRow, build_invention_params, compute_margin, _station_context,
@@ -31,9 +37,23 @@ from app.db.schema import ensure_schema as ensure_db_schema
 AVG_WINDOW_DAYS = 7
 
 
-def ensure_margin_tables(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_margin_tables(conn: Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists.
+
+    Two things are going on here, both temporary.
+
+    `app.db.schema` still speaks the DBAPI — it memoises per database file by
+    asking `PRAGMA database_list` — so it gets the driver connection from
+    underneath this one. Same connection, same transaction, different interface.
+
+    And it runs on SQLite only. Creating tables lazily on first use is a habit
+    from before this project had migrations; on Postgres the schema arrives
+    through Alembic, and `PRAGMA` is a syntax error there. So on Postgres this
+    is not "create if missing" — it is "nothing to do".
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
 def _today() -> str:
@@ -42,55 +62,64 @@ def _today() -> str:
 
 # ── watchlist ────────────────────────────────────────────────────────────────
 
-def add_item(conn: sqlite3.Connection, type_id: int, me: int, te: int) -> tuple[bool, str]:
+def add_item(conn: Connection, type_id: int, me: int, te: int) -> tuple[bool, str]:
     """Adds a product. Returns (ok, message)."""
     ensure_margin_tables(conn)
-    row = conn.execute("SELECT name FROM sde_types WHERE type_id=?", (type_id,)).fetchone()
+    row = conn.execute(
+        text("SELECT name FROM sde_types WHERE type_id = :tid"),
+        {"tid": type_id}).fetchone()
     if not row:
         return False, "Unknown item."
     buildable = conn.execute(
-        "SELECT 1 FROM sde_blueprint_products WHERE product_type_id=? "
-        "AND activity IN ('manufacturing','reaction') LIMIT 1", (type_id,)
+        text("SELECT 1 FROM sde_blueprint_products WHERE product_type_id = :tid"
+             " AND activity IN ('manufacturing','reaction') LIMIT 1"),
+        {"tid": type_id},
     ).fetchone()
     if not buildable:
         return False, f"{row[0]} has no blueprint — there is no build margin to track."
     try:
         conn.execute(
-            "INSERT INTO margin_watchlist (type_id, me, te, added_at) VALUES (?,?,?,?)",
-            (type_id, me, te, dt.datetime.now(dt.timezone.utc).timestamp()),
+            text("INSERT INTO margin_watchlist (type_id, me, te, added_at)"
+                 " VALUES (:tid, :me, :te, :now)"),
+            {"tid": type_id, "me": me, "te": te,
+             "now": dt.datetime.now(dt.timezone.utc).timestamp()},
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except IntegrityError:
+        # Same duplicate, different exception class per driver. Catching
+        # `sqlite3.IntegrityError` here silently stopped catching anything the
+        # moment the driver changed, and the duplicate became a 500.
+        conn.rollback()
         return False, f"{row[0]} at ME {me} / TE {te} is already tracked."
     return True, f"Added {row[0]} (ME {me}, TE {te})."
 
 
-def remove_item(conn: sqlite3.Connection, item_id: int) -> None:
+def remove_item(conn: Connection, item_id: int) -> None:
     ensure_margin_tables(conn)
-    conn.execute("DELETE FROM margin_watchlist WHERE id=?", (item_id,))
-    conn.execute("DELETE FROM margin_snapshot WHERE item_id=?", (item_id,))
+    conn.execute(text("DELETE FROM margin_watchlist WHERE id = :iid"), {"iid": item_id})
+    conn.execute(text("DELETE FROM margin_snapshot WHERE item_id = :iid"), {"iid": item_id})
     conn.commit()
 
 
-def clear_all(conn: sqlite3.Connection) -> None:
+def clear_all(conn: Connection) -> None:
     ensure_margin_tables(conn)
-    conn.execute("DELETE FROM margin_watchlist")
-    conn.execute("DELETE FROM margin_snapshot")
+    conn.execute(text("DELETE FROM margin_watchlist"))
+    conn.execute(text("DELETE FROM margin_snapshot"))
     conn.commit()
 
 
-def list_items(conn: sqlite3.Connection) -> list[dict]:
+def list_items(conn: Connection) -> list[dict]:
     """Watchlist rows as dicts — `get_conn()` hands back plain tuples, so this
     does not rely on the caller having set a row factory."""
     ensure_margin_tables(conn)
     return [{"id": r[0], "type_id": r[1], "me": r[2], "te": r[3]} for r in conn.execute(
-        "SELECT id, type_id, me, te FROM margin_watchlist ORDER BY added_at"
+        text("SELECT id, type_id, me, te FROM margin_watchlist ORDER BY added_at")
     ).fetchall()]
 
 
 # ── history ──────────────────────────────────────────────────────────────────
 
-def record_snapshot(conn: sqlite3.Connection, item_id: int, row: MarginRow) -> None:
+def record_snapshot(conn: Connection, item_id: int, row: MarginRow) -> None:
     """Stores today's reading, replacing any earlier reading from today.
 
     Replacing rather than skipping means today's row always reflects the latest
@@ -99,17 +128,20 @@ def record_snapshot(conn: sqlite3.Connection, item_id: int, row: MarginRow) -> N
     if row.margin_pct is None:
         return                      # an unpriced row is not a data point
     conn.execute(
-        "INSERT INTO margin_snapshot (item_id, day, margin_pct, profit, sell_price, captured_at) "
-        "VALUES (?,?,?,?,?,?) "
-        "ON CONFLICT(item_id, day) DO UPDATE SET "
-        "margin_pct=excluded.margin_pct, profit=excluded.profit, "
-        "sell_price=excluded.sell_price, captured_at=excluded.captured_at",
-        (item_id, _today(), row.margin_pct, row.profit, row.sell_price,
-         dt.datetime.now(dt.timezone.utc).timestamp()),
+        text("INSERT INTO margin_snapshot"
+             " (item_id, day, margin_pct, profit, sell_price, captured_at)"
+             " VALUES (:iid, :day, :margin_pct, :profit, :sell_price, :captured_at)"
+             " ON CONFLICT (item_id, day) DO UPDATE SET"
+             " margin_pct = excluded.margin_pct, profit = excluded.profit,"
+             " sell_price = excluded.sell_price,"
+             " captured_at = excluded.captured_at"),
+        {"iid": item_id, "day": _today(), "margin_pct": row.margin_pct,
+         "profit": row.profit, "sell_price": row.sell_price,
+         "captured_at": dt.datetime.now(dt.timezone.utc).timestamp()},
     )
 
 
-def history_for(conn: sqlite3.Connection, item_id: int) -> dict:
+def history_for(conn: Connection, item_id: int) -> dict:
     """Change since the previous reading, plus the rolling average.
 
     `change` compares against the most recent day *before* today, so it reads as
@@ -117,12 +149,15 @@ def history_for(conn: sqlite3.Connection, item_id: int) -> dict:
     """
     today = _today()
     prev = conn.execute(
-        "SELECT margin_pct FROM margin_snapshot WHERE item_id=? AND day<? "
-        "ORDER BY day DESC LIMIT 1", (item_id, today),
+        text("SELECT margin_pct FROM margin_snapshot"
+             " WHERE item_id = :iid AND day < :today"
+             " ORDER BY day DESC LIMIT 1"),
+        {"iid": item_id, "today": today},
     ).fetchone()
     window = conn.execute(
-        "SELECT margin_pct FROM margin_snapshot WHERE item_id=? "
-        "ORDER BY day DESC LIMIT ?", (item_id, AVG_WINDOW_DAYS),
+        text("SELECT margin_pct FROM margin_snapshot WHERE item_id = :iid"
+             " ORDER BY day DESC LIMIT :limit"),
+        {"iid": item_id, "limit": AVG_WINDOW_DAYS},
     ).fetchall()
     values = [r[0] for r in window if r[0] is not None]
     return {
@@ -135,11 +170,12 @@ def history_for(conn: sqlite3.Connection, item_id: int) -> dict:
 
 # ── view model ───────────────────────────────────────────────────────────────
 
-def build_view_model(conn: sqlite3.Connection, db_path: str,
+def build_view_model(conn: Connection, db_path: str,
                      message: str | None = None) -> dict:
     """Prices the whole watchlist and assembles the page."""
     ensure_margin_tables(conn)
-    defaults = get_defaults(conn)
+    # app_defaults is not converted yet — hand it the driver connection.
+    defaults = get_defaults(dbapi(conn))
     items = list_items(conn)
 
     view: dict = {
@@ -190,22 +226,32 @@ def build_view_model(conn: sqlite3.Connection, db_path: str,
     return view
 
 
-def _station_name(conn: sqlite3.Connection, location_id) -> str:
+def _station_name(conn: Connection, location_id) -> str:
     if not location_id:
         return ""
     row = conn.execute(
-        "SELECT name FROM location_name_cache WHERE location_id=?", (location_id,)
+        text("SELECT name FROM location_name_cache WHERE location_id = :lid"),
+        {"lid": location_id},
     ).fetchone()
     return row[0] if row and row[0] else str(location_id)
 
 
-def _volume_column_present(conn: sqlite3.Connection) -> bool:
-    """False on an SDE imported before `sde_types.packaged_volume` existed — the page
-    hides profit-per-m³ rather than showing a column of dashes."""
-    return "packaged_volume" in {r[1] for r in conn.execute("PRAGMA table_info(sde_types)")}
+def _volume_column_present(conn: Connection) -> bool:
+    """False on an SDE imported before `sde_types.packaged_volume` existed — the
+    page hides profit-per-m³ rather than showing a column of dashes.
+
+    This was `PRAGMA table_info(sde_types)`, which is SQLite-only. SQLAlchemy's
+    inspector asks the same question in whatever dialect is underneath, which is
+    the entire reason the engine is the seam.
+    """
+    try:
+        cols = inspect(conn).get_columns("sde_types")
+    except Exception:
+        return False              # no such table at all: also "not present"
+    return any(c["name"] == "packaged_volume" for c in cols)
 
 
-def _all_blueprints(conn: sqlite3.Connection) -> list:
+def _all_blueprints(conn: Connection) -> list:
     """Every character's blueprints, so intermediate components are costed at
     the ME you actually own rather than at 0.
 
@@ -218,9 +264,10 @@ def _all_blueprints(conn: sqlite3.Connection) -> list:
 
     raw: list[dict] = []
     try:
-        rows = conn.execute("SELECT data_json FROM char_blueprints_cache").fetchall()
-    except sqlite3.OperationalError:
-        return []
+        rows = conn.execute(
+            text("SELECT data_json FROM char_blueprints_cache")).fetchall()
+    except _NO_SUCH_TABLE:
+        return _recover(conn)
     for (blob,) in rows:
         try:
             entries = json.loads(blob)

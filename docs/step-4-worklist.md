@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.45. **602 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.46. **624 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -72,9 +72,28 @@ process, each sees the other's committed writes
 its own, and what is left at the end is deleting `get_conn()` once nothing
 calls it.
 
-Order, smallest first — `projects` is **done** and is the worked example:
-`media`, `industry`, `contracts`, `characters`, `planets`, `locations`,
-`prices`, `assets`, `plan`, then `deps.py` and `main.py`.
+Order — `projects` and `industry` are **done**; `industry` is the better
+worked example, because it hit the cases `projects` did not. Remaining:
+`media`, `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`,
+`plan`, then `app_defaults`, `industry_helper`, `app/character/*`,
+`location_resolver`, `deps.py`, `main.py` and `app/db/schema.py` itself.
+
+**"Smallest first" was the wrong heuristic and is abandoned.** It ignored
+shared dependencies: `BOMResolver` sat underneath four of the ten and had to be
+converted first (v0.9.43). Convert what is *underneath* next, not what is
+smallest.
+
+**Boundary crossings are marked.** A converted module calling an unconverted one
+passes `dbapi(conn)` — the driver connection from underneath. `grep -rn "dbapi("
+app/` is the list of boundaries still standing, and it should shrink to nothing.
+Passing the SQLAlchemy connection instead fails with
+`'str' object has no attribute '_execute_on_connection'` from deep inside
+SQLAlchemy, which reads like a query bug rather than a boundary crossing.
+
+**Lazy `ensure_*_tables()` is SQLite-only.** It predates migrations, and
+`app/db/schema.py` memoises by asking `PRAGMA database_list`, which is a syntax
+error on Postgres. A converted shim returns early on any other dialect: there
+the schema comes from Alembic.
 
 **Convert the router and its `*_helper.py` together.** The helpers take the
 connection as an argument, so half a slice does not run.
@@ -113,8 +132,19 @@ next module is the same until shown otherwise.
   `COUNT(DISTINCT CASE WHEN ... THEN id END)`. This was live in
   `list_projects`.
 
-**Verify:** full suite on SQLite, then the same suite with `EVE_DATABASE_URL`
-pointed at the container. Both must pass before the commit lands.
+**Verify:** a cross-backend test file per module — `test_projects_on_postgres.py`
+and `test_industry_on_postgres.py` are the pattern. Drive the helper directly,
+parameterised over both backends, so the same assertion runs twice. Then mutate
+the portability fix and check the failure *shape*: reverting
+`PRAGMA table_info` fails Postgres and passes SQLite, which is what proves the
+test can see a backend difference at all.
+
+**Open gap found doing `industry`: the SDE tables are not created on Postgres.**
+The Alembic history covers `APP_TABLES` only, and `import_sde.py` builds the SDE
+with `apply_sde_schema` against SQLite with no Postgres path. Six statements
+JOIN `sde_types` to runtime tables, so Postgres cannot serve the app until this
+is closed. `tests/test_industry_on_postgres.py` creates them in its fixture to
+test the conversion independently of it.
 
 ## 2. Remaining Step 4 items
 

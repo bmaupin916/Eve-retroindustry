@@ -11,7 +11,7 @@ import sqlite3
 
 import pytest
 
-from app.db.conn import connect_to_path
+from app.db.conn import connect_to_path, dbapi
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SDE = os.path.join(REPO, "sde_base.db")
@@ -38,13 +38,21 @@ def db(tmp_path):
     # refuses to show numbers at all.
     from app.web.app_defaults import ensure_defaults_table, save_defaults
     ensure_defaults_table(conn)
+    # Still the raw handle here: the SQLAlchemy connection is created below.
     save_defaults(conn, {"build_station_id": 60003760, "reaction_station_id": 60003760})
-    yield path, conn
     conn.close()
+
+    # The module under test is on the portable query layer now, so the fixture
+    # hands out a SQLAlchemy connection. Schema creation above stays on the
+    # DBAPI because `app/db/schema.py` has not been converted yet — it is the
+    # same file either way.
+    engine_conn = connect_to_path(path)
+    yield path, engine_conn
+    engine_conn.close()
 
 
 def _price(conn, type_id, sell, buy=None):
-    conn.execute(
+    conn.exec_driver_sql(
         "INSERT OR REPLACE INTO market_price_cache (type_id, sell_price, buy_price, cached_at) "
         "VALUES (?,?,?,?)", (type_id, sell, buy if buy is not None else sell * 0.9, 0))
     conn.commit()
@@ -237,7 +245,7 @@ def test_no_station_configured_shows_no_numbers(db):
     from app.web.app_defaults import save_defaults
     from app.web.reactions_helper import build_board
 
-    save_defaults(conn, {"build_station_id": ""})
+    save_defaults(dbapi(conn), {"build_station_id": ""})
     board = build_board(conn, path)
     assert board["configured"] is False
     assert board["rows"] == []
@@ -442,7 +450,7 @@ def test_raw_cost_amortises_a_sub_run_instead_of_charging_a_whole_job(db):
         for mat in mats:
             _price(conn, mat["material_type_id"], 100.0)
 
-        ctx = _station_context(conn, get_defaults(conn))
+        ctx = _station_context(conn, get_defaults(dbapi(conn)))
         prices = _prices(conn, {m["material_type_id"] for m in mats}, "buy")
         per_unit = raw_unit_cost(resolver, NITROGEN_FUEL_BLOCK, prices, ctx, {}, set())
 
@@ -479,16 +487,16 @@ def test_raw_cost_includes_manufacturing_job_fees_not_just_reaction_ones(db):
     # The install fee is EIV x rate, and EIV comes from CCP's ADJUSTED prices —
     # a separate cache from the market one. Empty, every fee is zero whatever
     # the rate, which is what made the first version of this test vacuous.
-    conn.execute("CREATE TABLE IF NOT EXISTS adjusted_price_cache "
+    conn.exec_driver_sql("CREATE TABLE IF NOT EXISTS adjusted_price_cache "
                  "(type_id INTEGER PRIMARY KEY, adjusted REAL, cached_at REAL)")
-    for tid, in conn.execute("SELECT type_id FROM market_price_cache"):
-        conn.execute("INSERT OR REPLACE INTO adjusted_price_cache VALUES (?,?,?)",
+    for tid, in conn.exec_driver_sql("SELECT type_id FROM market_price_cache"):
+        conn.exec_driver_sql("INSERT OR REPLACE INTO adjusted_price_cache VALUES (?,?,?)",
                      (tid, 100.0, 0))
     conn.commit()
 
-    base_ctx = _station_context(conn, get_defaults(conn))
-    adjusted = get_adjusted_prices_cached(conn)
-    ids = {r[0] for r in conn.execute("SELECT type_id FROM market_price_cache")}
+    base_ctx = _station_context(conn, get_defaults(dbapi(conn)))
+    adjusted = get_adjusted_prices_cached(dbapi(conn))
+    ids = {r[0] for r in conn.exec_driver_sql("SELECT type_id FROM market_price_cache")}
     prices = _prices(conn, ids, "buy")
 
     def cost(rate_mfg, rate_rxn):
@@ -520,7 +528,7 @@ def test_raw_cost_is_none_when_something_underneath_is_unpriced(db):
 
     resolver = BOMResolver(connect_to_path(path))
     try:
-        ctx = _station_context(conn, get_defaults(conn))
+        ctx = _station_context(conn, get_defaults(dbapi(conn)))
         unpriced = set()
         value = raw_unit_cost(resolver, TUNGSTEN_CARBIDE, {}, ctx, {}, unpriced)
     finally:
@@ -568,11 +576,11 @@ def test_export_is_output_volume_times_the_configured_rate(db):
     from app.web.app_defaults import save_defaults
     from app.web.reactions_helper import build_board
 
-    save_defaults(conn, {"freight_export_isk_m3": 1000.0})
+    save_defaults(dbapi(conn), {"freight_export_isk_m3": 1000.0})
     _price(conn, TUNGSTEN_CARBIDE, 500.0)
     row = next(r for r in build_board(conn, path, group="Composite")["rows"]
                if r["type_id"] == TUNGSTEN_CARBIDE)
-    vol = conn.execute("SELECT packaged_volume FROM sde_types WHERE type_id=?",
+    vol = conn.exec_driver_sql("SELECT packaged_volume FROM sde_types WHERE type_id=?",
                        (TUNGSTEN_CARBIDE,)).fetchone()[0]
     units = row["per_run"] * row["jobs_per_month"]
     assert row["export"] == pytest.approx(units * vol * 1000.0)
@@ -605,7 +613,7 @@ def test_an_unfetched_hub_reports_nothing_rather_than_no_advantage(db):
     from app.web.app_defaults import save_defaults
     from app.web.reactions_helper import build_board
 
-    save_defaults(conn, {"sell_hub_region_id": 10000042})    # Hek
+    save_defaults(dbapi(conn), {"sell_hub_region_id": 10000042})    # Hek
     board = build_board(conn, path, group="Composite")
     assert board["venue"]["name"] == "Hek"
     assert board["venue"]["fetched"] is False
@@ -621,10 +629,10 @@ def test_dumping_to_buy_orders_prices_the_output_at_the_buy_price(db):
 
     _price(conn, TUNGSTEN_CARBIDE, 1000.0, buy=400.0)
 
-    save_defaults(conn, {"sales_method": "orders"})
+    save_defaults(dbapi(conn), {"sales_method": "orders"})
     listed = next(r for r in build_board(conn, path)["rows"]
                   if r["type_id"] == TUNGSTEN_CARBIDE)
-    save_defaults(conn, {"sales_method": "immediate"})
+    save_defaults(dbapi(conn), {"sales_method": "immediate"})
     dumped = next(r for r in build_board(conn, path)["rows"]
                   if r["type_id"] == TUNGSTEN_CARBIDE)
 
@@ -673,8 +681,8 @@ def _tc_row(conn, path, **defaults):
     from app.web.app_defaults import get_defaults, save_defaults
     from app.web.reactions_helper import build_board
     if defaults:
-        save_defaults(conn, defaults)
-    get_defaults(conn)
+        save_defaults(dbapi(conn), defaults)
+    get_defaults(dbapi(conn))
     return next(r for r in build_board(conn, path)["rows"]
                 if r["type_id"] == TUNGSTEN_CARBIDE)
 
