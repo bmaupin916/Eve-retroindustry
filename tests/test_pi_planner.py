@@ -11,6 +11,7 @@ import sqlite3
 import pytest
 
 from app.planetary.planet_data import single_planet_types
+from app.web.routers import planets as planets_router
 from app.planetary.schematics import PIResolver, split_pi_leaves, whole_units
 
 SDE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sde_base.db")
@@ -398,21 +399,22 @@ def _plan_vs_actual(client, url):
     /planets also uses — is genuinely exercised; only the two ESI functions
     underneath it are stubbed.
     """
-    import app.web.main as m
-
     captured = {}
-    original = m._tr
+    original = planets_router._tr
 
     def spy(name, request, context):
         captured["view"] = context
         return original(name, request, context)
 
-    m._tr = spy
+    # The router imported _tr into its own namespace, so patching main's copy
+    # no longer reaches the handler. That is the whole point of the W6 split;
+    # the spy has to follow the code.
+    planets_router._tr = spy
     try:
         response = client.get(url)
         assert response.status_code == 200, response.text[:400]
     finally:
-        m._tr = original
+        planets_router._tr = original
     return captured["view"]["actual"]
 
 
@@ -456,7 +458,7 @@ def stub_pi(app_module, monkeypatch):
     # Start each test from an empty extractor cache — the planner writes to it.
     conn = app_module.get_conn()
     try:
-        app_module._ensure_pi_cache_tables(conn)
+        planets_router._ensure_pi_cache_tables(conn)
         conn.execute("DELETE FROM pi_extractor_cache")
         conn.commit()
     finally:
@@ -488,8 +490,8 @@ def stub_pi(app_module, monkeypatch):
         async def fake_fetch_detail(client, char_id, planet_id, token):
             return {"pins": colonies_by_planet.get(planet_id, []), "links": [], "routes": []}
 
-        monkeypatch.setattr(app_module.planets_api, "fetch_planets", fake_fetch_planets)
-        monkeypatch.setattr(app_module.planets_api, "fetch_planet_detail", fake_fetch_detail)
+        monkeypatch.setattr(planets_router.planets_api, "fetch_planets", fake_fetch_planets)
+        monkeypatch.setattr(planets_router.planets_api, "fetch_planet_detail", fake_fetch_detail)
     return install
 
 
@@ -679,13 +681,13 @@ def test_forbidden_fetch_leaves_the_cache_alone(client, stub_pi, app_module):
 def test_planner_does_not_fetch_planet_names_it_already_has(client, stub_pi, app_module, monkeypatch):
     """Planet names come from the shared cache; a cached planet costs no ESI."""
     calls = []
-    real = app_module._resolve_planet_names
+    real = planets_router._resolve_planet_names
 
     async def spy(conn, planet_ids):
         calls.append(set(planet_ids))
         return await real(conn, planet_ids)
 
-    monkeypatch.setattr(app_module, "_resolve_planet_names", spy)
+    monkeypatch.setattr(planets_router, "_resolve_planet_names", spy)
     stub_pi({4001: [_factory_pin(COOLANT_SCHEMATIC)]})
     view = _plan_vs_actual(client, FUEL_BLOCK_PLAN)
 
