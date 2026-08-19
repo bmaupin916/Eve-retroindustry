@@ -368,3 +368,28 @@ def _load_corp_assets_from_cache(conn: sqlite3.Connection, corp_id: int) -> list
     if not row:
         return []
     return json.loads(row[0])
+
+
+async def _resolve_party_names(ids: set[int]) -> dict[int, str]:
+    """Resolve char/corp/alliance/station/type IDs to names via ESI
+    /universe/names/. The endpoint can't handle player structures (>1e12) — we skip them.
+    """
+    ids = {i for i in ids if i and i < 1_000_000_000_000}
+    out: dict[int, str] = {}
+    if not ids:
+        return out
+    id_list = list(ids)
+    async with esi_client(timeout=10) as client:
+        for i in range(0, len(id_list), 1000):  # ESI limit 1000/req
+            chunk = id_list[i:i + 1000]
+            try:
+                r = await client.post(
+                    "https://esi.evetech.net/latest/universe/names/",
+                    json=chunk, headers={"Accept": "application/json"},
+                )
+                if r.status_code == 200:
+                    for item in r.json():
+                        out[item["id"]] = item["name"]
+            except Exception:
+                pass
+    return out
