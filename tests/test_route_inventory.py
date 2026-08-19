@@ -18,16 +18,41 @@ from __future__ import annotations
 import pytest
 
 
+def _iter_routes(router):
+    """Every real route, descending through included routers.
+
+    `app.include_router()` does not flatten the sub-router into `app.routes` on
+    FastAPI 0.141 / Starlette 1.6 — it appends one `_IncludedRouter` proxy that
+    holds the original. Walking `app.routes` alone therefore stops seeing a
+    route the moment W6 moves it into a router, which would quietly turn this
+    whole file into a test that passes because it is looking at less and less.
+    """
+    for route in router.routes:
+        inner = getattr(route, "original_router", None)
+        if inner is not None:
+            yield from _iter_routes(inner)
+        else:
+            yield route
+
+
 def _inventory(app) -> set[tuple[str, str]]:
     """(method, path) for everything the app serves, mounts included."""
     found = set()
-    for route in app.routes:
+    for route in _iter_routes(app):
         methods = getattr(route, "methods", None)
         if methods:
             for method in methods - {"HEAD"}:
                 found.add((method, route.path))
-        else:
+        elif hasattr(route, "path"):
             found.add(("MOUNT", route.path))
+        else:
+            # Not "skip what we do not recognise" — that is how the count above
+            # would drift downwards without anyone noticing.
+            raise AssertionError(
+                f"unrecognised entry in app.routes: {type(route).__name__}. "
+                "If this is a new way of holding routes, teach _iter_routes "
+                "about it; do not filter it out."
+            )
     return found
 
 
@@ -106,7 +131,7 @@ def test_no_route_is_registered_twice(app_module):
     becomes dead code that still looks live.
     """
     seen: dict[tuple[str, str], int] = {}
-    for route in app_module.app.routes:
+    for route in _iter_routes(app_module.app):
         methods = getattr(route, "methods", None) or {"MOUNT"}
         for method in methods - {"HEAD"}:
             seen[(method, route.path)] = seen.get((method, route.path), 0) + 1
@@ -118,7 +143,7 @@ def test_every_page_route_has_a_handler_name(app_module):
     """Routers move functions between modules; an unnamed endpoint means one
     got wrapped or reassigned on the way, which breaks url_for in templates."""
     unnamed = [
-        r.path for r in app_module.app.routes
+        r.path for r in _iter_routes(app_module.app)
         if getattr(r, "methods", None) and not getattr(r, "name", None)
     ]
     assert not unnamed, f"routes without a handler name: {unnamed}"

@@ -326,9 +326,10 @@ def test_background_price_warmup_actually_reaches_esi(app_module, monkeypatch):
         seen.append(list(type_ids))
 
     import app.market.prices as prices_mod
+    from app.web.routers import prices as prices_router
     monkeypatch.setattr(prices_mod, "fetch_jita_prices_bulk", _bulk)
 
-    asyncio.run(app_module._bg_fetch_prices([34, 35]))
+    asyncio.run(prices_router._bg_fetch_prices([34, 35]))
 
     assert seen == [[34, 35]], (
         f"the warm-up never reached fetch_jita_prices_bulk (saw {seen}) — "

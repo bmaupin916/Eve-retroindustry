@@ -11,16 +11,21 @@ property the module is for.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
+import json
 import os
 import sqlite3
 import time as _time
 from pathlib import Path
 
+import httpx
+
 from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from app.esi.client import esi_client
 from app.auth.token_store import (
     list_characters,
     get_character_row,
@@ -291,3 +296,75 @@ def _tr(name: str, request: Request, context: dict) -> HTMLResponse:
     session = getattr(request.state, "session", None)
     context.setdefault("csrf_token", session["csrf_token"] if session else "")
     return templates.TemplateResponse(request, name, context)
+
+
+async def _ensure_groups_populated(conn: sqlite3.Connection) -> None:
+    """Populate sde_groups via ESI /universe/groups/{id}/ with concurrency limit.
+
+    Top-up semantics: fetches only groups referenced by sde_types that are
+    MISSING from sde_groups. The previous all-or-nothing early return meant
+    a new expansion's groups (e.g. 5120 Command Carrier) never got added for
+    existing users — and rig_applies_to_product's INNER JOIN on sde_groups
+    then silently disabled all rig bonuses for those products.
+    """
+    group_ids = [r[0] for r in conn.execute(
+        """SELECT DISTINCT t.group_id FROM sde_types t
+           LEFT JOIN sde_groups g ON g.group_id = t.group_id
+           WHERE t.group_id > 0 AND t.published = 1 AND g.group_id IS NULL"""
+    ).fetchall()]
+    if not group_ids:
+        return
+
+    sem = asyncio.Semaphore(50)
+
+    async def _fetch(client: httpx.AsyncClient, gid: int):
+        async with sem:
+            try:
+                r = await client.get(
+                    f"https://esi.evetech.net/latest/universe/groups/{gid}/",
+                    params={"datasource": "tranquility"},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    if d.get("published", True):
+                        return (gid, d["name"])
+            except Exception:
+                pass
+            return None
+
+    async with esi_client() as client:
+        results = await asyncio.gather(*[_fetch(client, gid) for gid in group_ids])
+
+    for row in results:
+        if row:
+            conn.execute("INSERT INTO sde_groups VALUES (?,?) ON CONFLICT (group_id) DO UPDATE SET name=excluded.name", row)
+    conn.commit()
+
+
+def _load_blueprints_from_cache(conn: sqlite3.Connection, char_id: int) -> list[dict]:
+    row = conn.execute(
+        "SELECT data_json FROM char_blueprints_cache WHERE character_id=?", (char_id,)
+    ).fetchone()
+    if not row:
+        return []
+    return json.loads(row[0])
+
+
+def _load_assets_from_cache(conn: sqlite3.Connection, char_id: int) -> list[dict]:
+    """Load assets straight from the JSON cache without an ESI call."""
+    row = conn.execute(
+        "SELECT data_json FROM char_assets_cache WHERE character_id=?", (char_id,)
+    ).fetchone()
+    if not row:
+        return []
+    return json.loads(row[0])
+
+
+def _load_corp_assets_from_cache(conn: sqlite3.Connection, corp_id: int) -> list[dict]:
+    row = conn.execute(
+        "SELECT data_json FROM corp_assets_cache WHERE corporation_id=?", (corp_id,)
+    ).fetchone()
+    if not row:
+        return []
+    return json.loads(row[0])
