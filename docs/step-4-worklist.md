@@ -9,7 +9,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   Postgres is reachable.
 * **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
-* Step 4 is **3 of 8** items, plus the Postgres groundwork. The query
+* Step 4 is **4 of 8** items, plus the Postgres groundwork. The query
   conversion has started: `projects` is done, ten modules to go.
 
 To bring the Postgres tests back:
@@ -99,10 +99,9 @@ pointed at the container. Both must pass before the commit lands.
 
 Ordered by dependency, not by size.
 
-* **W9 — async token refresh.** The current refresh is synchronous and blocks
-  the event loop; this is the v0.9.22 bug class and it is still live.
-  `deps._valid_token_async` is the pattern to follow — it already exists and
-  already does the right thing for the dashboard and the first sync.
+* ~~**W9 — async token refresh.**~~ **Done.** 22 call sites across six routers.
+  The net is `tests/test_async_token_refresh.py`, which scans for the blocking
+  call inside any coroutine — keep it green rather than re-auditing by hand.
 * **Background sync worker** — delay-after-completion plus jitter, so N
   characters do not stampede ESI in lockstep. **Decide the event model before
   writing it**: §9.5 needs it to emit events rather than only fill caches,

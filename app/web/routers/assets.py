@@ -24,7 +24,6 @@ from fastapi.responses import HTMLResponse
 from app.auth.token_store import (
     list_characters,
     update_corporation_id,
-    get_valid_token as _get_valid_token_for,
 )
 from app.character.assets import fetch_assets, fetch_corp_assets
 from app.character.blueprints import fetch_blueprints
@@ -33,6 +32,7 @@ from app.db.type_resolver import resolve_names_bulk
 from app.esi.client import esi_client
 from app.web.deps import (
     _container_display_name,
+    _valid_token_async,
     _load_assets_from_cache,
     _load_corp_assets_from_cache,
     _tr,
@@ -104,7 +104,7 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
     if selected_chars:
         async with esi_client() as client:
             for cid, _name in selected_chars:
-                tok = _get_valid_token_for(conn, cid)
+                tok = await _valid_token_async(cid)
                 if not tok:
                     continue
                 primary_token = primary_token or tok
@@ -379,7 +379,7 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
         container_info: dict[int, tuple[str, int]] = {}
         if all_container_ids:
             for owner_id, _ in selected_chars:
-                tok = _get_valid_token_for(conn, owner_id)
+                tok = await _valid_token_async(owner_id)
                 if not tok:
                     continue
                 owner_assets = assets_raw_by_char.get(owner_id, [])
@@ -956,7 +956,7 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
         async with esi_client() as client:
             all_unique_type_ids: set[int] = set()
             for cid_sel, _name in selected_chars:
-                tok = _get_valid_token_for(conn, cid_sel)
+                tok = await _valid_token_async(cid_sel)
                 if not tok:
                     continue
                 primary_token = primary_token or tok
@@ -1025,7 +1025,7 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
     container_info: dict[int, tuple[str, int]] = {}
     if container_ids:
         for owner_id, _ in selected_chars:
-            tok = _get_valid_token_for(conn, owner_id)
+            tok = await _valid_token_async(owner_id)
             if not tok:
                 continue
             owner_assets = assets_by_char.get(owner_id, [])

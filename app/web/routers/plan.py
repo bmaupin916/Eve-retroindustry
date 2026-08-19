@@ -19,10 +19,7 @@ import sqlite3
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
-from app.auth.token_store import (
-    get_character_row,
-    get_valid_token as _get_valid_token_for,
-)
+from app.auth.token_store import get_character_row
 from app.bom.resolver import BOMResolver
 from app.cache.blueprint_cache import resolve_type
 from app.character.assets import fetch_assets
@@ -45,6 +42,7 @@ from app.web import app_defaults
 from app.db.location import database_path
 from app.web.deps import (
     _load_assets_from_cache,
+    _valid_token_async,
     _tr,
     get_active_character_id,
     get_conn,
@@ -170,7 +168,7 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
     if plan_char_id is None:
         plan_char_id = get_active_character_id(request, conn)
     char_row = get_character_row(conn, plan_char_id) if plan_char_id else None
-    token = _get_valid_token_for(conn, plan_char_id) if plan_char_id else None
+    token = await _valid_token_async(plan_char_id) if plan_char_id else None
 
     location_ids = []
     char_skills: dict[int, int] = {}
@@ -392,7 +390,7 @@ async def plan_result(
     try:
         if plan_char_id_int is None:
             raise ValueError("You are not signed in.")
-        token = _get_valid_token_for(conn, plan_char_id_int)
+        token = await _valid_token_async(plan_char_id_int)
         row = get_character_row(conn, plan_char_id_int)
         if not token or not row:
             raise ValueError("You are not signed in.")
@@ -887,7 +885,8 @@ async def plan_result(
 
     # Stock-source options (names via ESI, not bare IDs). Default = manufacturing
     # station unless the user selected explicitly.
-    _stock_token = _get_valid_token_for(conn, plan_char_id_int) if plan_char_id_int else None
+    _stock_token = (await _valid_token_async(plan_char_id_int)
+                    if plan_char_id_int else None)
     stock_station_options = await _build_stock_station_options(
         conn, plan_char_id_int, _stock_token,
         selected_ids=stock_station_ids, default_station=station, explicit=stock_explicit,

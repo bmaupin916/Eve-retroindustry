@@ -15,16 +15,13 @@ from urllib.parse import quote
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from app.auth.token_store import (
-    list_characters,
-    get_valid_token as _get_valid_token_for,
-)
+from app.auth.token_store import list_characters
 from app.character import jobs as jobs_api
 from app.character.skills import get_cached_skills
 from app.esi.client import esi_client
 from app.web import margins_helper, reactions_helper
 from app.db.location import database_path
-from app.web.deps import _tr, get_conn
+from app.web.deps import _tr, _valid_token_async, get_conn
 from app.web.location_resolver import (
     load_location_names_from_db,
     resolve_station_names_bulk,
@@ -69,7 +66,7 @@ async def jobs_page(request: Request):
     # failure (e.g. during a background Sync All) isn't shown as "no jobs".
     async def _one(cid: int):
         try:
-            tok = _get_valid_token_for(conn, cid)
+            tok = await _valid_token_async(cid)
             if not tok:
                 return cid, None
             async with esi_client() as client:
@@ -102,8 +99,11 @@ async def jobs_page(request: Request):
         ).fetchall()}
     loc_names: dict[int, str] = {}
     if all_loc_ids:
-        any_tok = next((_get_valid_token_for(conn, cid) for cid, _ in chars
-                        if _get_valid_token_for(conn, cid)), None)
+        # One refresh per character, concurrently, instead of up to two each
+        # in series: the generator called the blocking version twice per
+        # character — once for the condition and once for the value.
+        tokens = await asyncio.gather(*[_valid_token_async(cid) for cid, _ in chars])
+        any_tok = next((t for t in tokens if t), None)
         try:
             loc_names = await resolve_station_names_bulk(list(all_loc_ids), token=any_tok, conn=conn)
         except Exception:

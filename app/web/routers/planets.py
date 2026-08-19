@@ -16,16 +16,13 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from app.auth.token_store import (
-    list_characters,
-    get_valid_token as _get_valid_token_for,
-)
+from app.auth.token_store import list_characters
 from app.character import planets as planets_api
 from app.esi.client import esi_client
 from app.web import pi_planner_helper
 from app.db.location import database_path
 from app.db.schema import ensure_schema as ensure_db_schema
-from app.web.deps import _tr, get_conn
+from app.web.deps import _tr, _valid_token_async, get_conn
 
 router = APIRouter()
 
@@ -44,7 +41,7 @@ async def _fetch_pi_colonies(conn: sqlite3.Connection, chars) -> list:
     """
     async def _one(cid: int):
         try:
-            tok = _get_valid_token_for(conn, cid)
+            tok = await _valid_token_async(cid)
             if not tok:
                 return cid, None
             async with esi_client() as client:
@@ -410,7 +407,7 @@ async def _pi_fetch_and_cache(conn: sqlite3.Connection, chars) -> None:
     """Fetch every character's colonies + extractor expiry times and refresh the
     PI cache. Lightweight vs the full /planets view (extractors only)."""
     async def _one(cid: int):
-        tok = _get_valid_token_for(conn, cid)
+        tok = await _valid_token_async(cid)
         if not tok:
             return cid, None
         try:

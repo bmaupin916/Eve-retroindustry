@@ -7,6 +7,8 @@ character/corp ids and will land in different routers.
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 
@@ -14,13 +16,13 @@ from app.auth.token_store import (
     get_character_row,
     list_characters,
     update_corporation_id,
-    get_valid_token as _get_valid_token_for,
 )
 from app.character import contracts as contracts_api
 from app.esi.client import esi_client
 from app.web import contracts_helper
 from app.web.deps import (
     _resolve_party_names,
+    _valid_token_async,
     _tr,
     get_active_character_id,
     get_conn,
@@ -111,7 +113,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
             if scope == "corp":
                 corp_token: dict[int, str] = {}
                 for cid, _cn in chars:
-                    tok = _get_valid_token_for(conn, cid)
+                    tok = await _valid_token_async(cid)
                     if not tok:
                         continue
                     corp_id = (get_character_row(conn, cid) or {}).get("corporation_id")
@@ -128,7 +130,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
             else:
                 async with esi_client() as client:
                     for cid, cname in chars:
-                        tok = _get_valid_token_for(conn, cid)
+                        tok = await _valid_token_async(cid)
                         if not tok:
                             continue
                         for c in await contracts_api.fetch_character_contracts(client, cid, tok):
@@ -138,8 +140,10 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
             # dedup by contract_id (several characters may see the same contract)
             seen: set[int] = set()
             raw = [c for c in raw if not (c.get("contract_id") in seen or seen.add(c.get("contract_id")))]
-            any_tok = next((_get_valid_token_for(conn, c) for c, _ in chars
-                            if _get_valid_token_for(conn, c)), None)
+            # One refresh per character, concurrently. The generator called
+            # the blocking version twice each — condition and value.
+            tokens = await asyncio.gather(*[_valid_token_async(c) for c, _ in chars])
+            any_tok = next((t for t in tokens if t), None)
             ctx["contracts"] = await _finalize_contracts(conn, raw, any_tok)
             conn.close()
             return _tr("contracts.html", request, ctx)
@@ -149,7 +153,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
         if plan_char_id is None:
             plan_char_id = get_active_character_id(request, conn)
         ctx["contracts_char_id"] = plan_char_id
-        token = _get_valid_token_for(conn, plan_char_id) if plan_char_id else None
+        token = await _valid_token_async(plan_char_id) if plan_char_id else None
         row = get_character_row(conn, plan_char_id) if plan_char_id else None
         if not token or not row:
             ctx["error"] = "The character token expired — sign in again."
@@ -199,13 +203,13 @@ async def api_contract_items(request: Request, contract_id: int,
                 tok = None
                 for cid, _ in list_characters(conn):
                     if (get_character_row(conn, cid) or {}).get("corporation_id") == corp_id:
-                        tok = _get_valid_token_for(conn, cid)
+                        tok = await _valid_token_async(cid)
                         if tok:
                             break
                 if tok:
                     items = await contracts_api.fetch_corp_contract_items(client, corp_id, contract_id, tok)
             elif char_id:
-                tok = _get_valid_token_for(conn, char_id)
+                tok = await _valid_token_async(char_id)
                 if tok:
                     items = await contracts_api.fetch_character_contract_items(client, char_id, contract_id, tok)
         tids = {it.get("type_id") for it in items if it.get("type_id")}
@@ -306,8 +310,9 @@ async def public_contracts_page(request: Request, region: str = "", item: str = 
             party_names = await _resolve_party_names(party_ids) if party_ids else {}
             loc_names: dict[int, str] = {}
             if loc_ids:
-                any_tok = next((_get_valid_token_for(conn, cid) for cid, _ in list_characters(conn)
-                                if _get_valid_token_for(conn, cid)), None)
+                tokens = await asyncio.gather(
+                    *[_valid_token_async(cid) for cid, _ in list_characters(conn)])
+                any_tok = next((t for t in tokens if t), None)
                 try:
                     loc_names = await resolve_station_names_bulk(list(loc_ids), token=any_tok, conn=conn)
                 except Exception:

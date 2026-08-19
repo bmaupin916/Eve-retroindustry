@@ -20,7 +20,6 @@ from app.auth.token_store import (
     get_character_row,
     list_characters,
     update_corporation_id,
-    get_valid_token as _get_valid_token_for,
 )
 from app.character import orders as orders_api
 from app.character import wallet as wallet_api
@@ -33,6 +32,7 @@ from app.web.location_resolver import (
 )
 from app.web.deps import (
     _resolve_party_names,
+    _valid_token_async,
     _tr,
     get_active_character_id,
     get_conn,
@@ -74,7 +74,7 @@ async def wallet_page(request: Request, char: str = "", scope: str = "personal",
         conn.close()
         return _tr("wallet.html", request, ctx)
 
-    token = _get_valid_token_for(conn, plan_char_id)
+    token = await _valid_token_async(plan_char_id)
     row = get_character_row(conn, plan_char_id)
     if not token or not row:
         ctx["error"] = "The character token expired — sign in again."
@@ -341,7 +341,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
             return _tr("orders.html", request, ctx)
 
         async def _char_orders(cid: int, cname: str) -> list[dict]:
-            tok = _get_valid_token_for(conn, cid)
+            tok = await _valid_token_async(cid)
             if not tok:
                 return []
             async with esi_client() as client:
@@ -374,7 +374,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
                 corp_token: dict[int, str] = {}
                 async with esi_client() as client:
                     for cid, _cn in chars:
-                        tok = _get_valid_token_for(conn, cid)
+                        tok = await _valid_token_async(cid)
                         if not tok:
                             continue
                         crow = get_character_row(conn, cid) or {}
@@ -422,7 +422,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
         ctx["error"] = "You are not signed in."
         conn.close()
         return _tr("orders.html", request, ctx)
-    token = _get_valid_token_for(conn, plan_char_id)
+    token = await _valid_token_async(plan_char_id)
     row = get_character_row(conn, plan_char_id)
     if not token or not row:
         ctx["error"] = "The character token expired — sign in again."
