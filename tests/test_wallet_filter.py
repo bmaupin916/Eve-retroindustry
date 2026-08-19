@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import re
 
+from app.web.routers import characters as characters_router
+
 
 def test_ref_types_are_humanized_for_display_and_filtering(app_module):
     """The filter lists whatever the rows say, so raw ESI tokens would leak into it."""
-    h = app_module.wallet_api.humanize_ref_type
+    h = characters_router.wallet_api.humanize_ref_type
     assert h("brokers_fee") == "Broker's Fee"
     assert h("market_transaction") == "Market Transaction"
     assert h("industry_job_tax") == "Industry Job Tax"
@@ -26,17 +28,17 @@ def _wallet_html(client, app_module, journal, txns):
     async def _jr(*a, **k): return journal
     async def _tx(*a, **k): return txns
     async def _names(conn, j, t, tok): return {}
-    orig = (app_module.wallet_api.fetch_balance, app_module.wallet_api.fetch_journal,
-            app_module.wallet_api.fetch_transactions, app_module._wallet_names)
-    app_module.wallet_api.fetch_balance = _bal
-    app_module.wallet_api.fetch_journal = _jr
-    app_module.wallet_api.fetch_transactions = _tx
-    app_module._wallet_names = _names
+    orig = (characters_router.wallet_api.fetch_balance, characters_router.wallet_api.fetch_journal,
+            characters_router.wallet_api.fetch_transactions, characters_router._wallet_names)
+    characters_router.wallet_api.fetch_balance = _bal
+    characters_router.wallet_api.fetch_journal = _jr
+    characters_router.wallet_api.fetch_transactions = _tx
+    characters_router._wallet_names = _names
     try:
         return client.get("/wallet?char=900000001").text
     finally:
-        (app_module.wallet_api.fetch_balance, app_module.wallet_api.fetch_journal,
-         app_module.wallet_api.fetch_transactions, app_module._wallet_names) = orig
+        (characters_router.wallet_api.fetch_balance, characters_router.wallet_api.fetch_journal,
+         characters_router.wallet_api.fetch_transactions, characters_router._wallet_names) = orig
 
 
 JOURNAL = [
@@ -96,11 +98,11 @@ def test_row_cap_is_five_times_the_old_500(app_module):
     """Chosen from measurement, not taste: 500 rows/tab render in ~290 ms, 2500 in
     ~590 ms, 5000 in ~1.1 s and 6.5 MB of HTML. Going past this wants virtualised
     rows rather than a bigger constant."""
-    assert app_module._WALLET_ROW_CAP == 2500
+    assert characters_router._WALLET_ROW_CAP == 2500
 
 
 def test_cap_applies_to_both_tables(client, app_module):
-    cap = app_module._WALLET_ROW_CAP
+    cap = characters_router._WALLET_ROW_CAP
     journal = [{"date": "2026-08-01T10:00:00Z", "ref_type": "brokers_fee",
                 "amount": -1.0, "balance": 1.0, "id": i} for i in range(cap + 500)]
     txns = [{"date": "2026-08-01T12:00:00Z", "type_id": 34, "quantity": 1,
@@ -136,17 +138,17 @@ def test_journal_fetch_pages_until_the_limit_is_reached(app_module):
 
     # 1000-row pages → three calls to cover a 2500 limit.
     c = _Client(1000, 10)
-    got = asyncio.run(app_module.wallet_api.fetch_journal(c, 1, "t", limit=2500))
+    got = asyncio.run(characters_router.wallet_api.fetch_journal(c, 1, "t", limit=2500))
     assert c.calls == [1, 2, 3] and len(got) == 3000
 
     # 2500-row pages → one call is enough, no wasted requests.
     c = _Client(2500, 10)
-    asyncio.run(app_module.wallet_api.fetch_journal(c, 1, "t", limit=2500))
+    asyncio.run(characters_router.wallet_api.fetch_journal(c, 1, "t", limit=2500))
     assert c.calls == [1]
 
     # Fewer pages than the limit needs → stops at x-pages, does not loop.
     c = _Client(100, 2)
-    got = asyncio.run(app_module.wallet_api.fetch_journal(c, 1, "t", limit=2500))
+    got = asyncio.run(characters_router.wallet_api.fetch_journal(c, 1, "t", limit=2500))
     assert c.calls == [1, 2] and len(got) == 200
 
 
@@ -165,5 +167,5 @@ def test_journal_fetch_is_bounded_even_if_esi_reports_nonsense(app_module):
             return _Resp()
 
     c = _Client()
-    asyncio.run(app_module.wallet_api.fetch_journal(c, 1, "t", limit=2500))
-    assert c.calls == app_module.wallet_api._MAX_JOURNAL_PAGES
+    asyncio.run(characters_router.wallet_api.fetch_journal(c, 1, "t", limit=2500))
+    assert c.calls == characters_router.wallet_api._MAX_JOURNAL_PAGES
