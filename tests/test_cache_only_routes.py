@@ -81,8 +81,6 @@ ALLOWED = {
     "planets_page": "TODO: no cache for colony detail yet",
     "pi_planner_page": "TODO: shares the colony fetch with /planets",
     "api_pi_alerts": "TODO: refreshes live when the cache is stale",
-    "assets_page": "TODO: cache-aware fetchers, but still fetches when stale",
-    "blueprints_page": "TODO: cache-aware fetchers, but still fetches when stale",
     "plan_form": "TODO: cache-aware fetchers, but still fetches when stale",
     "plan_result": "TODO: cache-aware fetchers, but still fetches when stale",
 }

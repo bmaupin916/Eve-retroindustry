@@ -38,14 +38,23 @@ async def _fetch_from_esi(client: httpx.AsyncClient, type_id: int) -> dict | Non
 async def resolve_name(
     conn: sqlite3.Connection,
     type_id: int,
-    client: httpx.AsyncClient,
+    client: httpx.AsyncClient | None,
 ) -> str:
     """
     Return the type name. If missing from the SDE, query ESI and store the result.
+
+    `client=None` means "answer from local data or not at all". The cache-only
+    pages pass it: they must not reach ESI while rendering, and a type the SDE
+    has never heard of is worth a placeholder rather than a round trip on the
+    request path. Without this the None would surface as an AttributeError from
+    inside `_fetch_from_esi`, on whichever unusual item happened to be in the
+    hangar.
     """
     name = resolve_name_sync(conn, type_id)
     if name:
         return name
+    if client is None:
+        return f"Unknown ({type_id})"
 
     data = await _fetch_from_esi(client, type_id)
     if data:
@@ -59,7 +68,7 @@ async def resolve_name(
 async def resolve_names_bulk(
     conn: sqlite3.Connection,
     type_ids: list[int],
-    client: httpx.AsyncClient,
+    client: httpx.AsyncClient | None,
 ) -> dict[int, str]:
     """Translate a list of type_ids to names in parallel (SDE + ESI fallback)."""
     tasks = [resolve_name(conn, tid, client) for tid in type_ids]

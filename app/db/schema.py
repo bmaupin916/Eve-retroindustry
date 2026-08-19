@@ -196,6 +196,21 @@ wallet_ledger_cache = Table(
     Column("cached_at", Float, nullable=False),
 )
 
+container_name_cache = Table(
+    "container_name_cache", metadata,
+    # The name a player typed on a container or an assembled ship. ESI serves
+    # these from a bulk POST to /assets/names/, which was the last thing making
+    # /assets wait on the network to render.
+    #
+    # Keyed on the item alone: a container's name belongs to the container, not
+    # to whoever happened to ask. The owner still matters at *fetch* time —
+    # posting another pilot's item_ids fails the whole batch — but that is the
+    # worker's problem now, and it syncs per character anyway.
+    Column("item_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("name", Text, nullable=False),
+    Column("cached_at", Float, nullable=False),
+)
+
 contracts_cache = Table(
     "contracts_cache", metadata,
     # A character's or corporation's contracts, so /contracts renders without

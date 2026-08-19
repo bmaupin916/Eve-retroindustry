@@ -51,6 +51,25 @@ def _save_cache(conn: sqlite3.Connection, character_id: int, data: list[dict]):
     conn.commit()
 
 
+def load_cached_blueprints(conn: sqlite3.Connection,
+                           character_id: int) -> tuple[list[CharBlueprint] | None, float]:
+    """(blueprints, cached_at) at any age, or (None, 0) if never synced.
+
+    Ignores `CACHE_TTL` for the same reason as the assets reader beside it: the
+    TTL answers "is another round trip worth it", which is a question for the
+    fetcher and not for a page that must not make round trips.
+    """
+    row = conn.execute(
+        "SELECT data_json, cached_at FROM char_blueprints_cache WHERE character_id=?",
+        (character_id,)).fetchone()
+    if not row:
+        return None, 0.0
+    try:
+        return _parse_blueprints(json.loads(row[0])), float(row[1] or 0.0)
+    except (ValueError, TypeError, KeyError):
+        return None, 0.0
+
+
 async def fetch_blueprints(
     client: httpx.AsyncClient,
     character_id: int,

@@ -42,7 +42,12 @@ import time
 from typing import Iterable, Optional
 
 from app.auth.token_store import list_characters, update_corporation_id, update_last_sync
-from app.character.assets import fetch_assets, fetch_corp_assets
+from app.character.assets import (
+    container_item_ids,
+    fetch_assets,
+    fetch_container_names,
+    fetch_corp_assets,
+)
 from app.character.blueprints import fetch_blueprints
 from app.character.jobs import fetch_industry_jobs
 from app.character.orders import (
@@ -282,11 +287,29 @@ class SyncWorker:
                 # visible before its event — is only a late announcement.
                 raw = conn.connection.driver_connection
                 async with esi_client() as client:
-                    blueprints = await fetch_blueprints(client, char_id, token, raw)
+                    # `force_refresh` on all three, like the jobs fetch below.
+                    # Without it each consults the same TTL it is about to
+                    # write, which is circular — and blueprints' TTL is fifteen
+                    # minutes against a fifteen-minute tick, so whether the
+                    # worker refreshed them at all came down to scheduling
+                    # jitter. Assets' ten-minute TTL always lost the race and
+                    # so always refreshed, which is why this never showed up as
+                    # a stale asset list.
+                    blueprints = await fetch_blueprints(client, char_id, token, raw,
+                                                        force_refresh=True)
                     changed += self._diff(char_id, "blueprints", blueprints)
 
-                    assets = await fetch_assets(client, char_id, token, raw)
+                    assets = await fetch_assets(client, char_id, token, raw,
+                                                force_refresh=True)
                     changed += self._diff(char_id, "assets", assets)
+
+                    # Custom container and ship names, in one POST. Derived
+                    # from the assets just fetched rather than from a category
+                    # list: an item is a container exactly when something else
+                    # is inside it. No event — renaming a can is not news.
+                    await fetch_container_names(
+                        client, char_id, token, container_item_ids(assets or []),
+                        conn=raw)
 
                     skills = await fetch_skills(client, char_id, token, raw)
                     changed += self._diff(char_id, "skills", skills)
@@ -334,12 +357,16 @@ class SyncWorker:
 
                     try:
                         corp_id, corp_assets = await fetch_corp_assets(
-                            client, char_id, token, raw)
+                            client, char_id, token, raw, force_refresh=True)
                         if corp_id:
                             update_corporation_id(raw, char_id, corp_id)
                             changed += self._diff(
                                 char_id, "corp_assets", corp_assets,
                                 corporation_id=corp_id)
+                            await fetch_container_names(
+                                client, corp_id, token,
+                                container_item_ids(corp_assets or []),
+                                conn=raw, corporate=True)
                             # Same role requirement as corp assets and the same
                             # best-effort handling: a 403 returns an error
                             # string rather than raising, and writes nothing.

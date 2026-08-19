@@ -607,3 +607,44 @@ def test_a_wake_does_not_leak_into_the_next_sleep(db_with, stub_esi):
 def test_wake_is_safe_when_no_worker_is_running():
     """The login path calls this unconditionally; EVE_SYNC_WORKER=0 is normal."""
     assert w.wake() is False
+
+
+# ── the worker refreshes rather than consulting its own TTL ──────────────────
+
+def test_the_worker_forces_a_refresh_rather_than_reading_its_own_cache(
+        db_with, stub_esi, monkeypatch):
+    """`fetch_blueprints` and `fetch_assets` skip the network when their cache
+    row is younger than `CACHE_TTL`. That is the right rule for a *page* asking
+    "is another round trip worth it"; for the worker it is circular, because
+    the worker is what writes the row it is consulting.
+
+    It mattered most for blueprints: a fifteen-minute TTL against a
+    fifteen-minute tick meant whether they were refreshed at all came down to
+    scheduling jitter. Assets' ten-minute TTL always lost the race and so
+    always refreshed, which is why this never surfaced as a stale asset list —
+    only as blueprints that sometimes did not move.
+
+    Asserted on the argument rather than on behaviour because the alternative
+    is a test that sleeps: `fetch_*` decides internally, and the observable
+    difference is a network call that the stubs remove.
+    """
+    import asyncio
+
+    seen: dict[str, dict] = {}
+
+    def _capture(name):
+        async def _f(client, char_id, token, conn, **kw):
+            seen[name] = kw
+            return []
+        return _f
+
+    monkeypatch.setattr(w, "fetch_blueprints", _capture("blueprints"))
+    monkeypatch.setattr(w, "fetch_assets", _capture("assets"))
+
+    asyncio.run(_worker(_Clock()).sync_character(900000000, "Tester"))
+
+    assert seen, "neither fetcher was called — the stub never ran"
+
+    assert seen.get("blueprints", {}).get("force_refresh") is True, (
+        "the worker asked fetch_blueprints to honour a TTL it writes itself")
+    assert seen.get("assets", {}).get("force_refresh") is True

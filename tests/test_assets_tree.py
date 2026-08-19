@@ -466,164 +466,153 @@ def test_dashboard_ship_label_uses_the_same_convention(app_module):
 
 # ── "All characters" view ─────────────────────────────────────────────────────
 
-def test_resolver_asks_only_about_ids_the_character_owns(app_module):
+def test_the_fetcher_asks_only_about_ids_the_character_owns(app_module, tmp_path):
     """Reported: in the All-characters view no assembled ship showed its name.
 
-    The caller hands the resolver every container id found across the account. It
-    used to POST that whole list to each character's /assets/names/, so each call
-    carried other pilots' item_ids. Whatever ESI makes of those, a failed batch
-    costs the custom name of every container in it — and every assembled ship then
-    falls back to its bare hull type, which is what was seen.
+    The caller handed the resolver every container id found across the account,
+    and it POSTed that whole list to each character's /assets/names/, so each
+    call carried other pilots' item_ids. Whatever ESI makes of those, a failed
+    batch costs the custom name of every container in it — and every assembled
+    ship then falls back to its bare hull type, which is what was seen.
+
+    The POST moved out of the page in v0.9.52; the sync worker makes it now and
+    the page reads a cache. So the property is asserted where it lives, and it
+    holds for a stronger reason than a filter: `container_item_ids` derives the
+    list from *that owner's* assets, so there is no path by which another
+    pilot's id reaches the request.
     """
-    import asyncio, json as _j
+    import asyncio
+    import json as _j
+    import sqlite3
+
+    from app.character import assets as assets_api
+    from app.db.schema import apply_schema
 
     posted: list[list[int]] = []
 
     class _Resp:
         status_code = 200
-        def json(self): return [{"item_id": 111, "name": "Mine"}]
+
+        def json(self):
+            return [{"item_id": 111, "name": "Mine"}]
 
     class _Client:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
         async def post(self, url, **kw):
             posted.append(_j.loads(kw["content"]))
             return _Resp()
 
-    orig = assets_router.esi_client
-    assets_router.esi_client = lambda *a, **k: _Client()
-    try:
-        mine = [{"item_id": 111, "type_id": MEGATHRON, "location_id": 60003760}]
-        got = asyncio.run(assets_router._resolve_container_names(
-            1, "tok", [111, 222, 333], assets=mine))          # 222/333 belong to others
-    finally:
-        assets_router.esi_client = orig
+    conn = sqlite3.connect(str(tmp_path / "c.db"))
+    apply_schema(conn)
 
-    assert posted == [[111]], posted            # only our own id went out
-    assert got == {111: ("Mine (Megathron)", 60003760)}
+    # Only 111 is ours; 222 and 333 belong to other pilots and are inside their
+    # hangars, not ours.
+    mine = [{"item_id": 111, "type_id": MEGATHRON, "location_id": 60003760},
+            {"item_id": 999, "type_id": MEGATHRON, "location_id": 111}]
+
+    ids = assets_api.container_item_ids(mine)
+    assert ids == [111], f"derived {ids} — an id we do not own would be posted"
+
+    got = asyncio.run(assets_api.fetch_container_names(
+        _Client(), 1, "tok", ids, conn=conn))
+    conn.commit()
+
+    assert posted == [[111]], posted
+    assert got == {111: "Mine"}
+    assert assets_api.load_cached_container_names(conn, [111, 222]) == {111: "Mine"}
+    conn.close()
 
 
-def test_resolver_skips_esi_entirely_when_it_owns_nothing(app_module):
-    """A character with none of the requested containers must not be asked at all."""
+def test_an_asset_holding_nothing_is_not_a_container(app_module):
+    """`container_item_ids` is the whole filter now, so what it excludes matters
+    as much as what it includes. A ship in a hangar with nothing inside it is
+    not a container, and asking ESI to name it is a wasted id in the batch."""
+    from app.character import assets as assets_api
+
+    flat = [{"item_id": 1, "type_id": MEGATHRON, "location_id": 60003760},
+            {"item_id": 2, "type_id": MEGATHRON, "location_id": 60003760}]
+
+    assert assets_api.container_item_ids(flat) == []
+
+
+def test_the_resolver_returns_nothing_when_it_owns_nothing(app_module):
+    """A character with none of the requested containers gets an empty answer
+    rather than a lookup — the filter that used to keep it off ESI still keeps
+    it off the database."""
     import asyncio
 
-    called = []
+    got = asyncio.run(assets_router._resolve_container_names(1, "tok", [111, 222], assets=[]))
 
-    class _Client:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def post(self, *a, **k): called.append(1); raise AssertionError("should not post")
-
-    orig = assets_router.esi_client
-    assets_router.esi_client = lambda *a, **k: _Client()
-    try:
-        got = asyncio.run(assets_router._resolve_container_names(1, "tok", [111, 222], assets=[]))
-        assert got == {} and not called
-    finally:
-        assets_router.esi_client = orig
+    assert got == {}
 
 
-def test_all_characters_view_shows_every_pilots_ship_name(app_module, client, monkeypatch):
-    """The caller merges per-character results; each pilot's ship must keep its name."""
-    import json as _j, time as _t
+def test_the_resolver_names_a_container_from_the_cache(app_module):
+    """The page-side half: whatever the worker stored is what gets displayed,
+    and a container with no stored name still renders as its type."""
+    import asyncio
 
-    CHARS = {900000001: (830001, "Alpha Ship"), 900000002: (830002, "Beta Ship")}
+    from app.character import assets as assets_api
+
     conn = app_module.get_conn()
-    saved = {}
-    for cid, (ship_id, _n) in CHARS.items():
-        row = conn.execute("SELECT data_json, cached_at FROM char_assets_cache"
-                           " WHERE character_id=?", (cid,)).fetchone()
-        saved[cid] = (row[0], row[1]) if row else None
-        conn.execute("DELETE FROM char_assets_cache WHERE character_id=?", (cid,))
-        conn.execute("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
-                     " VALUES (?,?,?)", (cid, _j.dumps([
-                         {"item_id": ship_id, "type_id": MEGATHRON, "quantity": 1,
-                          "location_id": 60003760, "location_flag": "Hangar",
-                          "is_singleton": True},
-                         {"item_id": ship_id + 500, "type_id": TRIT, "quantity": 5,
-                          "location_id": ship_id, "location_flag": "Cargo",
-                          "is_singleton": False},
-                     ]), _t.time()))
-    conn.commit(); conn.close()
-
-    owned = {cid: ship for cid, (ship, _n) in CHARS.items()}
-    names = {ship: nm for _c, (ship, nm) in CHARS.items()}
-
-    async def _fake(char_id, token, container_ids, assets_raw):
-        # Mirrors the real resolver: a character only answers for its own items.
-        mine = owned.get(char_id)
-        if mine is None or mine not in container_ids:
-            return {}
-        return {mine: (app_module._container_display_name(names[mine], "Megathron", mine),
-                       60003760)}
-
-    monkeypatch.setattr(assets_router, "_resolve_container_names", _fake)
     try:
-        html = _text(client, "/assets?view=all")
-        assert "Alpha Ship (Megathron)" in html
-        assert "Beta Ship (Megathron)" in html
+        assets_api.save_cached_container_names(conn, {111: "Ammo Bin"})
+        conn.commit()
     finally:
-        conn = app_module.get_conn()
-        for cid, orig in saved.items():
-            conn.execute("DELETE FROM char_assets_cache WHERE character_id=?", (cid,))
-            if orig:
-                conn.execute("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
-                             " VALUES (?,?,?)", (cid, orig[0], orig[1]))
-        conn.commit(); conn.close()
+        conn.close()
+
+    mine = [{"item_id": 111, "type_id": MEGATHRON, "location_id": 60003760},
+            {"item_id": 112, "type_id": MEGATHRON, "location_id": 60003760}]
+    got = asyncio.run(assets_router._resolve_container_names(
+        1, "tok", [111, 112], assets=mine))
+
+    assert got[111][0] == "Ammo Bin (Megathron)"
+    assert got[112][0].startswith("Megathron"), (
+        f"an unnamed container lost its type fallback: {got[112][0]}")
 
 
-# ── the corp variant of the same resolver ────────────────────────────────────
+def test_the_fetcher_asks_only_about_ids_the_corp_owns(app_module, tmp_path):
+    """Matches its character twin, and for the same reason: an id the
+    corporation does not hold fails the batch for every container in it."""
+    import asyncio
+    import json as _j
+    import sqlite3
 
-def test_corp_resolver_asks_only_about_ids_the_corp_owns(app_module):
-    """The corp resolver is a copy of the character one that never got the fix.
-
-    It posted `owned_ids` — a name only the character variant builds. Python
-    raised NameError, `except Exception: custom_names = {}` ate it, and every
-    corp container in the hangar fell back to its bare type name. Nothing in
-    the UI or the log said why, which is why this sat there: found by pyflakes,
-    not by anything failing.
-    """
-    import asyncio, json as _j
+    from app.character import assets as assets_api
+    from app.db.schema import apply_schema
 
     posted: list[list[int]] = []
 
     class _Resp:
         status_code = 200
-        def json(self): return [{"item_id": 5001, "name": "Ore Bin"}]
+
+        def json(self):
+            return [{"item_id": 5001, "name": "Ore Bin"}]
 
     class _Client:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
         async def post(self, url, **kw):
             posted.append(_j.loads(kw["content"]))
+            assert "/corporations/" in url, f"posted to the character endpoint: {url}"
             return _Resp()
 
-    ours = [{"item_id": 5001, "type_id": MEGATHRON, "location_id": 60003760}]
-    orig = assets_router.esi_client
-    assets_router.esi_client = lambda *a, **k: _Client()
-    try:                                          # 7777 belongs to someone else
-        got = asyncio.run(assets_router._resolve_corp_container_names(
-            98000001, "tok", [5001, 7777], ours))
-    finally:
-        assets_router.esi_client = orig
+    conn = sqlite3.connect(str(tmp_path / "corp.db"))
+    apply_schema(conn)
 
-    assert posted == [[5001]], posted             # only our own id went out
-    assert got == {5001: ("Ore Bin (Megathron)", 60003760)}
+    ours = [{"item_id": 5001, "type_id": MEGATHRON, "location_id": 60003760},
+            {"item_id": 5002, "type_id": MEGATHRON, "location_id": 5001}]
+
+    got = asyncio.run(assets_api.fetch_container_names(
+        _Client(), 98000001, "tok", assets_api.container_item_ids(ours),
+        conn=conn, corporate=True))
+
+    assert posted == [[5001]], posted
+    assert got == {5001: "Ore Bin"}
+    conn.close()
 
 
-def test_corp_resolver_skips_esi_entirely_when_it_owns_nothing(app_module):
-    """Matches its character twin: nothing owned means no call at all."""
+def test_the_corp_resolver_returns_nothing_when_it_owns_nothing(app_module):
+    """Matches its character twin: nothing owned means no lookup at all."""
     import asyncio
 
-    class _Client:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def post(self, *a, **k): raise AssertionError("should not post")
+    assert asyncio.run(assets_router._resolve_corp_container_names(
+        98000001, "tok", [5001, 7777], [])) == {}
 
-    orig = assets_router.esi_client
-    assets_router.esi_client = lambda *a, **k: _Client()
-    try:
-        assert asyncio.run(assets_router._resolve_corp_container_names(
-            98000001, "tok", [5001, 7777], [])) == {}
-    finally:
-        assets_router.esi_client = orig
+

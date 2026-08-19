@@ -12,7 +12,6 @@ only caller.
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import time as _time
 
@@ -21,12 +20,13 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from app.auth.token_store import (
-    list_characters,
-    update_corporation_id,
+from app.auth.token_store import get_character_row, list_characters
+from app.character.assets import (
+    load_cached_assets,
+    load_cached_container_names,
+    load_cached_corp_assets,
 )
-from app.character.assets import fetch_assets, fetch_corp_assets
-from app.character.blueprints import fetch_blueprints
+from app.character.blueprints import load_cached_blueprints
 from app.db.schema import ensure_schema as ensure_db_schema
 from app.db.type_resolver import resolve_names_bulk
 from app.esi.client import esi_client
@@ -101,38 +101,45 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
     bpo_item_ids: set[int] = set()
     all_bp_type_ids: set[int] = set()
     primary_token: str | None = None
+    unsynced: list[str] = []
+    oldest: list[float] = []
     if selected_chars:
-        async with esi_client() as client:
-            for cid, _name in selected_chars:
-                tok = await _valid_token_async(cid)
-                if not tok:
-                    continue
-                primary_token = primary_token or tok
-                try:
-                    char_assets[cid] = await fetch_assets(client, cid, tok, conn)
-                except Exception:
-                    char_assets[cid] = []
-                try:
-                    bps = await fetch_blueprints(client, cid, tok, conn)
-                    for bp in bps:
-                        (bpc_item_ids if not bp.is_original else bpo_item_ids).add(bp.item_id)
-                        all_bp_type_ids.add(bp.type_id)
-                except Exception:
-                    pass
-                try:
-                    corp_id, corp_list = await fetch_corp_assets(client, cid, tok, conn)
-                    if corp_id:
-                        update_corporation_id(conn, cid, corp_id)
-                    corp_data[cid] = (corp_id, corp_list)
-                except Exception:
-                    corp_data[cid] = (0, [])
+        for cid, _name in selected_chars:
+            tok = await _valid_token_async(cid)
+            primary_token = primary_token or tok
 
-            all_type_ids_for_names = set()
-            for assets in char_assets.values():
-                all_type_ids_for_names |= {a.type_id for a in assets}
-            for _, corp_list in corp_data.values():
-                all_type_ids_for_names |= {a.type_id for a in corp_list}
-            names = await resolve_names_bulk(conn, list(all_type_ids_for_names), client)
+            assets, at = load_cached_assets(conn, cid)
+            if assets is None:
+                unsynced.append(_name or str(cid))
+                char_assets[cid] = []
+            else:
+                char_assets[cid] = assets
+                oldest.append(at)
+
+            bps, _bat = load_cached_blueprints(conn, cid)
+            for bp in bps or []:
+                (bpc_item_ids if not bp.is_original else bpo_item_ids).add(bp.item_id)
+                all_bp_type_ids.add(bp.type_id)
+
+            # The corporation id comes off the character row, which the sync
+            # worker writes. `fetch_corp_assets` used to be the only way to get
+            # it — and it asked ESI for it *before* consulting its own cache, so
+            # even a cache hit cost a round trip on every page view.
+            corp_id = (get_character_row(conn, cid) or {}).get("corporation_id") or 0
+            corp_list, corp_at = (load_cached_corp_assets(conn, corp_id)
+                                  if corp_id else (None, 0.0))
+            corp_data[cid] = (corp_id, corp_list or [])
+            if corp_list is not None:
+                oldest.append(corp_at)
+
+        all_type_ids_for_names = set()
+        for assets in char_assets.values():
+            all_type_ids_for_names |= {a.type_id for a in assets}
+        for _, corp_list in corp_data.values():
+            all_type_ids_for_names |= {a.type_id for a in corp_list}
+        # No client: `resolve_names_bulk` reads the SDE and the name cache, and
+        # only reaches ESI for ids neither knows. Passing None keeps it local.
+        names = await resolve_names_bulk(conn, list(all_type_ids_for_names), None)
     else:
         names = {}
 
@@ -571,6 +578,11 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
         "view": view or "",
         "show_char_badge": show_char_badge,
         "selected_chars": selected_chars,
+        # The oldest reading in the set, because that is the age of the weakest
+        # part of the answer — the newest would describe whichever character
+        # happened to sync last.
+        "cached_at": min(oldest) if oldest else 0.0,
+        "unsynced": unsynced,
     })
 
 
@@ -666,18 +678,13 @@ async def _resolve_corp_container_names(
     if not owned_ids:
         return result
 
+    # Same cache as the character variant. The worker fills it from the corp
+    # asset sync, which already holds the role this endpoint needs.
+    conn_names = get_conn()
     try:
-        async with esi_client() as client:
-            r = await client.post(
-                f"https://esi.evetech.net/latest/corporations/{corp_id}/assets/names/",
-                params={"datasource": "tranquility"},
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                content=json.dumps(owned_ids),
-                timeout=10,
-            )
-            custom_names = {e["item_id"]: e["name"] for e in r.json()} if r.status_code == 200 else {}
-    except Exception:
-        custom_names = {}
+        custom_names = load_cached_container_names(conn_names, owned_ids)
+    finally:
+        conn_names.close()
 
     type_id_set = {asset_map[cid]["type_id"] for cid in container_ids if cid in asset_map}
     type_names: dict[int, str] = {}
@@ -890,18 +897,15 @@ async def _resolve_container_names(
     if not owned_ids:
         return result
 
+    # From the cache the sync worker fills. A name it has not seen simply is
+    # not there, and the display falls back to the container's type below —
+    # which is the same thing that happened when the POST failed, so nothing
+    # about the rendering changed except that it no longer costs a round trip.
+    conn_names = get_conn()
     try:
-        async with esi_client() as client:
-            r = await client.post(
-                f"https://esi.evetech.net/latest/characters/{char_id}/assets/names/",
-                params={"datasource": "tranquility"},
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                content=json.dumps(owned_ids),
-                timeout=10,
-            )
-            custom_names = {e["item_id"]: e["name"] for e in r.json()} if r.status_code == 200 else {}
-    except Exception:
-        custom_names = {}
+        custom_names = load_cached_container_names(conn_names, owned_ids)
+    finally:
+        conn_names.close()
 
     type_id_set = {asset_map[cid]["type_id"] for cid in container_ids if cid in asset_map}
     type_names: dict[int, str] = {}
@@ -952,21 +956,24 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
     primary_token: str | None = None
     char_name_by_id = {cid: name for cid, name in all_chars}
 
+    bp_unsynced: list[str] = []
+    bp_oldest: list[float] = []
     if selected_chars:
-        async with esi_client() as client:
-            all_unique_type_ids: set[int] = set()
-            for cid_sel, _name in selected_chars:
-                tok = await _valid_token_async(cid_sel)
-                if not tok:
-                    continue
-                primary_token = primary_token or tok
-                try:
-                    bps_for = await fetch_blueprints(client, cid_sel, tok, conn)
-                except Exception:
-                    bps_for = []
-                bps_by_char[cid_sel] = bps_for
-                all_unique_type_ids |= {bp.type_id for bp in bps_for}
-            names = await resolve_names_bulk(conn, list(all_unique_type_ids), client)
+        all_unique_type_ids: set[int] = set()
+        for cid_sel, _name in selected_chars:
+            tok = await _valid_token_async(cid_sel)
+            primary_token = primary_token or tok
+            bps_for, bp_at = load_cached_blueprints(conn, cid_sel)
+            if bps_for is None:
+                bp_unsynced.append(_name or str(cid_sel))
+                bps_for = []
+            else:
+                bp_oldest.append(bp_at)
+            bps_by_char[cid_sel] = bps_for
+            all_unique_type_ids |= {bp.type_id for bp in bps_for}
+        # None, not a client: every blueprint type is in the SDE, and a page
+        # that must not fetch should not be given the means to.
+        names = await resolve_names_bulk(conn, list(all_unique_type_ids), None)
 
         if all_unique_type_ids:
             ph = ",".join("?" * len(all_unique_type_ids))
@@ -1084,6 +1091,8 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
         "total": len(bp_list),
         "view": view or "",
         "show_char_badge": show_char_badge,
+        "cached_at": min(bp_oldest) if bp_oldest else 0.0,
+        "unsynced": bp_unsynced,
     })
 
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 
 import pytest
 
@@ -539,3 +540,133 @@ def test_the_contracts_page_reads_the_cache(client, monkeypatch):
 
     assert r.status_code == 200
     assert "Not synced yet" in r.text
+
+
+# ── /assets and /blueprints: a different starting point ──────────────────────
+
+from app.character import assets as assets_api      # noqa: E402
+from app.character import blueprints as bp_api      # noqa: E402
+
+
+def test_the_asset_reader_ignores_the_ttl(conn):
+    """These two caches already existed and the worker already filled them.
+    What made the pages fetch was `CACHE_TTL`: `_load_cache` returns None once
+    the row is older than ten minutes, and the page then went to ESI.
+
+    The TTL answers "is another round trip worth it", which is a question for
+    the fetcher. A page that must not make round trips has no use for it.
+    """
+    stale = time.time() - assets_api.CACHE_TTL - 3600      # an hour past expiry
+    conn.execute(
+        "INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
+        " VALUES (?,?,?)",
+        (ALICE, json.dumps([{"item_id": 1, "type_id": 34, "location_id": 60003760,
+                             "quantity": 5, "is_singleton": False,
+                             "location_flag": "Hangar"}]), stale))
+    conn.commit()
+
+    assert assets_api._load_cache(conn, ALICE) is None, (
+        "the fixture is not actually stale — this test would pass vacuously")
+
+    assets, at = assets_api.load_cached_assets(conn, ALICE)
+
+    assert assets is not None, "an aged cache read as never-synced"
+    assert len(assets) == 1
+    assert at == pytest.approx(stale)
+
+
+def test_the_blueprint_reader_ignores_the_ttl(conn):
+    stale = time.time() - bp_api.CACHE_TTL - 3600
+    conn.execute(
+        "INSERT INTO char_blueprints_cache (character_id, data_json, cached_at)"
+        " VALUES (?,?,?)",
+        (ALICE, json.dumps([{"item_id": 9, "type_id": 999, "location_id": 60003760,
+                             "quantity": -1, "material_efficiency": 10,
+                             "time_efficiency": 20, "runs": -1,
+                             "location_flag": "Hangar"}]), stale))
+    conn.commit()
+
+    assert bp_api._load_cache(conn, ALICE) is None
+    bps, at = bp_api.load_cached_blueprints(conn, ALICE)
+
+    assert bps is not None and len(bps) == 1
+    assert at == pytest.approx(stale)
+
+
+def test_an_unsynced_character_has_no_assets_rather_than_none(conn):
+    """Same distinction as everywhere else. An empty hangar is a statement."""
+    assert assets_api.load_cached_assets(conn, ALICE) == (None, 0.0)
+    assert bp_api.load_cached_blueprints(conn, ALICE) == (None, 0.0)
+
+
+def test_container_ids_are_derived_from_containment(conn):
+    """No category list to keep in step with CCP: an item is a container
+    exactly when something else is located inside it."""
+    assets = [
+        {"item_id": 1, "location_id": 60003760},   # a can in a station
+        {"item_id": 2, "location_id": 1},          # something inside the can
+        {"item_id": 3, "location_id": 60003760},   # a ship holding nothing
+    ]
+
+    assert assets_api.container_item_ids(assets) == [1]
+
+
+def test_container_ids_accept_objects_as_well_as_dicts(conn):
+    """Both shapes circulate — `_parse_assets` makes objects, `_load_cache`
+    returns raw dicts — and this was found by an AttributeError from inside a
+    sync tick rather than by reading."""
+    parsed = assets_api._parse_assets([
+        {"item_id": 1, "type_id": 34, "location_id": 60003760, "quantity": 1,
+         "is_singleton": True, "location_flag": "Hangar"},
+        {"item_id": 2, "type_id": 34, "location_id": 1, "quantity": 1,
+         "is_singleton": False, "location_flag": "Cargo"},
+    ])
+
+    assert assets_api.container_item_ids(parsed) == [1]
+
+
+def test_container_names_round_trip(conn):
+    assets_api.save_cached_container_names(conn, {111: "Ammo Bin", 222: "Ore"})
+    conn.commit()
+
+    assert assets_api.load_cached_container_names(conn, [111, 333]) == {111: "Ammo Bin"}
+
+
+def test_a_failed_name_fetch_caches_nothing(conn):
+    """A name that failed to resolve must not be stored as a name, and must not
+    wipe one that resolved earlier."""
+    assets_api.save_cached_container_names(conn, {111: "Ammo Bin"})
+    conn.commit()
+
+    class _Failing:
+        async def post(self, *a, **k):
+            raise RuntimeError("ESI down")
+
+    got = asyncio.run(assets_api.fetch_container_names(
+        _Failing(), 1, "tok", [111], conn=conn))
+
+    assert got is None
+    assert assets_api.load_cached_container_names(conn, [111]) == {111: "Ammo Bin"}
+
+
+def test_neither_inventory_page_calls_a_fetcher(client, monkeypatch):
+    """The same guard as the other three pages, pointed at these two."""
+    called: list[str] = []
+
+    def _recorder(name):
+        async def _spy(*a, **kw):
+            called.append(name)
+            return None
+        return _spy
+
+    patched = 0
+    for module in (assets_api, bp_api):
+        for attr in dir(module):
+            if attr.startswith("fetch_"):
+                monkeypatch.setattr(module, attr, _recorder(f"{module.__name__}.{attr}"))
+                patched += 1
+    assert patched >= 4, f"only {patched} fetchers found"
+
+    for url in ("/assets", "/assets?view=all", "/blueprints", "/blueprints?view=all"):
+        assert client.get(url).status_code == 200, url
+        assert not called, f"{url} called {called}"

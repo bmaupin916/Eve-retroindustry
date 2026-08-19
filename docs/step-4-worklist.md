@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.51. **713 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.52. **723 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -225,8 +225,8 @@ Ordered by dependency, not by size.
   correct.
 
 * **Cache-only routes** — no route fetches from ESI on the request path.
-  **`/jobs`, `/orders`, `/wallet` and `/contracts` are done; `/orders` is the
-  better example**, because it came with tests. The jobs cache has none: it is covered only by the AST
+  **Done: `/jobs`, `/orders`, `/wallet`, `/contracts`, `/assets` and
+  `/blueprints`. `/orders` is the better example**, because it came with tests. The jobs cache has none: it is covered only by the AST
   scan, which proves a handler contains no `fetch_` call and nothing at all
   about whether the cached data is right.
 
@@ -413,3 +413,31 @@ right, and the **URL list** was short.
 The pattern across all three: a guard is only as wide as the thing it actually
 exercises, and nothing about a passing test says how wide that is. Mutation is
 the only way to find out, and it costs one run per claim.
+
+## A cache that exists is not a cache that is read
+
+`/assets` and `/blueprints` (v0.9.52) started from a different place than the
+three pages before them: the caches already existed and the worker already
+filled them. What made the pages fetch was the **TTL**. `_load_cache` returns
+None once the row is older than `CACHE_TTL`, so an aged cache was
+indistinguishable from an empty one and the page went to ESI.
+
+The TTL answers "is another round trip worth it", which is a question for a
+fetcher. A page that must not make round trips has no use for it. So both
+modules gained a reader that ignores the TTL and returns the age instead —
+`load_cached_assets`, `load_cached_blueprints` — and the page says how old its
+answer is rather than silently refreshing it.
+
+**The same rule cuts the other way in the worker**, and that turned out to be a
+live defect. `sync_character` called `fetch_blueprints` and `fetch_assets`
+*without* `force_refresh`, so each consulted the same TTL it was about to
+write. Blueprints' TTL is fifteen minutes against a fifteen-minute tick:
+whether the worker refreshed them at all came down to scheduling jitter. Assets
+at ten minutes always lost the race and so always refreshed, which is why this
+never showed up as a stale asset list — only as blueprints that sometimes did
+not move. `fetch_industry_jobs` had always passed `force_refresh=True`; the
+other three now do too.
+
+Worth checking for on the remaining pages: **a fetcher's freshness rule and a
+page's freshness rule are different rules**, and sharing one function for both
+hides which is being applied.
