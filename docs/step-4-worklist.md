@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.49. **695 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.50. **705 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -225,8 +225,8 @@ Ordered by dependency, not by size.
   correct.
 
 * **Cache-only routes** — no route fetches from ESI on the request path.
-  **`/jobs` and `/orders` are done; `/orders` is the better example**, because
-  it came with tests. The jobs cache has none: it is covered only by the AST
+  **`/jobs`, `/orders` and `/wallet` are done; `/orders` is the better
+  example**, because it came with tests. The jobs cache has none: it is covered only by the AST
   scan, which proves a handler contains no `fetch_` call and nothing at all
   about whether the cached data is right.
 
@@ -358,3 +358,22 @@ The general shape: **a guard that cannot fail looks exactly like a guard that
 passes.** The only way to tell them apart is to break the thing on purpose and
 watch — which is the same rule as "mutate the fix and check the failure shape",
 applied to tests rather than to code.
+
+## A converted page breaks the tests that stubbed its fetchers
+
+`/wallet` (v0.9.50) took `tests/test_wallet_filter.py` down with it, and the
+failure is worth keeping in mind before each remaining page rather than
+discovered each time. That file injected journal and transaction rows by
+replacing `wallet_api.fetch_journal` and friends. The page stopped calling
+them, so the stubs were ignored and it rendered empty — two assertions about
+row attributes failed with `0 == 2`.
+
+**The repair is to seed the cache, not to re-stub.** A fixture that writes
+`wallet_ledger_cache` exercises the path a real request takes; one that stubs a
+fetcher exercises a path that now exists only under test. The same will be true
+of `/assets`, `/blueprints`, `/contracts` and `/plan` — check what stubs each
+one's fetchers before converting it, because the failure arrives as an
+assertion about rendered HTML and reads like a template bug.
+
+It is also, in its way, the best confirmation available that the conversion
+took: a page that still fetched would have passed.

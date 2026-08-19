@@ -11,19 +11,13 @@ character thing, because it shares the whole on-disk image cache with
 from __future__ import annotations
 
 import asyncio
-import time as _time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from app.auth.token_store import (
-    get_character_row,
-    list_characters,
-    update_corporation_id,
-)
+from app.auth.token_store import get_character_row, list_characters
 from app.character import orders as orders_api
 from app.character import wallet as wallet_api
-from app.esi.client import esi_client
 from app.market.prices import JITA_REGION, TRADE_HUBS
 from app.web.location_resolver import (
     get_region_for_location,
@@ -66,7 +60,7 @@ async def wallet_page(request: Request, char: str = "", scope: str = "personal",
         "balance": None, "journal": [], "transactions": [],
         "corp_wallets": None, "corp_error": None, "corp_name": None,
         "error": None, "division_names": _CORP_DIVISION_NAMES,
-        "row_cap": _WALLET_ROW_CAP,
+        "row_cap": _WALLET_ROW_CAP, "cached_at": 0.0,
     }
 
     if not plan_char_id:
@@ -95,43 +89,58 @@ async def wallet_page(request: Request, char: str = "", scope: str = "personal",
         ).fetchall()}
 
     try:
-        async with esi_client() as client:
-            if scope == "corp":
-                corp_id = row.get("corporation_id")
-                if not corp_id:
-                    cr = await client.get(
-                        f"https://esi.evetech.net/latest/characters/{plan_char_id}/",
-                        timeout=10)
-                    if cr.status_code == 200:
-                        corp_id = cr.json().get("corporation_id")
-                        if corp_id:
-                            update_corporation_id(conn, plan_char_id, corp_id)
-                if not corp_id:
-                    ctx["corp_error"] = "Could not determine the character's corporation."
+        if scope == "corp":
+            corp_id = row.get("corporation_id")
+            if not corp_id:
+                # Recorded by the sync worker. Absent means this character has
+                # not been synced, not that it has no corporation — the page
+                # used to ask ESI here on every single load, for a value that
+                # changes about once a year.
+                ctx["corp_error"] = ("This character has not been synced yet, so "
+                                     "its corporation is not known.")
+            else:
+                cn = await _resolve_party_names({corp_id})
+                ctx["corp_name"] = cn.get(corp_id, str(corp_id))
+                wallets, _at = wallet_api.load_cached_ledger(
+                    conn, corp_id, wallet_api.BALANCES, wallet_api.CORPORATION)
+                ctx["corp_wallets"] = wallets
+                if wallets is None:
+                    # Not "you lack the role": the worker may simply not have
+                    # reached this corporation, and telling somebody their
+                    # permissions are wrong when they are not sends them to the
+                    # wrong place entirely.
+                    ctx["corp_error"] = _NOT_SYNCED_WALLET
                 else:
-                    wallets, err = await wallet_api.fetch_corp_wallets(client, corp_id, token)
-                    ctx["corp_wallets"] = wallets
-                    ctx["corp_error"] = err
-                    cn = await _resolve_party_names({corp_id})
-                    ctx["corp_name"] = cn.get(corp_id, str(corp_id))
-                    if wallets:
-                        journal = await wallet_api.fetch_corp_journal(
-                            client, corp_id, division, token, limit=_WALLET_ROW_CAP)
-                        txns = await wallet_api.fetch_corp_transactions(client, corp_id, division, token)
-                        bal = next((w["balance"] for w in wallets if w["division"] == division), None)
-                        ctx["balance"] = bal
-                        names = await _wallet_names(conn, journal, txns, token)
-                        ctx["journal"], ctx["transactions"] = _decorate(
-                            conn, journal, txns, _type_names, names)
-            else:  # personal
-                balance = await wallet_api.fetch_balance(client, plan_char_id, token)
-                journal = await wallet_api.fetch_journal(
-                    client, plan_char_id, token, limit=_WALLET_ROW_CAP)
-                txns = await wallet_api.fetch_transactions(client, plan_char_id, token)
-                ctx["balance"] = balance
-                names = await _wallet_names(conn, journal, txns, token)
-                ctx["journal"], ctx["transactions"] = _decorate(
-                    conn, journal, txns, _type_names, names)
+                    journal, j_at = wallet_api.load_cached_ledger(
+                        conn, corp_id, wallet_api.JOURNAL,
+                        wallet_api.CORPORATION, division)
+                    txns, _t_at = wallet_api.load_cached_ledger(
+                        conn, corp_id, wallet_api.TRANSACTIONS,
+                        wallet_api.CORPORATION, division)
+                    if journal is None and txns is None:
+                        ctx["corp_error"] = _NOT_SYNCED_DIVISION.format(division)
+                    ctx["balance"] = next(
+                        (w["balance"] for w in wallets
+                         if w.get("division") == division), None)
+                    ctx["cached_at"] = j_at
+                    journal, txns = journal or [], txns or []
+                    names = await _wallet_names(conn, journal, txns, token)
+                    ctx["journal"], ctx["transactions"] = _decorate(
+                        conn, journal, txns, _type_names, names)
+        else:  # personal
+            balance, b_at = wallet_api.load_cached_balance(conn, plan_char_id)
+            journal, j_at = wallet_api.load_cached_ledger(
+                conn, plan_char_id, wallet_api.JOURNAL)
+            txns, _t_at = wallet_api.load_cached_ledger(
+                conn, plan_char_id, wallet_api.TRANSACTIONS)
+            if journal is None and txns is None:
+                ctx["error"] = _NOT_SYNCED_WALLET
+            ctx["balance"] = balance
+            ctx["cached_at"] = j_at or b_at
+            journal, txns = journal or [], txns or []
+            names = await _wallet_names(conn, journal, txns, token)
+            ctx["journal"], ctx["transactions"] = _decorate(
+                conn, journal, txns, _type_names, names)
     except Exception as exc:
         ctx["error"] = f"Error loading wallet: {exc}"
 
@@ -472,6 +481,17 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
     conn.close()
     return _tr("orders.html", request, ctx)
 
+
+#: Nothing cached for this owner at all.
+_NOT_SYNCED_WALLET = ("Not synced yet — the background worker fills this within "
+                      "a few minutes of signing in.")
+
+#: The corporation is known and its balances are cached, but this particular
+#: division is not. Separate from the message above because the fix is
+#: different: waiting will not help if the division has never held anything,
+#: since the worker only walks divisions ESI reports.
+_NOT_SYNCED_DIVISION = ("Division {} has not been synced. The worker only walks "
+                        "divisions the corporation actually reports.")
 
 #: Shown when the cache has nothing for an owner. Deliberately not "no orders":
 #: the page has not looked yet, and saying otherwise is the bug this whole

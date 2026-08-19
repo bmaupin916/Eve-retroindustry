@@ -51,6 +51,14 @@ from app.character.orders import (
     fetch_orders,
     fetch_orders_history,
 )
+from app.character.wallet import (
+    fetch_balance,
+    fetch_corp_journal,
+    fetch_corp_transactions,
+    fetch_corp_wallets,
+    fetch_journal,
+    fetch_transactions,
+)
 from app.character.skills import fetch_skills
 from app.db.conn import connect
 from app.esi.client import esi_client
@@ -302,6 +310,15 @@ class SyncWorker:
                     # fails, so the previous cache stays the best answer.
                     await fetch_orders_history(client, char_id, token, conn=raw)
 
+                    # /wallet reads these. The balance goes to the table the
+                    # dashboard already polls, so that read stops falling
+                    # through to ESI as a side effect of this one.
+                    await fetch_balance(client, char_id, token, conn=raw)
+                    journal = await fetch_journal(client, char_id, token,
+                                                  conn=raw)
+                    changed += self._diff(char_id, "wallet", journal)
+                    await fetch_transactions(client, char_id, token, conn=raw)
+
                     try:
                         corp_id, corp_assets = await fetch_corp_assets(
                             client, char_id, token, raw)
@@ -320,6 +337,23 @@ class SyncWorker:
                                 corporation_id=corp_id)
                             await fetch_corp_orders_history(
                                 client, corp_id, token, conn=raw)
+
+                            # Corporation wallets: one call lists every
+                            # division's balance, then the ledgers are per
+                            # division. Only the divisions ESI actually
+                            # reported are walked — asking for all seven on a
+                            # corp that uses two spends ten paginated calls a
+                            # tick to cache nothing.
+                            wallets, _werr = await fetch_corp_wallets(
+                                client, corp_id, token, conn=raw)
+                            for wallet in wallets or []:
+                                div = wallet.get("division")
+                                if not div:
+                                    continue
+                                await fetch_corp_journal(
+                                    client, corp_id, div, token, conn=raw)
+                                await fetch_corp_transactions(
+                                    client, corp_id, div, token, conn=raw)
                     except Exception as exc:
                         # Corp assets need a role most characters do not have.
                         # Not a failure of the character, so it is not recorded

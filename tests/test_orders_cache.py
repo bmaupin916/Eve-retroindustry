@@ -231,45 +231,63 @@ def test_history_failing_on_a_later_page_keeps_what_arrived():
 
 # ── the page ─────────────────────────────────────────────────────────────────
 
-def test_the_orders_page_never_calls_esi(client, monkeypatch):
-    """The scan in `test_cache_only_routes.py` proves the handler contains no
-    `fetch_` call. It cannot prove the handler does not reach ESI some other
-    way — through a helper in another module, or a bare client. This can.
+def test_the_router_cannot_open_an_esi_client_at_all():
+    """Stronger than spying: `characters.py` no longer imports `esi_client`.
 
-    **Patched on the router, not on `app.esi.client`.** The router does
-    `from app.esi.client import esi_client`, which binds the function at import;
-    rebinding the source module afterwards leaves that binding untouched and
-    this test green no matter what the page does. The first version of this
-    test did exactly that, and mutation is what caught it — restoring an
-    `esi_client()` call to the handler failed the AST scan and *not* this.
+    It did until /orders and /wallet were converted — both handlers opened one,
+    and both also asked ESI for the character's corporation id on every load.
+    With the import gone there is no path from this module to a raw client, so
+    the guard is a fact about the file rather than a fact about one request.
 
-    `setattr` with the string form is deliberate too: it raises here if the
-    router stops importing the name, rather than silently guarding nothing.
-
-    **And it records rather than raises.** The handler wraps its body in
-    `except Exception`, so a stub that raised `AssertionError` was caught,
-    turned into an error banner, and returned 200 — the test passed while the
-    page called ESI on every request. Mutation is what surfaced that: putting
-    an `esi_client()` call back into the handler failed the AST scan and left
-    this green. A list the stub appends to survives being swallowed.
+    If the import comes back, this fails and somebody has to say why. That is
+    the point: the earlier version of this test monkeypatched
+    `app.esi.client.esi_client`, which the router had already bound at import,
+    so it guarded nothing and said so in a green tick.
     """
     from app.web.routers import characters as router_module
 
-    calls: list[str] = []
+    assert not hasattr(router_module, "esi_client"), (
+        "characters.py imports esi_client again — /orders and /wallet are "
+        "supposed to render from cache. If a new handler here legitimately "
+        "needs one, exempt it in tests/test_cache_only_routes.py::ALLOWED with "
+        "a reason rather than deleting this.")
 
-    def _spy(*a, **kw):
-        calls.append("esi_client")
-        raise AssertionError("the orders page called ESI")
 
-    assert hasattr(router_module, "esi_client"), (
-        "the router no longer imports esi_client — retarget this test rather "
-        "than deleting it")
-    monkeypatch.setattr(router_module, "esi_client", _spy)
+def test_neither_page_calls_a_fetcher(client, monkeypatch):
+    """The import check above cannot see a fetch made through the API modules,
+    which the router *does* still import — it reads their cache helpers. So
+    every `fetch_` on both is replaced with a recorder.
+
+    **It records rather than raises.** These handlers wrap their bodies in
+    `except Exception` to turn a failure into an error banner, so a stub that
+    raised was caught, rendered, and returned 200 — green test, page fetching
+    on every request. Mutation is what surfaced that. A list survives being
+    caught.
+    """
+    from app.character import orders as orders_api
+    from app.character import wallet as wallet_api
+
+    called: list[str] = []
+
+    def _recorder(name):
+        async def _spy(*a, **kw):
+            called.append(name)
+            return None
+        return _spy
+
+    patched = 0
+    for module in (orders_api, wallet_api):
+        for attr in dir(module):
+            if attr.startswith("fetch_"):
+                monkeypatch.setattr(module, attr, _recorder(f"{module.__name__}.{attr}"))
+                patched += 1
+    assert patched >= 8, f"only {patched} fetchers found — the scan has drifted"
 
     for url in ("/orders", "/orders?state=history", "/orders?scope=corp",
-                "/orders?char=all", "/orders?char=all&scope=corp"):
+                "/orders?char=all", "/orders?char=all&scope=corp",
+                "/wallet", "/wallet?scope=corp", "/wallet?scope=corp&division=3"):
         assert client.get(url).status_code == 200, url
-        assert not calls, f"{url} opened an ESI client"
+        assert not called, f"{url} called {called}"
 
 
 def test_an_unsynced_character_is_told_so_rather_than_shown_zero(client):
@@ -280,3 +298,129 @@ def test_an_unsynced_character_is_told_so_rather_than_shown_zero(client):
     assert r.status_code == 200
     assert "Not synced yet" in r.text, (
         "the page showed an empty order book for a character it never looked at")
+
+
+# ── /wallet, same shape ──────────────────────────────────────────────────────
+
+from app.character import wallet as wallet_api  # noqa: E402  (grouped with its tests)
+
+
+def test_an_unsynced_wallet_reads_as_none_not_an_empty_journal(conn):
+    """The same distinction as orders, and it matters more here: an empty
+    journal reads as "no activity this month", which is a finding rather than
+    a gap."""
+    rows, at = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
+
+    assert rows is None
+    assert at == 0.0
+
+
+def test_a_wallet_ledger_round_trips(conn):
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL,
+                                  [{"id": 1, "amount": -5.0}])
+    conn.commit()
+
+    rows, at = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
+
+    assert [r["id"] for r in rows] == [1]
+    assert at > 0
+
+
+def test_the_journal_and_transactions_do_not_overwrite_each_other(conn):
+    """`ledger` is in the key. The worker writes both back to back, so a key
+    that collapsed would leave whichever ran last in both tabs."""
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS, [{"id": 2}])
+    conn.commit()
+
+    journal, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
+    txns, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS)
+
+    assert [r["id"] for r in journal] == [1]
+    assert [r["id"] for r in txns] == [2]
+
+
+def test_corporation_divisions_are_kept_apart(conn):
+    """Seven divisions, shown one at a time. Without `division` in the key the
+    page would show division 1's ledger under every tab — and the numbers look
+    plausible, which is the worst kind of wrong for a wallet."""
+    for div in (1, 3):
+        wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL,
+                                      [{"id": div}], wallet_api.CORPORATION, div)
+    conn.commit()
+
+    one, _ = wallet_api.load_cached_ledger(
+        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 1)
+    three, _ = wallet_api.load_cached_ledger(
+        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 3)
+
+    assert [r["id"] for r in one] == [1]
+    assert [r["id"] for r in three] == [3]
+
+
+def test_a_character_and_a_corporation_do_not_share_division_zero(conn):
+    """A character sits at division 0 and a corporation's balance list does
+    too. `owner_kind` is what keeps them apart."""
+    wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL, [{"id": 1}])
+    wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL, [{"id": 2}],
+                                  wallet_api.CORPORATION)
+    conn.commit()
+
+    personal, _ = wallet_api.load_cached_ledger(conn, CORP, wallet_api.JOURNAL)
+    corp, _ = wallet_api.load_cached_ledger(
+        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION)
+
+    assert [r["id"] for r in personal] == [1]
+    assert [r["id"] for r in corp] == [2]
+
+
+def test_a_failed_journal_fetch_keeps_the_previous_month(conn):
+    """`fetch_journal` returned `[]` on any failure. Cached, that erases a
+    month of history and the next sync writes the erasure down."""
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
+    conn.commit()
+
+    result = asyncio.run(
+        wallet_api.fetch_journal(_Client(_Resp(500)), ALICE, "tok", conn=conn))
+
+    assert result is None, "a failed fetch reported an empty journal"
+    kept, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
+    assert [r["id"] for r in kept] == [1], "the good cache was overwritten"
+
+
+def test_a_failed_transactions_fetch_writes_nothing(conn):
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS, [{"id": 1}])
+    conn.commit()
+
+    result = asyncio.run(
+        wallet_api.fetch_transactions(_Client(_Resp(500)), ALICE, "tok", conn=conn))
+
+    assert result is None
+    kept, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS)
+    assert [r["id"] for r in kept] == [1]
+
+
+def test_the_balance_lands_in_the_table_the_dashboard_reads(conn):
+    """Not the ledger table. `char_wallet_cache` has a second consumer in
+    `app/web/main.py` that reads it with a five-minute TTL and fetches on a
+    miss — writing it here is what stops that fetch happening at all."""
+    asyncio.run(wallet_api.fetch_balance(
+        _Client(_Resp(200, 12_345.75)), ALICE, "tok", conn=conn))
+    conn.commit()
+
+    stored = conn.execute(
+        "SELECT balance FROM char_wallet_cache WHERE character_id=?",
+        (ALICE,)).fetchone()
+
+    assert stored is not None, "the balance did not reach char_wallet_cache"
+    assert stored[0] == pytest.approx(12_345.75)
+    assert wallet_api.load_cached_balance(conn, ALICE)[0] == pytest.approx(12_345.75)
+
+
+def test_an_unsynced_wallet_page_says_so_rather_than_showing_zero(client):
+    """The fixture's character has never been synced."""
+    r = client.get("/wallet")
+
+    assert r.status_code == 200
+    assert "Not synced yet" in r.text, (
+        "the page showed an empty wallet for a character it never looked at")

@@ -22,23 +22,39 @@ def test_ref_types_are_humanized_for_display_and_filtering(app_module):
     assert h("") == ""
 
 
+CHAR_ID = 900000001
+
+
 def _wallet_html(client, app_module, journal, txns):
-    """Render /wallet with fixed journal/transaction data, no ESI."""
-    async def _bal(*a, **k): return 1_000_000.0
-    async def _jr(*a, **k): return journal
-    async def _tx(*a, **k): return txns
+    """Render /wallet over fixed journal/transaction data, no ESI.
+
+    This used to stub the three `fetch_*` functions. The page stopped calling
+    them in v0.9.50 — it reads the cache the background worker fills — so the
+    stubs were ignored and the page rendered empty. Seeding the cache is both
+    the repair and a more honest fixture: it exercises the path a real request
+    takes rather than one that only exists under test.
+
+    `_wallet_names` is still stubbed, because name resolution is a different
+    subject and these tests are about the filter attributes on each row.
+    """
+    from app.character import wallet as wallet_api
+
+    conn = app_module.get_conn()
+    try:
+        wallet_api.save_cached_balance(conn, CHAR_ID, 1_000_000.0)
+        wallet_api.save_cached_ledger(conn, CHAR_ID, wallet_api.JOURNAL, journal)
+        wallet_api.save_cached_ledger(conn, CHAR_ID, wallet_api.TRANSACTIONS, txns)
+        conn.commit()
+    finally:
+        conn.close()
+
     async def _names(conn, j, t, tok): return {}
-    orig = (characters_router.wallet_api.fetch_balance, characters_router.wallet_api.fetch_journal,
-            characters_router.wallet_api.fetch_transactions, characters_router._wallet_names)
-    characters_router.wallet_api.fetch_balance = _bal
-    characters_router.wallet_api.fetch_journal = _jr
-    characters_router.wallet_api.fetch_transactions = _tx
+    orig = characters_router._wallet_names
     characters_router._wallet_names = _names
     try:
-        return client.get("/wallet?char=900000001").text
+        return client.get(f"/wallet?char={CHAR_ID}").text
     finally:
-        (characters_router.wallet_api.fetch_balance, characters_router.wallet_api.fetch_journal,
-         characters_router.wallet_api.fetch_transactions, characters_router._wallet_names) = orig
+        characters_router._wallet_names = orig
 
 
 JOURNAL = [

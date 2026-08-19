@@ -167,8 +167,32 @@ char_skills_cache = Table(
 
 char_wallet_cache = Table(
     "char_wallet_cache", metadata,
+    # A character's ISK balance. Kept warm by the sync worker, which is why the
+    # dashboard's five-minute TTL read below never has to fall through to ESI
+    # any more. Balances stay here rather than moving into the ledger table
+    # next to it: two places holding the same number is how they come to
+    # disagree, and this one already has a second consumer.
     Column("character_id", Integer, primary_key=True, autoincrement=False),
     Column("balance", Float, nullable=False),
+    Column("cached_at", Float, nullable=False),
+)
+
+wallet_ledger_cache = Table(
+    "wallet_ledger_cache", metadata,
+    # The journal and the transaction list, so /wallet renders without waiting
+    # on ESI — up to 2,500 rows each, and the journal is paginated, so this was
+    # the most expensive page in the app to open.
+    #
+    # `division` is 0 for a character, which has no divisions, and 1–7 for a
+    # corporation, which has seven and shows one at a time. Corporation
+    # *balances* arrive as one list covering every division, so they are stored
+    # once at division 0 under `balances` rather than split across seven rows
+    # that would all have to be written together to stay consistent.
+    Column("owner_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("owner_kind", Text, primary_key=True),     # "character" | "corporation"
+    Column("division", Integer, primary_key=True, autoincrement=False),
+    Column("ledger", Text, primary_key=True),         # journal | transactions | balances
+    Column("data_json", Text, nullable=False),
     Column("cached_at", Float, nullable=False),
 )
 
