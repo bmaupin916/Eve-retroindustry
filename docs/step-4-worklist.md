@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.41. **571 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.42. **586 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -17,6 +17,11 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   job on a table it had never seen.
 * **W11 is done.** SQLite holds up under the sync worker, and that is now
   asserted rather than assumed — see `tests/test_sqlite_under_the_worker.py`.
+* **`/sync-health` exists**, and the four observability surfaces finally have a
+  caller that is not a test. It shows the worker's state, per-character cache
+  freshness, the ETag cache, anything the transport is holding back, and the
+  newest 60 events with their failure reasons. Read-only on purpose: a health
+  view that can act is one you cannot trust about the thing it acts on.
 * **W6 is done.** `main.py` 7,112 → 835 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
 * Step 4 is **7.5 of 8** items. What is left is the rest of the cache-only
@@ -181,24 +186,22 @@ work, not a move, and the event model has to be decided before it is written.
 
 ## Start here next session
 
-~~Run `projects` against Postgres~~ and ~~sign in~~ are both **done**. What that
-left is below.
+~~Run `projects` against Postgres~~, ~~sign in~~ and ~~the sync-health page~~ are
+all **done**. What that left is below.
 
-1. **A sync-health page.** The strongest item, and the argument for it is
-   evidence rather than taste. `worker.status()`, `quarantine_state()`,
-   `etag_stats()` and the whole `sync_events` log have **no non-test caller**:
-   the worker writes events nothing reads. Two shipped defects were found on
-   2026-08-19 within an hour of each other, and both were visible only because
-   a `[sync]` line happened to be printed to a terminal somebody was watching —
-   the failure reasons were sitting in `sync_events`, queryable, the whole time.
-   Building one real consumer also tests the event model before anything else
-   depends on it, which is much cheaper now than after five pages do.
-2. **Then pick up the conversion** — `industry` is next by size, and it is a
-   router plus two helpers (`margins_helper`, `reactions_helper`).
+1. **Pick up the conversion** — `industry` is next by size, and it is a router
+   plus two helpers (`margins_helper`, `reactions_helper`).
    `tests/test_projects_on_postgres.py` is the pattern to copy: drive the
    helper directly, parameterised over both backends, so the same assertion
-   runs twice. It is what proves a conversion rather than merely exercising it.
-3. **Cache-only routes**, eight pages left. `/jobs` is the worked example.
+   runs twice. That is what *proves* a conversion rather than merely exercising
+   it — the mutation run there failed 7 Postgres tests and 0 SQLite ones, which
+   is the shape every one of these conversions should be checked against.
+2. **Cache-only routes**, eight pages left. `/jobs` is the worked example.
+3. **Give the health page a second consumer, or don't.** `/sync-health` reads
+   the log; nothing subscribes to it with a cursor. That is fine — `since()`
+   exists for when something does, and building a subscriber before there is
+   anything to subscribe *for* is how the first four surfaces ended up with no
+   callers. Wait until a feature needs it.
 
 ## How to work on this without wasting an afternoon
 

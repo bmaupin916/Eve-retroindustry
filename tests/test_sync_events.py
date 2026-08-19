@@ -207,3 +207,34 @@ def test_the_table_is_in_the_migration_history():
                for p in history.glob("*.py")), (
         "sync_events is declared but no migration creates it"
     )
+
+
+def test_recent_answers_a_different_question_from_since(conn):
+    """`since` is for a consumer working forwards from a cursor; `recent` is for
+    a human asking what just happened. Using `since(0, limit=N)` for the second
+    returns the *oldest* N, which on a busy log means the page can never show
+    the line that matters."""
+    for n in range(10):
+        events.emit(conn, "character.assets.changed", character_id=1, detail={"n": n})
+    conn.commit()
+
+    newest = events.recent(conn, limit=3)
+    oldest = events.since(conn, 0, limit=3)
+
+    assert [e.detail["n"] for e in newest] == [9, 8, 7], "not newest-first"
+    assert [e.detail["n"] for e in oldest] == [0, 1, 2], "since() changed meaning"
+
+
+def test_recent_survives_the_gaps_trim_leaves(conn):
+    """Why `recent` is a query and not `latest_id() - limit`: trim deletes by
+    position, so ids have holes and that arithmetic silently returns short."""
+    for n in range(10):
+        events.emit(conn, "character.assets.changed", character_id=1, detail={"n": n})
+    conn.commit()
+    events.trim(conn, keep=4)
+    conn.commit()
+
+    got = events.recent(conn, limit=4)
+
+    assert len(got) == 4, f"asked for 4 after a trim, got {len(got)}"
+    assert [e.detail["n"] for e in got] == [9, 8, 7, 6]

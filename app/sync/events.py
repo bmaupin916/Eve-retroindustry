@@ -130,14 +130,34 @@ def since(conn: Connection, cursor: int = 0, *, limit: int = 500,
     sql += " ORDER BY id LIMIT :limit"
 
     rows = conn.execute(text(sql), params).fetchall()
-    return [
-        Event(
-            id=r[0], created_at=r[1], kind=r[2],
-            character_id=r[3], corporation_id=r[4],
-            detail=json.loads(r[5]) if r[5] else {},
-        )
-        for r in rows
-    ]
+    return [_row_to_event(r) for r in rows]
+
+
+def _row_to_event(r) -> Event:
+    """The one place a row becomes an Event. Both readers select the same six
+    columns in the same order, and this is what keeps that true."""
+    return Event(
+        id=r[0], created_at=r[1], kind=r[2],
+        character_id=r[3], corporation_id=r[4],
+        detail=json.loads(r[5]) if r[5] else {},
+    )
+
+
+def recent(conn: Connection, limit: int = 50) -> list[Event]:
+    """The newest `limit` events, newest first. For looking, not for consuming.
+
+    Deliberately not `since(conn, 0, limit=…)`: that answers "the oldest N after
+    my cursor", which is right for a subscriber working forwards and wrong for
+    a human who wants to know what just happened. Nor `latest_id() - limit`,
+    because `trim()` leaves gaps and that arithmetic would quietly return fewer
+    rows than asked for. A consumer that tracks a cursor still wants `since`.
+    """
+    rows = conn.execute(
+        text("SELECT id, created_at, kind, character_id, corporation_id,"
+             " detail_json FROM sync_events ORDER BY id DESC LIMIT :limit"),
+        {"limit": limit},
+    ).fetchall()
+    return [_row_to_event(r) for r in rows]
 
 
 def latest_id(conn: Connection) -> int:

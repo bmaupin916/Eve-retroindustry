@@ -821,6 +821,7 @@ from app.web.routers import media as media_router  # noqa: E402
 from app.web.routers import plan as plan_router  # noqa: E402
 from app.web.routers import planets as planets_router  # noqa: E402
 from app.web.routers import projects as projects_router  # noqa: E402
+from app.web.routers import sync_health as sync_health_router  # noqa: E402
 
 app.include_router(assets_router.router)
 app.include_router(auth_router.router)
@@ -833,3 +834,4 @@ app.include_router(plan_router.router)
 app.include_router(planets_router.router)
 app.include_router(prices_router.router)
 app.include_router(projects_router.router)
+app.include_router(sync_health_router.router)

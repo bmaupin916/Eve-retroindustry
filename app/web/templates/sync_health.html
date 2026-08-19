@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block title %}Sync Health — EVE Retroindustry{% endblock %}
+{% block content %}
+
+<div class="row mb-4 align-items-center">
+  <div class="col">
+    <h4 class="mb-0"><i class="bi bi-activity me-2 text-primary"></i>Sync Health</h4>
+    <div class="text-muted small mt-1">
+      What the background worker has been doing. Read-only, and never calls ESI.
+    </div>
+  </div>
+</div>
+
+<!-- ── The worker ───────────────────────────────────────────────────────── -->
+<div class="row g-3 mb-4">
+  <div class="col-sm-6 col-lg-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small text-uppercase" style="letter-spacing:.05em">Worker</div>
+      {% if worker.running %}
+        <div class="h5 mb-0 mt-1 text-success"><i class="bi bi-check-circle me-1"></i>Running</div>
+        <div class="small text-muted mt-1">every {{ interval_minutes }} min per character</div>
+      {% elif not worker.enabled %}
+        <div class="h5 mb-0 mt-1 text-secondary"><i class="bi bi-pause-circle me-1"></i>Disabled</div>
+        <div class="small text-muted mt-1"><code>EVE_SYNC_WORKER=0</code></div>
+      {% else %}
+        <div class="h5 mb-0 mt-1 text-danger"><i class="bi bi-x-circle me-1"></i>Not running</div>
+        <div class="small text-muted mt-1">enabled, but no loop is alive</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="col-sm-6 col-lg-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small text-uppercase" style="letter-spacing:.05em">Rounds</div>
+      <div class="h5 mb-0 mt-1">{{ worker.rounds if worker.rounds is defined else '—' }}</div>
+      <div class="small mt-1 {% if worker.failures %}text-warning{% else %}text-muted{% endif %}">
+        {{ worker.failures if worker.failures is defined else 0 }} failure(s)
+      </div>
+    </div>
+  </div>
+
+  <div class="col-sm-6 col-lg-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small text-uppercase" style="letter-spacing:.05em">Conditional requests</div>
+      <div class="h5 mb-0 mt-1">{{ etags.hits }} <span class="text-muted fs-6">hits</span></div>
+      <div class="small text-muted mt-1">
+        {{ etags.entries }} cached · {{ (etags.bytes / 1048576) | round(1) }} MB
+      </div>
+    </div>
+  </div>
+
+  <div class="col-sm-6 col-lg-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small text-uppercase" style="letter-spacing:.05em">Quarantined</div>
+      {% if quarantine %}
+        <div class="h5 mb-0 mt-1 text-warning">{{ quarantine | length }}</div>
+        <div class="small text-muted mt-1">entity/entities held back</div>
+      {% else %}
+        <div class="h5 mb-0 mt-1 text-muted">None</div>
+        <div class="small text-muted mt-1">every token is answering</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<!-- ── Anything currently wrong, said once and loudly ───────────────────── -->
+{% if failures %}
+<div class="card p-3 mb-4" style="border-color:#8a6d3b">
+  <div class="fw-semibold text-warning mb-2">
+    <i class="bi bi-exclamation-triangle me-1"></i>Recent sync failures
+  </div>
+  {% for f in failures %}
+  <div class="small mb-1">
+    <span class="text-muted">{{ f.when | age_short }}</span>
+    <strong class="ms-2">{{ f.who }}</strong>
+    <span class="ms-2 font-monospace text-warning">{{ f.reason or f.kind }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if quarantine %}
+<div class="card p-3 mb-4" style="border-color:#8a6d3b">
+  <div class="fw-semibold text-warning mb-2">
+    <i class="bi bi-slash-circle me-1"></i>Held back by the transport
+  </div>
+  <div class="small text-muted mb-2">
+    Three refusals in a row and an entity is answered locally instead of on the
+    wire, because a 4xx costs five tokens of the error budget everybody shares.
+    Any success clears it.
+  </div>
+  {% for entity, seconds in quarantine %}
+  <div class="small font-monospace">{{ entity }} — {{ seconds | round(0) | int }}s remaining</div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<!-- ── Per character ───────────────────────────────────────────────────── -->
+<div class="card p-0 mb-4">
+  <div class="p-3 border-bottom" style="border-color:#30363d !important">
+    <span class="fw-semibold">Characters</span>
+    <span class="text-muted small ms-2">
+      cache age; anything older than {{ stale_rounds }} rounds is flagged
+    </span>
+  </div>
+  {% if not characters %}
+  <div class="p-4 text-center text-muted">
+    <i class="bi bi-person-slash" style="font-size:1.5rem;opacity:.3"></i>
+    <div class="mt-2">Nobody is signed in, so there is nothing to sync.</div>
+  </div>
+  {% else %}
+  <div class="table-responsive">
+    <table class="table table-sm mb-0 align-middle">
+      <thead>
+        <tr class="text-muted small">
+          <th class="ps-3">Character</th>
+          <th>Last sync</th>
+          {% for c in characters[0].caches %}<th>{{ c.label }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for ch in characters %}
+        <tr>
+          <td class="ps-3">
+            {{ ch.name }}
+            {% if ch.never %}
+            <span class="badge bg-secondary ms-1" title="the worker has not reached this character yet">never synced</span>
+            {% elif ch.stale %}
+            <span class="badge bg-warning text-dark ms-1">stale</span>
+            {% endif %}
+          </td>
+          <td class="{% if ch.stale %}text-warning{% elif not ch.last_sync_at %}text-muted{% endif %}">
+            {{ ch.last_sync_at | age_short }}
+          </td>
+          {% for c in ch.caches %}
+          <td class="{% if not c.at %}text-muted{% endif %}">{{ c.at | age_short }}</td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+
+<!-- ── The log ─────────────────────────────────────────────────────────── -->
+<div class="card p-0">
+  <div class="p-3 border-bottom" style="border-color:#30363d !important">
+    <span class="fw-semibold">Recent events</span>
+    <span class="text-muted small ms-2">newest {{ event_limit }} from the sync log</span>
+  </div>
+
+  {% if events is none %}
+  <div class="p-4 text-center text-muted">
+    <i class="bi bi-database-exclamation" style="font-size:1.5rem;opacity:.3"></i>
+    <div class="mt-2">
+      No <code>sync_events</code> table. The database is behind the migrations —
+      restart the app and check the <code>[db] schema at revision</code> line.
+    </div>
+  </div>
+  {% elif not events %}
+  <div class="p-4 text-center text-muted">
+    <i class="bi bi-journal" style="font-size:1.5rem;opacity:.3"></i>
+    <div class="mt-2">Nothing logged yet.</div>
+    <div class="small mt-1" style="max-width:34rem;margin:0 auto">
+      The first sight of a character is deliberately never recorded as a change —
+      otherwise a restart would announce everything you own as newly acquired.
+      Events start appearing on the round after something actually moves.
+    </div>
+  </div>
+  {% else %}
+  <div class="table-responsive" style="max-height:32rem;overflow-y:auto">
+    <table class="table table-sm mb-0 align-middle">
+      <thead class="position-sticky top-0" style="background:#0d1117;z-index:1">
+        <tr class="text-muted small">
+          <th class="ps-3">When</th>
+          <th>Event</th>
+          <th>Who</th>
+          <th>Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in events %}
+        <tr class="{% if e.bad %}table-warning-subtle{% endif %}">
+          <td class="ps-3 text-muted small text-nowrap">{{ e.when | age_short }}</td>
+          <td class="small font-monospace {% if e.bad %}text-warning{% endif %}">{{ e.kind }}</td>
+          <td class="small">{{ e.who }}</td>
+          <td class="small text-muted">
+            {% if e.reason %}
+              <span class="text-warning font-monospace">{{ e.reason }}</span>
+            {% elif e.detail %}
+              {% for k, v in e.detail.items() %}<span class="me-2">{{ k }}={{ v }}</span>{% endfor %}
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+
+{% endblock %}

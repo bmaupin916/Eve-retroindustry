@@ -435,4 +435,7 @@ def status() -> dict:
         "rounds": _WORKER.rounds,
         "failures": _WORKER.failures,
         "characters_tracked": len(_WORKER._due),
+        # So a health view can say how stale is too stale without hardcoding a
+        # number that would then disagree with the worker after a config change.
+        "interval": _WORKER.interval,
     }
