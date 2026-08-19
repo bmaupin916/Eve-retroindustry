@@ -31,6 +31,18 @@
   {% endif %}
 </div>
 
+{% if cached_at %}
+<p class="text-muted small mb-3"><i class="bi bi-clock-history me-1"></i>As of {{ cached_at|ts_ago }} — this page reads the local cache and never waits on ESI.</p>
+{% endif %}
+
+{% if unsynced %}
+<div class="alert alert-warning py-2 small">
+  <i class="bi bi-hourglass-split me-1"></i>
+  Not synced yet: {{ unsynced|join(", ") }}. Their contracts are missing from
+  the list below rather than counted as none.
+</div>
+{% endif %}
+
 {% if error %}
 <div class="alert alert-danger"><i class="bi bi-exclamation-circle me-2"></i>{{ error }}</div>
 {% endif %}

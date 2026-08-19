@@ -12,11 +12,7 @@ import asyncio
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from app.auth.token_store import (
-    get_character_row,
-    list_characters,
-    update_corporation_id,
-)
+from app.auth.token_store import get_character_row, list_characters
 from app.character import contracts as contracts_api
 from app.esi.client import esi_client
 from app.web import contracts_helper
@@ -92,6 +88,11 @@ async def _finalize_contracts(conn, raw: list[dict], token: str | None) -> list[
     return _decorate_contracts(raw, party_names, loc_names)
 
 
+#: Nothing cached for this owner. Not "no contracts": the worker has not looked.
+_NOT_SYNCED = ("Not synced yet — the background worker fills this within a few "
+               "minutes of signing in.")
+
+
 @router.get("/contracts", response_class=HTMLResponse)
 async def contracts_page(request: Request, char: str = "", scope: str = "personal"):
     conn = get_conn()
@@ -99,6 +100,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
     ctx: dict = {
         "scope": scope, "contracts_char_id": None, "all_chars": all_chars,
         "contracts": [], "error": None, "corp_error": None,
+        "cached_at": 0.0, "unsynced": [],
     }
 
     chars = list_characters(conn)
@@ -106,6 +108,10 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
         ctx["error"] = "You are not signed in."
         conn.close()
         return _tr("contracts.html", request, ctx)
+
+    # Owners the cache has nothing for. Named rather than counted, so the page
+    # can say who is missing instead of sending you to look.
+    unsynced: list[str] = []
 
     try:
         if all_chars:
@@ -120,23 +126,26 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
                     if corp_id and corp_id not in corp_token:
                         corp_token[corp_id] = tok
                 corp_names = await _resolve_party_names(set(corp_token)) if corp_token else {}
-                async with esi_client() as client:
-                    for corp_id, tok in corp_token.items():
-                        lst, _err = await contracts_api.fetch_corp_contracts(client, corp_id, tok)
-                        for c in (lst or []):
-                            c["_corp_id"] = corp_id
-                            c["_party_label"] = corp_names.get(corp_id, str(corp_id))
-                            raw.append(c)
+                for corp_id in corp_token:
+                    lst, _at = contracts_api.load_cached_contracts(
+                        conn, corp_id, contracts_api.CORPORATION)
+                    if lst is None:
+                        unsynced.append(corp_names.get(corp_id, str(corp_id)))
+                        continue
+                    for c in lst:
+                        c["_corp_id"] = corp_id
+                        c["_party_label"] = corp_names.get(corp_id, str(corp_id))
+                        raw.append(c)
             else:
-                async with esi_client() as client:
-                    for cid, cname in chars:
-                        tok = await _valid_token_async(cid)
-                        if not tok:
-                            continue
-                        for c in await contracts_api.fetch_character_contracts(client, cid, tok):
-                            c["_char_id"] = cid
-                            c["_party_label"] = cname
-                            raw.append(c)
+                for cid, cname in chars:
+                    lst, _at = contracts_api.load_cached_contracts(conn, cid)
+                    if lst is None:
+                        unsynced.append(cname or str(cid))
+                        continue
+                    for c in lst:
+                        c["_char_id"] = cid
+                        c["_party_label"] = cname
+                        raw.append(c)
             # dedup by contract_id (several characters may see the same contract)
             seen: set[int] = set()
             raw = [c for c in raw if not (c.get("contract_id") in seen or seen.add(c.get("contract_id")))]
@@ -145,6 +154,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
             tokens = await asyncio.gather(*[_valid_token_async(c) for c, _ in chars])
             any_tok = next((t for t in tokens if t), None)
             ctx["contracts"] = await _finalize_contracts(conn, raw, any_tok)
+            ctx["unsynced"] = unsynced
             conn.close()
             return _tr("contracts.html", request, ctx)
 
@@ -160,29 +170,32 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
             conn.close()
             return _tr("contracts.html", request, ctx)
 
-        async with esi_client() as client:
-            if scope == "corp":
-                corp_id = row.get("corporation_id")
-                if not corp_id:
-                    cr = await client.get(
-                        f"https://esi.evetech.net/latest/characters/{plan_char_id}/", timeout=10)
-                    if cr.status_code == 200:
-                        corp_id = cr.json().get("corporation_id")
-                        if corp_id:
-                            update_corporation_id(conn, plan_char_id, corp_id)
-                if not corp_id:
-                    ctx["corp_error"] = "Could not determine the character's corporation."
-                    raw = []
-                else:
-                    lst, err = await contracts_api.fetch_corp_contracts(client, corp_id, token)
-                    ctx["corp_error"] = err
-                    raw = lst or []
-                    for c in raw:
-                        c["_corp_id"] = corp_id
+        if scope == "corp":
+            corp_id = row.get("corporation_id")
+            if not corp_id:
+                # Recorded by the sync worker. Absent means unsynced, not
+                # corporation-less — the page used to ask ESI here on every
+                # load for a value that changes about once a year.
+                ctx["corp_error"] = ("This character has not been synced yet, so "
+                                     "its corporation is not known.")
+                raw = []
             else:
-                raw = await contracts_api.fetch_character_contracts(client, plan_char_id, token)
+                lst, cached_at = contracts_api.load_cached_contracts(
+                    conn, corp_id, contracts_api.CORPORATION)
+                if lst is None:
+                    ctx["corp_error"] = _NOT_SYNCED
+                ctx["cached_at"] = cached_at
+                raw = lst or []
                 for c in raw:
-                    c["_char_id"] = plan_char_id
+                    c["_corp_id"] = corp_id
+        else:
+            lst, cached_at = contracts_api.load_cached_contracts(conn, plan_char_id)
+            if lst is None:
+                ctx["error"] = _NOT_SYNCED
+            ctx["cached_at"] = cached_at
+            raw = lst or []
+            for c in raw:
+                c["_char_id"] = plan_char_id
         ctx["contracts"] = await _finalize_contracts(conn, raw, token)
     except Exception as exc:
         ctx["error"] = f"Error loading contracts: {exc}"
@@ -197,21 +210,31 @@ async def api_contract_items(request: Request, contract_id: int,
     """Lazy fetch of a contract's items (on expand). Returns resolved names from the SDE."""
     conn = get_conn()
     try:
-        items: list[dict] = []
-        async with esi_client() as client:
-            if corp_id:
-                tok = None
-                for cid, _ in list_characters(conn):
-                    if (get_character_row(conn, cid) or {}).get("corporation_id") == corp_id:
-                        tok = await _valid_token_async(cid)
-                        if tok:
-                            break
-                if tok:
-                    items = await contracts_api.fetch_corp_contract_items(client, corp_id, contract_id, tok)
-            elif char_id:
-                tok = await _valid_token_async(char_id)
-                if tok:
-                    items = await contracts_api.fetch_character_contract_items(client, char_id, contract_id, tok)
+        # A contract's contents are fixed when it is created, so a hit here is
+        # permanently correct and there is no age to check. That is also why the
+        # worker does not prefetch these: expanding a row is a button press, and
+        # caching fifty contracts' items a tick to serve the two anybody opens
+        # spends the error budget on nothing.
+        items = contracts_api.load_cached_contract_items(conn, contract_id)
+        if items is None:
+            async with esi_client() as client:
+                if corp_id:
+                    tok = None
+                    for cid, _ in list_characters(conn):
+                        if (get_character_row(conn, cid) or {}).get("corporation_id") == corp_id:
+                            tok = await _valid_token_async(cid)
+                            if tok:
+                                break
+                    if tok:
+                        items = await contracts_api.fetch_corp_contract_items(
+                            client, corp_id, contract_id, tok, conn=conn)
+                elif char_id:
+                    tok = await _valid_token_async(char_id)
+                    if tok:
+                        items = await contracts_api.fetch_character_contract_items(
+                            client, char_id, contract_id, tok, conn=conn)
+            conn.commit()
+        items = items or []
         tids = {it.get("type_id") for it in items if it.get("type_id")}
         names: dict[int, str] = {}
         if tids:

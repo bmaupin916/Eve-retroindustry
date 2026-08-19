@@ -45,6 +45,12 @@ ALLOWED = {
     "api_station_volume": "the Load button, non-streamed path",
     "fetch_plan_sell_price": "the user asking this item's price at this station",
     "api_market_orders": "the user opening one item's order book",
+    # Expanding a contract row. Cached permanently on first open — a contract's
+    # contents are fixed when it is created — so this fetches once per contract
+    # ever, not once per view. It stays exempt rather than being converted
+    # because the worker prefetching every contract's items would spend fifty
+    # calls a tick to store what nobody opens.
+    "api_contract_items": "the user expanding one contract, cached after",
     "api_public_index": "the user indexing a region, streamed with progress",
 
     # Answer *is* the fetch: nothing local could serve these.
@@ -77,8 +83,6 @@ ALLOWED = {
     "api_pi_alerts": "TODO: refreshes live when the cache is stale",
     "assets_page": "TODO: cache-aware fetchers, but still fetches when stale",
     "blueprints_page": "TODO: cache-aware fetchers, but still fetches when stale",
-    "contracts_page": "TODO: no cache at all yet",
-    "api_contract_items": "TODO: no cache at all yet",
     "plan_form": "TODO: cache-aware fetchers, but still fetches when stale",
     "plan_result": "TODO: cache-aware fetchers, but still fetches when stale",
 }

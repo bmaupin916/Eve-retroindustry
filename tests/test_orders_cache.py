@@ -253,10 +253,33 @@ def test_the_router_cannot_open_an_esi_client_at_all():
         "a reason rather than deleting this.")
 
 
-def test_neither_page_calls_a_fetcher(client, monkeypatch):
+def test_the_contracts_router_still_needs_a_client_for_one_reason():
+    """`contracts.py` keeps its `esi_client` import, unlike `characters.py`,
+    and that is deliberate rather than an oversight.
+
+    Two handlers there legitimately fetch: the public-contract region index,
+    which is a streamed button, and `api_contract_items`, which is the user
+    expanding one row. Both are exempted by name in
+    `tests/test_cache_only_routes.py::ALLOWED`.
+
+    Asserted so the difference between the two routers is a recorded decision.
+    If contracts.py ever stops needing a client, this fails and the import
+    should go the way characters.py's did.
+    """
+    from app.web.routers import contracts as router_module
+
+    assert hasattr(router_module, "esi_client")
+
+
+def test_no_converted_page_calls_a_fetcher(client, monkeypatch):
     """The import check above cannot see a fetch made through the API modules,
-    which the router *does* still import — it reads their cache helpers. So
-    every `fetch_` on both is replaced with a recorder.
+    which the routers *do* still import — they read the cache helpers next to
+    the fetchers. So every `fetch_` on all three is replaced with a recorder.
+
+    **The URL list is the test.** An earlier version patched the fetchers but
+    visited only /orders and /wallet, so putting a fetch back into /contracts
+    failed the AST scan and left this green. Every page named in the docstring
+    has to appear in the loop below, or it is not covered.
 
     **It records rather than raises.** These handlers wrap their bodies in
     `except Exception` to turn a failure into an error banner, so a stub that
@@ -264,6 +287,7 @@ def test_neither_page_calls_a_fetcher(client, monkeypatch):
     on every request. Mutation is what surfaced that. A list survives being
     caught.
     """
+    from app.character import contracts as contracts_api
     from app.character import orders as orders_api
     from app.character import wallet as wallet_api
 
@@ -276,16 +300,18 @@ def test_neither_page_calls_a_fetcher(client, monkeypatch):
         return _spy
 
     patched = 0
-    for module in (orders_api, wallet_api):
+    for module in (orders_api, wallet_api, contracts_api):
         for attr in dir(module):
             if attr.startswith("fetch_"):
                 monkeypatch.setattr(module, attr, _recorder(f"{module.__name__}.{attr}"))
                 patched += 1
-    assert patched >= 8, f"only {patched} fetchers found — the scan has drifted"
+    assert patched >= 12, f"only {patched} fetchers found — the scan has drifted"
 
     for url in ("/orders", "/orders?state=history", "/orders?scope=corp",
                 "/orders?char=all", "/orders?char=all&scope=corp",
-                "/wallet", "/wallet?scope=corp", "/wallet?scope=corp&division=3"):
+                "/wallet", "/wallet?scope=corp", "/wallet?scope=corp&division=3",
+                "/contracts", "/contracts?scope=corp",
+                "/contracts?char=all", "/contracts?char=all&scope=corp"):
         assert client.get(url).status_code == 200, url
         assert not called, f"{url} called {called}"
 
@@ -424,3 +450,92 @@ def test_an_unsynced_wallet_page_says_so_rather_than_showing_zero(client):
     assert r.status_code == 200
     assert "Not synced yet" in r.text, (
         "the page showed an empty wallet for a character it never looked at")
+
+
+# ── /contracts, same shape again ─────────────────────────────────────────────
+
+from app.character import contracts as contracts_api  # noqa: E402
+
+
+def test_unsynced_contracts_read_as_none_not_an_empty_list(conn):
+    """An expiring courier contract is exactly what this page is checked for.
+    Showing none because nobody looked is the failure that costs collateral."""
+    rows, at = contracts_api.load_cached_contracts(conn, ALICE)
+
+    assert rows is None
+    assert at == 0.0
+
+
+def test_contracts_round_trip_and_keep_owners_apart(conn):
+    contracts_api.save_cached_contracts(conn, ALICE, [{"contract_id": 1}])
+    contracts_api.save_cached_contracts(conn, CORP, [{"contract_id": 2}],
+                                        contracts_api.CORPORATION)
+    conn.commit()
+
+    mine, _ = contracts_api.load_cached_contracts(conn, ALICE)
+    theirs, _ = contracts_api.load_cached_contracts(
+        conn, CORP, contracts_api.CORPORATION)
+
+    assert [c["contract_id"] for c in mine] == [1]
+    assert [c["contract_id"] for c in theirs] == [2]
+
+
+def test_a_character_and_a_corporation_with_one_id_stay_apart(conn):
+    """`owner_kind` is in the key for the same reason as everywhere else."""
+    contracts_api.save_cached_contracts(conn, CORP, [{"contract_id": 1}])
+    contracts_api.save_cached_contracts(conn, CORP, [{"contract_id": 2}],
+                                        contracts_api.CORPORATION)
+    conn.commit()
+
+    personal, _ = contracts_api.load_cached_contracts(conn, CORP)
+    corp, _ = contracts_api.load_cached_contracts(
+        conn, CORP, contracts_api.CORPORATION)
+
+    assert [c["contract_id"] for c in personal] == [1]
+    assert [c["contract_id"] for c in corp] == [2]
+
+
+def test_a_failed_contracts_fetch_keeps_the_previous_list(conn):
+    contracts_api.save_cached_contracts(conn, ALICE, [{"contract_id": 1}])
+    conn.commit()
+
+    result = asyncio.run(contracts_api.fetch_character_contracts(
+        _Client(_Resp(500)), ALICE, "tok", conn=conn))
+
+    assert result is None, "a failed fetch reported an empty contract list"
+    kept, _ = contracts_api.load_cached_contracts(conn, ALICE)
+    assert [c["contract_id"] for c in kept] == [1]
+
+
+def test_contract_items_are_cached_without_an_age(conn):
+    """The one cache here that cannot go stale: a contract's contents are fixed
+    when it is created. So this returns the items alone, with no timestamp to
+    judge — offering one would invite a staleness check that means nothing."""
+    assert contracts_api.load_cached_contract_items(conn, 555) is None
+
+    contracts_api.save_cached_contract_items(conn, 555, [{"type_id": 34}])
+    conn.commit()
+
+    items = contracts_api.load_cached_contract_items(conn, 555)
+    assert [i["type_id"] for i in items] == [34]
+
+
+def test_a_failed_item_fetch_is_not_cached_as_an_empty_contract(conn):
+    """Caching `[]` here would be permanent — nothing ever refreshes it — so a
+    single failed expand would show that contract as empty forever."""
+    result = asyncio.run(contracts_api.fetch_character_contract_items(
+        _Client(_Resp(500)), ALICE, 777, "tok", conn=conn))
+    conn.commit()
+
+    assert result is None
+    assert contracts_api.load_cached_contract_items(conn, 777) is None, (
+        "a failed fetch was cached permanently as an empty contract")
+
+
+def test_the_contracts_page_reads_the_cache(client, monkeypatch):
+    """Covered by `test_neither_page_calls_a_fetcher` for the fetchers; this is
+    the page-level statement of the None/[] distinction."""
+    r = client.get("/contracts")
+
+    assert r.status_code == 200
+    assert "Not synced yet" in r.text

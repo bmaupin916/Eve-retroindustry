@@ -196,6 +196,33 @@ wallet_ledger_cache = Table(
     Column("cached_at", Float, nullable=False),
 )
 
+contracts_cache = Table(
+    "contracts_cache", metadata,
+    # A character's or corporation's contracts, so /contracts renders without
+    # waiting on ESI. No `state` dimension unlike the orders cache: ESI returns
+    # outstanding and finished contracts in one paginated list, and the page
+    # filters them client-side.
+    Column("owner_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("owner_kind", Text, primary_key=True),      # "character" | "corporation"
+    Column("data_json", Text, nullable=False),
+    Column("cached_at", Float, nullable=False),
+)
+
+contract_items_cache = Table(
+    "contract_items_cache", metadata,
+    # What is *inside* one contract, fetched when a row is expanded.
+    #
+    # Keyed on the contract alone, with no owner and no expiry, because a
+    # contract's contents are fixed when it is created — you cannot add an item
+    # to a courier job someone has already accepted. That makes this the one
+    # cache in the app that never goes stale, which is also why the worker does
+    # not prefetch it: a character with fifty contracts would cost fifty calls
+    # a tick to cache something most of which is never opened.
+    Column("contract_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("data_json", Text, nullable=False),
+    Column("cached_at", Float, nullable=False),
+)
+
 market_orders_cache = Table(
     "market_orders_cache", metadata,
     # Market orders, so /orders renders without waiting on ESI.

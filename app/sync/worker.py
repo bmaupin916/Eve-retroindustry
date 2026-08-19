@@ -51,6 +51,10 @@ from app.character.orders import (
     fetch_orders,
     fetch_orders_history,
 )
+from app.character.contracts import (
+    fetch_character_contracts,
+    fetch_corp_contracts,
+)
 from app.character.wallet import (
     fetch_balance,
     fetch_corp_journal,
@@ -319,6 +323,15 @@ class SyncWorker:
                     changed += self._diff(char_id, "wallet", journal)
                     await fetch_transactions(client, char_id, token, conn=raw)
 
+                    # /contracts reads this. Contract *items* are deliberately
+                    # not prefetched: they never change once a contract exists,
+                    # so they are cached on first expand instead — a character
+                    # with fifty contracts would otherwise cost fifty calls a
+                    # tick to store something most of which is never opened.
+                    contracts = await fetch_character_contracts(
+                        client, char_id, token, conn=raw)
+                    changed += self._diff(char_id, "contracts", contracts)
+
                     try:
                         corp_id, corp_assets = await fetch_corp_assets(
                             client, char_id, token, raw)
@@ -354,6 +367,12 @@ class SyncWorker:
                                     client, corp_id, div, token, conn=raw)
                                 await fetch_corp_transactions(
                                     client, corp_id, div, token, conn=raw)
+
+                            corp_contracts, _cerr = await fetch_corp_contracts(
+                                client, corp_id, token, conn=raw)
+                            changed += self._diff(
+                                char_id, "corp_contracts", corp_contracts,
+                                corporation_id=corp_id)
                     except Exception as exc:
                         # Corp assets need a role most characters do not have.
                         # Not a failure of the character, so it is not recorded
@@ -397,7 +416,8 @@ class SyncWorker:
             # everything the account owns as newly acquired.
             return []
         kind = ({"corp_assets": "corporation.assets.changed",
-                 "corp_orders": "corporation.orders.changed"}.get(what)
+                 "corp_orders": "corporation.orders.changed",
+                 "corp_contracts": "corporation.contracts.changed"}.get(what)
                 or f"character.{what}.changed")
         return [(kind, {"count": size})]
 

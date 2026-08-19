@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.50. **705 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.51. **713 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -225,8 +225,8 @@ Ordered by dependency, not by size.
   correct.
 
 * **Cache-only routes** — no route fetches from ESI on the request path.
-  **`/jobs`, `/orders` and `/wallet` are done; `/orders` is the better
-  example**, because it came with tests. The jobs cache has none: it is covered only by the AST
+  **`/jobs`, `/orders`, `/wallet` and `/contracts` are done; `/orders` is the
+  better example**, because it came with tests. The jobs cache has none: it is covered only by the AST
   scan, which proves a handler contains no `fetch_` call and nothing at all
   about whether the cached data is right.
 
@@ -377,3 +377,39 @@ assertion about rendered HTML and reads like a template bug.
 
 It is also, in its way, the best confirmation available that the conversion
 took: a page that still fetched would have passed.
+
+## Not every fetching handler should be converted
+
+`api_contract_items` came off the TODO list in v0.9.51 without being converted,
+and the reasoning generalises to the pages still on it.
+
+Expanding a contract row is a button press, like `api_market_orders` above it.
+Prefetching would mean the worker fetching items for every contract every
+character holds — fifty calls a tick to cache what nobody opens. So it keeps
+its exemption, but it now *caches* what it fetches, permanently: a contract's
+contents are fixed when it is created, so the first read is correct forever and
+the second expand is instant.
+
+That is a third category the list did not have a name for. Not "renders from
+cache" and not "the answer is the fetch", but **fetched once, on demand, then
+never again.** When the remaining pages are looked at, ask which of the three
+each piece of their data is before reaching for the worker.
+
+One consequence worth stating: this cache has no TTL and nothing refreshes it,
+so caching a *failure* would be permanent. `fetch_character_contract_items`
+returning `[]` on an error would show that contract as empty for the life of
+the database. It returns None instead, and
+`test_a_failed_item_fetch_is_not_cached_as_an_empty_contract` is what keeps it
+that way.
+
+## The third time the guard did not cover the page
+
+`test_no_converted_page_calls_a_fetcher` patched every `fetch_*` on the API
+modules and then visited only `/orders` and `/wallet`. Putting a fetch back
+into `/contracts` failed the AST scan and left it green — the same shape as the
+two failures above it, for a third reason: the stub was right, the target was
+right, and the **URL list** was short.
+
+The pattern across all three: a guard is only as wide as the thing it actually
+exercises, and nothing about a passing test says how wide that is. Mutation is
+the only way to find out, and it costs one run per claim.

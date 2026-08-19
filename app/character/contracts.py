@@ -13,7 +13,12 @@ ESI endpoints:
     GET /contracts/public/items/{cid}/                  → items
 """
 from __future__ import annotations
+
 import asyncio
+import json
+import sqlite3
+import time
+
 import httpx
 
 ESI_BASE = "https://esi.evetech.net/latest"
@@ -52,18 +57,90 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
+#: Cache-key vocabulary, spelled once — it is part of a primary key.
+CHARACTER, CORPORATION = "character", "corporation"
+
+
+# ── cache ─────────────────────────────────────────────────────────────────────
+
+def load_cached_contracts(conn: sqlite3.Connection, owner_id: int,
+                          kind: str = CHARACTER) -> tuple[list[dict] | None, float]:
+    """(contracts, cached_at), or (None, 0) when never synced.
+
+    `None` and `[]` are different answers: nobody has looked, versus looked and
+    found none. A contracts page showing nothing it never fetched reads as "no
+    outstanding contracts", which is a conclusion rather than a gap — and an
+    expiring courier contract is exactly the thing you check this page for.
+    """
+    row = conn.execute(
+        "SELECT data_json, cached_at FROM contracts_cache"
+        " WHERE owner_id=? AND owner_kind=?", (owner_id, kind)).fetchone()
+    if not row:
+        return None, 0.0
+    try:
+        return json.loads(row[0]), float(row[1] or 0.0)
+    except (ValueError, TypeError):
+        return None, 0.0
+
+
+def save_cached_contracts(conn: sqlite3.Connection, owner_id: int,
+                          contracts: list[dict], kind: str = CHARACTER) -> None:
+    conn.execute(
+        "INSERT INTO contracts_cache (owner_id, owner_kind, data_json, cached_at)"
+        " VALUES (?,?,?,?) ON CONFLICT (owner_id, owner_kind) DO UPDATE SET"
+        " data_json=excluded.data_json, cached_at=excluded.cached_at",
+        (owner_id, kind, json.dumps(contracts), time.time()),
+    )
+
+
+def load_cached_contract_items(conn: sqlite3.Connection,
+                               contract_id: int) -> list[dict] | None:
+    """A contract's contents, which never change once it exists.
+
+    No age is returned because there is nothing to judge: unlike every other
+    cache here, this one cannot go stale. A contract's item list is fixed at
+    creation.
+    """
+    row = conn.execute(
+        "SELECT data_json FROM contract_items_cache WHERE contract_id=?",
+        (contract_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except (ValueError, TypeError):
+        return None
+
+
+def save_cached_contract_items(conn: sqlite3.Connection, contract_id: int,
+                               items: list[dict]) -> None:
+    conn.execute(
+        "INSERT INTO contract_items_cache (contract_id, data_json, cached_at)"
+        " VALUES (?,?,?) ON CONFLICT (contract_id) DO UPDATE SET"
+        " data_json=excluded.data_json, cached_at=excluded.cached_at",
+        (contract_id, json.dumps(items), time.time()),
+    )
+
+
 # ── Personal / corporation ────────────────────────────────────────────────────
 
 async def _get_all_pages(client: httpx.AsyncClient, url: str, token: str | None = None,
-                         max_pages: int = 30) -> list[dict]:
+                         max_pages: int = 30) -> list[dict] | None:
     out: list[dict] = []
     headers = _auth(token) if token else {"Accept": "application/json"}
     for page in range(1, max_pages + 1):
         try:
             r = await client.get(url, params={"page": page}, headers=headers, timeout=20)
         except Exception:
+            # First page failing is "ESI is unavailable" and must not be
+            # recorded as "no contracts". A later page still returns what
+            # arrived.
+            if page == 1:
+                return None
             break
         if r.status_code != 200:
+            if page == 1:
+                return None
             break
         batch = r.json()
         if not batch:
@@ -74,11 +151,18 @@ async def _get_all_pages(client: httpx.AsyncClient, url: str, token: str | None 
     return out
 
 
-async def fetch_character_contracts(client, char_id: int, token: str) -> list[dict]:
-    return await _get_all_pages(client, f"{ESI_BASE}/characters/{char_id}/contracts/", token)
+async def fetch_character_contracts(client, char_id: int, token: str,
+                                    conn: sqlite3.Connection | None = None
+                                    ) -> list[dict] | None:
+    out = await _get_all_pages(
+        client, f"{ESI_BASE}/characters/{char_id}/contracts/", token)
+    if out is not None and conn is not None:
+        save_cached_contracts(conn, char_id, out, CHARACTER)
+    return out
 
 
-async def fetch_corp_contracts(client, corp_id: int, token: str
+async def fetch_corp_contracts(client, corp_id: int, token: str,
+                               conn: sqlite3.Connection | None = None
                                ) -> tuple[list[dict] | None, str | None]:
     try:
         r = await client.get(f"{ESI_BASE}/corporations/{corp_id}/contracts/",
@@ -99,33 +183,45 @@ async def fetch_corp_contracts(client, corp_id: int, token: str
         if rp.status_code != 200:
             break
         out.extend(rp.json())
+    if conn is not None:
+        save_cached_contracts(conn, corp_id, out, CORPORATION)
     return out, None
 
 
 async def fetch_character_contract_items(client, char_id: int, contract_id: int,
-                                         token: str) -> list[dict]:
+                                         token: str,
+                                         conn: sqlite3.Connection | None = None
+                                         ) -> list[dict] | None:
     try:
         r = await client.get(
             f"{ESI_BASE}/characters/{char_id}/contracts/{contract_id}/items/",
             headers=_auth(token), timeout=15)
         if r.status_code == 200:
-            return r.json()
+            items = r.json()
+            if conn is not None:
+                save_cached_contract_items(conn, contract_id, items)
+            return items
     except Exception:
         pass
-    return []
+    return None
 
 
 async def fetch_corp_contract_items(client, corp_id: int, contract_id: int,
-                                    token: str) -> list[dict]:
+                                    token: str,
+                                    conn: sqlite3.Connection | None = None
+                                    ) -> list[dict] | None:
     try:
         r = await client.get(
             f"{ESI_BASE}/corporations/{corp_id}/contracts/{contract_id}/items/",
             headers=_auth(token), timeout=15)
         if r.status_code == 200:
-            return r.json()
+            items = r.json()
+            if conn is not None:
+                save_cached_contract_items(conn, contract_id, items)
+            return items
     except Exception:
         pass
-    return []
+    return None
 
 
 # ── Public (regional) ─────────────────────────────────────────────────────────
