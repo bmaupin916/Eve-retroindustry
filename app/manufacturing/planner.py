@@ -207,32 +207,42 @@ def build_plan(
     runs_per_job_by_product: dict[int, int] | None = None,
     invention: InventionParams | None = None,
 ) -> ManufacturingPlan:
+    import contextlib
+
     from app.db.conn import connect_to_path
-    sde = connect_to_path(db_path)                     # for the converted BOMResolver
-    db_conn = sqlite3.connect(db_path)
 
-    bp = find_blueprint_for_product(blueprints, product_type_id, db_conn)
-    # me_override/te_override carry the ROOT ME/TE the caller already settled on
-    # (a value typed into the form, or the blueprint's own). Without them this
-    # function re-derived ME from the owned blueprint only, so a manually entered
-    # ME never reached `materials` — the Materials tab then disagreed with the
-    # Manufacturing steps, which are built from the caller's own resolved tree.
-    me = me_override if me_override is not None else (bp.material_efficiency if bp else 0)
-    te = te_override if te_override is not None else (bp.time_efficiency     if bp else 0)
+    # Both connections scoped, for the reason `plan_result` was fixed in
+    # v0.9.54: `find_blueprint_for_product` and `resolver.resolve` both raise on
+    # bad input, and `build_plan` is called from an `except Exception` handler,
+    # so the bare closes at the bottom were skipped on exactly the paths that
+    # reach them. Two handles per failed plan, held until the process exited.
+    #
+    # `contextlib.closing` on the sqlite3 one and not a bare `with`: a
+    # `sqlite3.Connection` used as a context manager commits or rolls back the
+    # transaction and does **not** close the connection, which is the trap that
+    # makes this look fixed while still leaking.
+    with connect_to_path(db_path) as sde,             contextlib.closing(sqlite3.connect(db_path)) as db_conn:
+        bp = find_blueprint_for_product(blueprints, product_type_id, db_conn)
+        # me_override/te_override carry the ROOT ME/TE the caller already settled
+        # on (a value typed into the form, or the blueprint's own). Without them
+        # this function re-derived ME from the owned blueprint only, so a
+        # manually entered ME never reached `materials` — the Materials tab then
+        # disagreed with the Manufacturing steps, which are built from the
+        # caller's own resolved tree.
+        me = me_override if me_override is not None else (bp.material_efficiency if bp else 0)
+        te = te_override if te_override is not None else (bp.time_efficiency     if bp else 0)
 
-    resolver = BOMResolver(sde, blueprints=blueprints, runs_per_job=runs_per_job,
-                           adjusted_prices=adjusted_prices,
-                           rate_mfg=rate_mfg, rate_rxn=rate_rxn,
-                           runs_per_job_by_product=runs_per_job_by_product,
-                           invention=invention)
-    root = resolver.resolve(
-        product_type_id, quantity, me=float(me),
-        mfg_facility=mfg_facility, rxn_facility=rxn_facility,
-    )
-    plan_invention_cost = total_invention_cost(root)
-    plan_invention_unpriced = list(resolver.invention_unpriced)
-    sde.close()
-    db_conn.close()
+        resolver = BOMResolver(sde, blueprints=blueprints, runs_per_job=runs_per_job,
+                               adjusted_prices=adjusted_prices,
+                               rate_mfg=rate_mfg, rate_rxn=rate_rxn,
+                               runs_per_job_by_product=runs_per_job_by_product,
+                               invention=invention)
+        root = resolver.resolve(
+            product_type_id, quantity, me=float(me),
+            mfg_facility=mfg_facility, rxn_facility=rxn_facility,
+        )
+        plan_invention_cost = total_invention_cost(root)
+        plan_invention_unpriced = list(resolver.invention_unpriced)
 
     product_name = root.name
     opt_total = opt_naive = None

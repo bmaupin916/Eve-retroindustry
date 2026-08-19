@@ -13,7 +13,6 @@ cache.
 """
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 
 from fastapi import APIRouter, Form, Request
@@ -22,9 +21,9 @@ from fastapi.responses import HTMLResponse
 from app.auth.token_store import get_character_row
 from app.bom.resolver import BOMResolver
 from app.cache.blueprint_cache import resolve_type
-from app.character.assets import fetch_assets
-from app.character.blueprints import fetch_blueprints
-from app.character.skills import fetch_skills, get_cached_skills
+from app.character.assets import load_cached_assets
+from app.character.blueprints import load_cached_blueprints
+from app.character.skills import get_cached_skills
 from app.db.database import get_session
 from app.esi.client import esi_client, esi_error_message, search_type_by_name
 from app.manufacturing.margins import build_invention_params
@@ -175,11 +174,11 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
     if char_row:
         raw = _load_assets_from_cache(conn, char_row["character_id"])
         location_ids = sorted({a["location_id"] for a in raw if not a.get("is_singleton", False)})
-        if token:
-            async with esi_client() as client:
-                char_skills = await fetch_skills(client, char_row["character_id"], token, conn)
-        else:
-            char_skills = get_cached_skills(conn, char_row["character_id"])
+        # Cached either way now. The two branches used to differ — a signed-in
+        # character got a live fetch and a token-less one got the cache — which
+        # meant the page was fast exactly when the data was least likely to
+        # matter, and slow on every normal load. The worker keeps this warm.
+        char_skills = get_cached_skills(conn, char_row["character_id"])
     product_param = request.query_params.get("product", "")
     if product_param.strip().isdigit():
         row = conn.execute("SELECT name FROM sde_types WHERE type_id=?", (int(product_param),)).fetchone()
@@ -406,34 +405,51 @@ async def plan_result(
         char = (row["character_id"], row["character_name"])
         char_id, _ = char
 
-        async with esi_client() as client:
-            session = get_session()
-            if product.strip().isdigit():
-                type_id = int(product.strip())
-                type_name = await resolve_type(client, session, type_id)
-            else:
-                # Local SDE resolve — exact → prefix → substring; prefers
-                # producible, published, shortest name (so "Industrial
-                # Jump Portal Generator" hits "…Generator I", not its
-                # blueprint). ESI /universe/ids/ only as a last resort
-                # (and it is purely exact-match).
-                local = _resolve_product_local(conn, product.strip())
-                if local:
-                    type_id, type_name = local
-                else:
-                    results = await search_type_by_name(client, product.strip())
-                    if not results:
-                        raise ValueError(f"Product '{product}' not found.")
-                    type_id = results[0]
-                    type_name = await resolve_type(client, session, type_id)
-            session.close()
+        # Resolving what the user typed. Local first, and for anything
+        # buildable that is the whole story: every product with a blueprint is
+        # in the SDE by definition. The ESI fallback below exists for a name the
+        # static data has never heard of — a typo, or a type added since the
+        # last `import_sde.py` — and is the reason this handler keeps its
+        # exemption in tests/test_cache_only_routes.py rather than being
+        # declared cache-only. It is the one fetch here that *is* the answer.
+        local = None
+        if not product.strip().isdigit():
+            # Exact → prefix → substring; prefers producible, published,
+            # shortest name (so "Industrial Jump Portal Generator" hits
+            # "…Generator I", not its blueprint).
+            local = _resolve_product_local(conn, product.strip())
 
-        async with esi_client() as client:
-            blueprints, all_assets, char_skills = await asyncio.gather(
-                fetch_blueprints(client, char_id, token, conn),
-                fetch_assets(client, char_id, token, conn),
-                fetch_skills(client, char_id, token, conn),
-            )
+        if local:
+            type_id, type_name = local
+        else:
+            async with esi_client() as client:
+                session = get_session()
+                try:
+                    if product.strip().isdigit():
+                        type_id = int(product.strip())
+                        type_name = await resolve_type(client, session, type_id)
+                    else:
+                        results = await search_type_by_name(client, product.strip())
+                        if not results:
+                            raise ValueError(f"Product '{product}' not found.")
+                        type_id = results[0]
+                        type_name = await resolve_type(client, session, type_id)
+                finally:
+                    session.close()
+
+        # All three come from the caches the sync worker fills. This was three
+        # paginated ESI calls on every plan submission — and a plan is submitted
+        # repeatedly while somebody tunes ME, runs and stations, so the same
+        # three lists were fetched over and over to compute a different number
+        # from identical inputs.
+        blueprints, _bp_at = load_cached_blueprints(conn, char_id)
+        all_assets, _as_at = load_cached_assets(conn, char_id)
+        char_skills = get_cached_skills(conn, char_id)
+        if blueprints is None or all_assets is None:
+            raise ValueError(
+                "This character has not been synced yet — the background worker "
+                "fills its blueprints and assets within a few minutes of signing "
+                "in. Planning now would price the build as if you owned nothing.")
 
         # Industry/AdvIndustry always from current char_skills (the form_industry
         # field is hidden and may come from an old character after switching).

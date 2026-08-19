@@ -86,3 +86,76 @@ def test_the_happy_path_closes_the_sde_connection_too(client, monkeypatch):
     assert all(conn.closed for conn in opened), (
         "an SDE connection outlived a successful /plan request"
     )
+
+
+# ── the same leak, one layer down ────────────────────────────────────────────
+
+def test_build_plan_closes_both_of_its_connections_when_something_raises(tmp_path):
+    """`app/manufacturing/planner.py::build_plan` had the identical shape twice.
+
+    It opens two connections — `connect_to_path(db_path)` for the resolver and a
+    raw `sqlite3.connect(db_path)` for the blueprint lookup — and closed both
+    with bare calls at the bottom of a span containing
+    `find_blueprint_for_product` and `resolver.resolve`. `plan_result` calls it
+    from inside the same `except Exception` handler, so a failure here leaked
+    **two** handles per attempt with no symptom at all.
+
+    The trap this pins, and the reason a bare `with` would not have been the
+    fix: a `sqlite3.Connection` used as a context manager commits or rolls back
+    its transaction and does **not** close the connection. Only
+    `contextlib.closing` closes it. A "fixed" version using `with` looks right,
+    passes any test that checks for an exception, and leaks exactly as before.
+    """
+    import shutil
+    import sqlite3
+
+    import app.db.conn as conn_mod
+    from app.manufacturing import planner
+
+    db = str(tmp_path / "plan.db")
+    shutil.copy2("sde_base.db", db)
+
+    opened_engine = []
+    real_ctp = conn_mod.connect_to_path
+
+    def spy_ctp(path):
+        c = real_ctp(path)
+        opened_engine.append(c)
+        return c
+
+    opened_raw = []
+    real_connect = sqlite3.connect
+
+    def spy_connect(*a, **kw):
+        c = real_connect(*a, **kw)
+        opened_raw.append(c)
+        return c
+
+    conn_mod.connect_to_path = spy_ctp
+    sqlite3.connect = spy_connect
+    try:
+        # A product id the SDE has no blueprint for makes `resolve` raise.
+        try:
+            planner.build_plan(product_type_id=1, quantity=1,
+                               location_id=60003760, available_assets={},
+                               blueprints=[], db_path=db, mode="full")
+        except Exception:
+            pass
+    finally:
+        conn_mod.connect_to_path = real_ctp
+        sqlite3.connect = real_connect
+
+    assert opened_engine, "the spy never saw the engine connection — retarget this"
+    assert opened_raw, "the spy never saw the raw connection — retarget this"
+
+    for c in opened_engine:
+        assert c.closed, "the engine connection outlived a failed build_plan"
+    for c in opened_raw:
+        # A closed sqlite3.Connection raises on use; there is no `.closed`.
+        try:
+            c.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            continue
+        raise AssertionError(
+            "the raw sqlite3 connection outlived a failed build_plan — note "
+            "that `with sqlite3.connect(...)` would NOT have fixed this")

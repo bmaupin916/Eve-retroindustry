@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.54. **736 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.55. **739 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -250,12 +250,15 @@ Ordered by dependency, not by size.
   `test_no_characters_means_no_work` had asserted the full-interval sleep as
   correct.
 
-* **Cache-only routes** — no route fetches from ESI on the request path.
-  **Nine of the eleven handlers are done**; only `plan_form` and
-  `plan_result` are left. `/orders` is the better example to copy, because it
-  came with tests. The jobs cache has none: it is covered only by the AST
-  scan, which proves a handler contains no `fetch_` call and nothing at all
-  about whether the cached data is right.
+* ~~**Cache-only routes**~~ — **done in v0.9.55.** No route fetches from ESI
+  to render. All eleven handlers that were on the TODO list are off it, and
+  `ALLOWED` now contains only routes where the fetch *is* the answer: buttons,
+  streams, image proxies, and two lookups of something the user just typed.
+
+  `/orders` is the example to copy. The jobs cache — the original pattern — has
+  no tests of its own: it is covered only by the AST scan, which proves a
+  handler contains no `fetch_` call and nothing at all about whether the cached
+  data is right.
 
   **`/jobs` is the original pattern**: a `char_jobs_cache` table filled by
   the worker, `load_cached_jobs()` read by the page, and the page saying how old
@@ -317,7 +320,7 @@ all **done**. What that left is below.
    connection.** A converted writer that loses its `commit()` passes every
    same-connection check and drops the write when the request ends — dropping
    the commit from `save_defaults` fails exactly one test, and it is that one.
-2. **Cache-only routes**, eight pages left. `/jobs` is the worked example.
+2. ~~**Cache-only routes**~~ — done in v0.9.55.
 3. **Give the health page a second consumer, or don't.** `/sync-health` reads
    the log; nothing subscribes to it with a cursor. That is fine — `since()`
    exists for when something does, and building a subscriber before there is
@@ -504,3 +507,37 @@ The general form: **a cache has two contracts, and they need separate tests.**
 The store's contract is "what goes in comes out"; the fetcher's is "what is
 worth storing, and in what shape". Round-tripping the first is easy and proves
 nothing about the second — which is where every decision lives.
+
+
+## One test is timing-based and will fail again
+
+`test_several_characters_refresh_concurrently` asserts that three stubbed
+200 ms token refreshes finish in under 0.5 s — the point being that they gather
+rather than run in series. It is a wall-clock assertion on a shared machine,
+and at 740 tests the suite is heavy enough to trip it: it failed once during
+v0.9.55 and passed on the next run with no change in between, and it passes
+alone every time.
+
+Left as it is rather than loosened. The margin is 0.5 s against an ideal of
+0.2 s, so widening it far enough to never flake would stop it distinguishing
+concurrent from serial, which is the only thing it is for. **If it fails, re-run
+that file alone before believing it** — and if it starts failing alone, that is
+a real regression.
+
+## What the last slice added, briefly
+
+* **The AST scan matches on names, so an alias walks past it.** The first
+  mutation batch for `/plan` imported `esi_client as _ec` and called `_ec()`;
+  nothing noticed, because the scan looks for the literal name. That is a
+  mutation testing the scan's blind spot rather than the conversion, and it
+  had to be redone honestly. The lasting fix is the recorder-style guard —
+  `test_the_plan_pages_do_not_call_a_collection_fetcher` — which an alias
+  cannot dodge.
+* **Patch the module that calls, for the third time.** The unsynced-character
+  test patched `app.character.assets.load_cached_assets` while `plan.py` had
+  already bound the name. Same lesson as the two above it, now three for three.
+* **`sqlite3.Connection` as a context manager does not close.** It commits or
+  rolls back the transaction and leaves the connection open, so
+  `with sqlite3.connect(...)` looks like a leak fix and is not one. It needs
+  `contextlib.closing`. `build_plan` now uses it, and the mutation that swaps
+  it back for a bare `with` is what proves the test can tell them apart.

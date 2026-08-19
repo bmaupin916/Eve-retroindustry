@@ -847,3 +847,70 @@ def test_a_character_with_no_colonies_is_written_down_as_such(conn):
 
     assert result == ([], [])
     assert planets_api.load_cached_colonies(conn, ALICE)[0] == ([], [])
+
+
+# ── /plan, the last pair ─────────────────────────────────────────────────────
+
+def test_the_plan_pages_do_not_call_a_collection_fetcher(client, monkeypatch):
+    """`plan_result` submits repeatedly while somebody tunes ME, runs and
+    stations, and each submission used to re-fetch the same three paginated
+    lists to compute a different number from identical inputs.
+
+    Not the AST scan's job: it matches on the *name* `fetch_blueprints`, so a
+    local import aliased to something else walks straight past it. This records
+    calls instead, which an alias cannot dodge.
+
+    The product-name resolve is deliberately outside this: `plan_result` keeps
+    its exemption for that one call, and it is skipped entirely for any product
+    the SDE knows — which is every product with a blueprint.
+    """
+    from app.character import assets as a_api
+    from app.character import blueprints as b_api
+    from app.character import skills as s_api
+
+    called: list[str] = []
+
+    def _recorder(name):
+        async def _spy(*a, **kw):
+            called.append(name)
+            return None
+        return _spy
+
+    patched = 0
+    for module in (a_api, b_api, s_api):
+        for attr in dir(module):
+            if attr.startswith("fetch_"):
+                monkeypatch.setattr(module, attr, _recorder(f"{module.__name__}.{attr}"))
+                patched += 1
+    assert patched >= 4, f"only {patched} fetchers found"
+
+    assert client.get("/plan").status_code == 200
+    assert not called, f"/plan called {called}"
+
+    client.post("/plan", data={"product": "Tritanium", "qty": "1",
+                               "station": "60003760", "mode": "full",
+                               "runs_per_job": "0", "form_me": "0"})
+    assert not called, f"POST /plan called {called}"
+
+
+def test_planning_for_an_unsynced_character_says_so(client, monkeypatch):
+    """The cache reads return None for a character the worker has not reached.
+    Treating that as "owns nothing" would price the whole build as if every
+    component had to be bought — a plausible number, and wrong in the expensive
+    direction."""
+    # Patched on the *router*, not on `app.character.assets`: plan.py does
+    # `from app.character.assets import load_cached_assets` at module level,
+    # which binds the function, so rebinding the source leaves the router's copy
+    # alone. Third time this has come up in this conversion; it is in the
+    # worklist under "Two ways a test can guard nothing".
+    from app.web.routers import plan as plan_router
+
+    monkeypatch.setattr(plan_router, "load_cached_assets", lambda conn, cid: (None, 0.0))
+
+    r = client.post("/plan", data={"product": "Tritanium", "qty": "1",
+                                   "station": "60003760", "mode": "full",
+                                   "runs_per_job": "0", "form_me": "0"})
+
+    assert r.status_code == 200
+    assert "has not been synced yet" in r.text, (
+        "an unsynced character was planned as owning nothing")

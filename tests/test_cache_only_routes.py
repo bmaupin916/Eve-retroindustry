@@ -45,6 +45,13 @@ ALLOWED = {
     "api_station_volume": "the Load button, non-streamed path",
     "fetch_plan_sell_price": "the user asking this item's price at this station",
     "api_market_orders": "the user opening one item's order book",
+    # Resolving the product name somebody typed, and only when the SDE has
+    # never heard of it — a typo, or a type added since the last import_sde
+    # run. Anything with a blueprint is in the static data by definition, so
+    # the fetch is skipped on every plan of a real product. The three
+    # collections this page used to fetch (blueprints, assets, skills) come
+    # from the worker's caches since v0.9.55.
+    "plan_result": "resolving a typed name the static data does not have",
     # Expanding a contract row. Cached permanently on first open — a contract's
     # contents are fixed when it is created — so this fetches once per contract
     # ever, not once per view. It stays exempt rather than being converted
@@ -78,8 +85,6 @@ ALLOWED = {
     # Not yet converted. Each needs a cache the worker fills first; /jobs is
     # the worked example. Remove a name from here when its page stops fetching,
     # never to make this test pass.
-    "plan_form": "TODO: cache-aware fetchers, but still fetches when stale",
-    "plan_result": "TODO: cache-aware fetchers, but still fetches when stale",
 }
 
 
