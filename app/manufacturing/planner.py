@@ -207,6 +207,8 @@ def build_plan(
     runs_per_job_by_product: dict[int, int] | None = None,
     invention: InventionParams | None = None,
 ) -> ManufacturingPlan:
+    from app.db.conn import connect_to_path
+    sde = connect_to_path(db_path)                     # for the converted BOMResolver
     db_conn = sqlite3.connect(db_path)
 
     bp = find_blueprint_for_product(blueprints, product_type_id, db_conn)
@@ -218,7 +220,7 @@ def build_plan(
     me = me_override if me_override is not None else (bp.material_efficiency if bp else 0)
     te = te_override if te_override is not None else (bp.time_efficiency     if bp else 0)
 
-    resolver = BOMResolver(db_path, blueprints=blueprints, runs_per_job=runs_per_job,
+    resolver = BOMResolver(sde, blueprints=blueprints, runs_per_job=runs_per_job,
                            adjusted_prices=adjusted_prices,
                            rate_mfg=rate_mfg, rate_rxn=rate_rxn,
                            runs_per_job_by_product=runs_per_job_by_product,
@@ -229,7 +231,7 @@ def build_plan(
     )
     plan_invention_cost = total_invention_cost(root)
     plan_invention_unpriced = list(resolver.invention_unpriced)
-    resolver.close()
+    sde.close()
     db_conn.close()
 
     product_name = root.name

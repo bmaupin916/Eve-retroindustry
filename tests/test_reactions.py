@@ -11,6 +11,8 @@ import sqlite3
 
 import pytest
 
+from app.db.conn import connect_to_path
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SDE = os.path.join(REPO, "sde_base.db")
 
@@ -76,7 +78,7 @@ def test_tungsten_carbide_uses_the_real_formula_not_the_test_blueprint(db):
     _path, conn = db
     from app.bom.resolver import BOMResolver
 
-    resolver = BOMResolver(_path)
+    resolver = BOMResolver(connect_to_path(_path))
     try:
         bp = resolver.find_blueprint(TUNGSTEN_CARBIDE)
     finally:
@@ -103,7 +105,7 @@ def test_inputs_are_priced_directly_not_resolved_to_raw(db):
     from app.bom.resolver import BOMResolver
     from app.web.reactions_helper import build_board
 
-    resolver = BOMResolver(path)
+    resolver = BOMResolver(connect_to_path(path))
     try:
         bp = resolver.find_blueprint(TUNGSTEN_CARBIDE)
         mats = resolver.get_materials(bp["blueprint_type_id"], "reaction")
@@ -130,7 +132,7 @@ def test_profit_is_revenue_minus_inputs_fee_and_selling_costs(db):
     from app.bom.resolver import BOMResolver
     from app.web.reactions_helper import build_board
 
-    resolver = BOMResolver(path)
+    resolver = BOMResolver(connect_to_path(path))
     try:
         bp = resolver.find_blueprint(TUNGSTEN_CARBIDE)
         mats = resolver.get_materials(bp["blueprint_type_id"], "reaction")
@@ -167,7 +169,7 @@ def test_slot_hours_use_the_reaction_job_not_the_whole_tree(db):
     from app.bom.resolver import BOMResolver
     from app.web.reactions_helper import build_board
 
-    resolver = BOMResolver(path)
+    resolver = BOMResolver(connect_to_path(path))
     try:
         bp = resolver.find_blueprint(TUNGSTEN_CARBIDE)
     finally:
@@ -351,7 +353,7 @@ def test_a_row_with_an_unpriced_input_cannot_top_the_board(db):
     from app.bom.resolver import BOMResolver
     from app.web.reactions_helper import build_board
 
-    resolver = BOMResolver(path)
+    resolver = BOMResolver(connect_to_path(path))
     try:
         bp = resolver.find_blueprint(TUNGSTEN_CARBIDE)
         mats = resolver.get_materials(bp["blueprint_type_id"], "reaction")
@@ -380,7 +382,7 @@ def test_a_thin_market_is_flagged_and_demoted(db):
     from app.bom.resolver import BOMResolver
     from app.web.reactions_helper import build_board, THIN_MARKET_RATIO
 
-    resolver = BOMResolver(path)
+    resolver = BOMResolver(connect_to_path(path))
     try:
         bp = resolver.find_blueprint(TUNGSTEN_CARBIDE)
         mats = resolver.get_materials(bp["blueprint_type_id"], "reaction")
@@ -431,7 +433,7 @@ def test_raw_cost_amortises_a_sub_run_instead_of_charging_a_whole_job(db):
     from app.manufacturing.margins import _station_context
     from app.web.reactions_helper import raw_unit_cost, _prices
 
-    resolver = BOMResolver(path)
+    resolver = BOMResolver(connect_to_path(path))
     try:
         block_bp = resolver.find_blueprint(NITROGEN_FUEL_BLOCK)
         assert block_bp is not None and block_bp["product_qty"] > 1, \
@@ -467,7 +469,7 @@ def test_raw_cost_includes_manufacturing_job_fees_not_just_reaction_ones(db):
     from app.web.industry_helper import get_adjusted_prices_cached
     from app.web.reactions_helper import raw_unit_cost, _prices
 
-    seed = BOMResolver(path)
+    seed = BOMResolver(connect_to_path(path))
     try:
         for leaf_id in seed.resolve(TUNGSTEN_CARBIDE, 1).aggregate_leaves():
             _price(conn, leaf_id, 100.0)
@@ -490,7 +492,7 @@ def test_raw_cost_includes_manufacturing_job_fees_not_just_reaction_ones(db):
     prices = _prices(conn, ids, "buy")
 
     def cost(rate_mfg, rate_rxn):
-        resolver = BOMResolver(path, blueprints=[], runs_per_job=None,
+        resolver = BOMResolver(connect_to_path(path), blueprints=[], runs_per_job=None,
                                adjusted_prices=adjusted,
                                rate_mfg=rate_mfg, rate_rxn=rate_rxn)
         try:
@@ -516,7 +518,7 @@ def test_raw_cost_is_none_when_something_underneath_is_unpriced(db):
     from app.manufacturing.margins import _station_context
     from app.web.reactions_helper import raw_unit_cost
 
-    resolver = BOMResolver(path)
+    resolver = BOMResolver(connect_to_path(path))
     try:
         ctx = _station_context(conn, get_defaults(conn))
         unpriced = set()
@@ -628,3 +630,33 @@ def test_dumping_to_buy_orders_prices_the_output_at_the_buy_price(db):
 
     assert listed["sell_price"] == pytest.approx(1000.0)
     assert dumped["sell_price"] == pytest.approx(400.0)
+
+
+# ── the internal-blueprint filter, after the GLOB rewrite ────────────────────
+#
+# `find_blueprint` used five `NOT GLOB` clauses to drop CCP's test/QA/tournament
+# blueprints. GLOB is SQLite-only and `LIKE` cannot replace it: SQLite's LIKE
+# ignores case and Postgres's does not, so one spelling means two things. The
+# filter is a Python predicate now, which is identical on every backend and can
+# be called directly — these are what say it still means what it meant.
+
+def test_the_internal_blueprint_filter_catches_what_it_used_to():
+    from app.bom.resolver import is_internal_blueprint_name as bad
+
+    assert bad("Test Tungsten Carbide Blueprint")
+    assert bad("Tournament Rifter Blueprint")
+    assert bad("QA Damage Control Blueprint")
+    assert bad("Something TEST Blueprint")
+    assert bad("Foo TEST Bar Blueprint")
+
+
+def test_the_filter_stays_case_sensitive():
+    """The reason GLOB was there at all. A case-insensitive reading throws away
+    real items, and 'Protest' is the example that made it GLOB in the first
+    place — matching '%TEST%' loosely would delete it."""
+    from app.bom.resolver import is_internal_blueprint_name as bad
+
+    assert not bad("Protest Blueprint"), "a real item was filtered out"
+    assert not bad("Contest Trophy Blueprint")
+    assert not bad("test drive blueprint"), "lowercase is not CCP's convention"
+    assert not bad("Latest Model Blueprint")

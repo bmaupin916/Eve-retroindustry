@@ -13,6 +13,14 @@ import tempfile
 
 import pytest
 
+from app.db.conn import connect_to_path
+
+
+def _db_file(conn) -> str:
+    """The file a sqlite3 connection is attached to. `database_list` returns
+    (seq, name, file) per attached database; `main` is the one we opened."""
+    return [r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"][0]
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SDE = os.path.join(REPO, "sde_base.db")
 
@@ -51,7 +59,7 @@ def _price_whole_tree(conn, path, type_id, me, unit_price=100.0):
     that cannot price its blueprint is not fully priced.
     """
     from app.bom.resolver import BOMResolver
-    resolver = BOMResolver(path)
+    resolver = BOMResolver(connect_to_path(path))
     try:
         leaves = resolver.resolve(type_id, 1, me=me).aggregate_leaves()
     finally:
@@ -64,9 +72,15 @@ def _price_whole_tree(conn, path, type_id, me, unit_price=100.0):
 
 
 def _datacores(conn, type_id):
-    """Datacore type ids consumed inventing `type_id`, empty if not invented."""
+    """Datacore type ids consumed inventing `type_id`, empty if not invented.
+
+    `invention` is on the portable query layer now, so it needs a SQLAlchemy
+    connection rather than the raw sqlite3 one this fixture otherwise uses.
+    Both open the same file.
+    """
     from app.manufacturing.invention import find_recipe
-    recipe = find_recipe(conn, type_id)
+    with connect_to_path(_db_file(conn)) as sde:
+        recipe = find_recipe(sde, type_id)
     return [tid for tid, _name, _qty in recipe.datacores] if recipe else []
 
 

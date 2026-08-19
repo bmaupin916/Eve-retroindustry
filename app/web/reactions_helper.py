@@ -427,8 +427,10 @@ def build_board(conn: sqlite3.Connection, db_path: str,
     # blueprints), and its ME path is reused so reaction rig and structure
     # bonuses are applied here exactly as they are everywhere else. Its lookups
     # are cached, so this costs one query per product rather than one per call.
+    from app.db.conn import connect_to_path
+    sde = connect_to_path(db_path)                     # for the converted BOMResolver
     resolver = BOMResolver(
-        db_path, blueprints=[], runs_per_job=None,
+        sde, blueprints=[], runs_per_job=None,
         adjusted_prices=get_adjusted_prices_cached(conn),
         rate_mfg=ctx["rate_mfg"], rate_rxn=ctx["rate_rxn"],
     )
@@ -538,7 +540,7 @@ def build_board(conn: sqlite3.Connection, db_path: str,
                     type_id, local, ref_sell, volumes.get(type_id, 0.0), export_rate),
             })
     finally:
-        resolver.close()
+        sde.close()
 
     counts = view["counts"]
     counts["total"] = len(rows)

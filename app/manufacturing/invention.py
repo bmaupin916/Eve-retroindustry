@@ -42,8 +42,11 @@ hardcoded; the values in the SDE match EVE University's published table exactly
 """
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass, field
+
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
+from app.db.conn import NO_SUCH_TABLE as _NO_SUCH_TABLE, recover_from_missing_table as _table_missing
 
 # Per-level contributions to the success chance. 1/30 is 3.333% per level of
 # each science skill; 1/40 is 2.5% per level of the encryption skill.
@@ -131,7 +134,7 @@ def _lvl(raw) -> int:
         return 0
 
 
-def find_recipe(conn: sqlite3.Connection, product_type_id: int) -> InventionRecipe | None:
+def find_recipe(conn: Connection, product_type_id: int) -> InventionRecipe | None:
     """The invention recipe for a T2 product, or None if it is not invented.
 
     Walks product -> T2 blueprint -> the T1 blueprint that invents it. T1 items,
@@ -139,16 +142,18 @@ def find_recipe(conn: sqlite3.Connection, product_type_id: int) -> InventionReci
     is how a caller tells "no invention cost" from "invention cost of zero".
     """
     row = conn.execute(
-        "SELECT blueprint_type_id, quantity FROM sde_blueprint_products "
-        "WHERE product_type_id=? AND activity='manufacturing'", (product_type_id,)
+        text("SELECT blueprint_type_id, quantity FROM sde_blueprint_products "
+             "WHERE product_type_id = :pid AND activity = 'manufacturing'"),
+        {"pid": product_type_id},
     ).fetchone()
     if not row:
         return None
     t2_bp, units_per_run = int(row[0]), int(row[1] or 1)
 
     row = conn.execute(
-        "SELECT blueprint_type_id, probability FROM sde_blueprint_products "
-        "WHERE product_type_id=? AND activity='invention'", (t2_bp,)
+        text("SELECT blueprint_type_id, probability FROM sde_blueprint_products "
+             "WHERE product_type_id = :pid AND activity = 'invention'"),
+        {"pid": t2_bp},
     ).fetchone()
     if not row:
         return None                     # manufactured directly, not invented
@@ -157,18 +162,23 @@ def find_recipe(conn: sqlite3.Connection, product_type_id: int) -> InventionReci
         return None
 
     base_runs = conn.execute(
-        "SELECT max_production_limit FROM sde_blueprints WHERE blueprint_type_id=?",
-        (t2_bp,)).fetchone()
+        text("SELECT max_production_limit FROM sde_blueprints"
+             " WHERE blueprint_type_id = :bp"),
+        {"bp": t2_bp}).fetchone()
 
     datacores = [(int(r[0]), r[1], int(r[2])) for r in conn.execute(
-        "SELECT m.material_type_id, t.name, m.quantity "
-        "FROM sde_blueprint_materials m JOIN sde_types t ON t.type_id=m.material_type_id "
-        "WHERE m.blueprint_type_id=? AND m.activity='invention'", (t1_bp,))]
+        text("SELECT m.material_type_id, t.name, m.quantity "
+             "FROM sde_blueprint_materials m"
+             " JOIN sde_types t ON t.type_id = m.material_type_id "
+             "WHERE m.blueprint_type_id = :bp AND m.activity = 'invention'"),
+        {"bp": t1_bp})]
 
     skills = [(int(r[0]), r[1]) for r in conn.execute(
-        "SELECT s.skill_type_id, t.name "
-        "FROM sde_blueprint_skills s JOIN sde_types t ON t.type_id=s.skill_type_id "
-        "WHERE s.blueprint_type_id=? AND s.activity='invention'", (t1_bp,))]
+        text("SELECT s.skill_type_id, t.name "
+             "FROM sde_blueprint_skills s"
+             " JOIN sde_types t ON t.type_id = s.skill_type_id "
+             "WHERE s.blueprint_type_id = :bp AND s.activity = 'invention'"),
+        {"bp": t1_bp})]
 
     encryption_id, science_ids = _classify_skills(conn, skills, datacores)
 
@@ -185,7 +195,7 @@ def find_recipe(conn: sqlite3.Connection, product_type_id: int) -> InventionReci
     )
 
 
-def _classify_skills(conn: sqlite3.Connection,
+def _classify_skills(conn: Connection,
                      skills: list[tuple[int, str]],
                      datacores: list[tuple[int, str, int]]
                      ) -> tuple[int | None, list[int]]:
@@ -216,12 +226,13 @@ def _classify_skills(conn: sqlite3.Connection,
     science_ids: list[int] = []
     if ids:
         try:
-            placeholders = ",".join("?" * len(ids))
             science_ids = [r[0] for r in conn.execute(
-                f"SELECT skill_type_id FROM sde_datacore_skills "
-                f"WHERE type_id IN ({placeholders})", ids)]
-        except sqlite3.OperationalError:
-            science_ids = []             # SDE predates the link table
+                text("SELECT skill_type_id FROM sde_datacore_skills"
+                     " WHERE type_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": list(ids)})]
+        except _NO_SUCH_TABLE:
+            science_ids = _table_missing(conn)   # SDE predates the link table
 
     # Deliberately NOT intersected with the blueprint's own skill list. Those
     # two disagree: Multispectrum Coating II consumes Molecular Engineering
@@ -282,7 +293,7 @@ def compute_cost(
     return cost
 
 
-def invention_material_ids(conn: sqlite3.Connection) -> set[int]:
+def invention_material_ids(conn: Connection) -> set[int]:
     """Every type consumed by an invention job — i.e. every datacore.
 
     The resolver charges invention at any node in a tree, so it cannot know
@@ -293,31 +304,34 @@ def invention_material_ids(conn: sqlite3.Connection) -> set[int]:
     """
     try:
         return {int(r[0]) for r in conn.execute(
-            "SELECT DISTINCT material_type_id FROM sde_blueprint_materials "
-            "WHERE activity='invention'")}
-    except sqlite3.OperationalError:
-        return set()                     # SDE predates the invention activity
+            text("SELECT DISTINCT material_type_id FROM sde_blueprint_materials "
+                 "WHERE activity = 'invention'"))}
+    except _NO_SUCH_TABLE:
+        return set(_table_missing(conn))  # SDE predates the invention activity
 
 
-def load_decryptor(conn: sqlite3.Connection, type_id: int) -> Decryptor | None:
+def load_decryptor(conn: Connection, type_id: int) -> Decryptor | None:
     if not type_id:
         return None
     try:
         row = conn.execute(
-            "SELECT type_id, name, probability_mult, me_modifier, te_modifier, "
-            "run_modifier FROM sde_decryptors WHERE type_id=?", (type_id,)).fetchone()
-    except sqlite3.OperationalError:
+            text("SELECT type_id, name, probability_mult, me_modifier, te_modifier,"
+                 " run_modifier FROM sde_decryptors WHERE type_id = :tid"),
+            {"tid": type_id}).fetchone()
+    except _NO_SUCH_TABLE:
+        _table_missing(conn)
         return None                      # SDE predates the decryptor table
     return Decryptor(*row) if row else None
 
 
-def list_decryptors(conn: sqlite3.Connection) -> list[Decryptor]:
+def list_decryptors(conn: Connection) -> list[Decryptor]:
     """Every decryptor, best probability first. Empty on an older SDE."""
     try:
         rows = conn.execute(
-            "SELECT type_id, name, probability_mult, me_modifier, te_modifier, "
-            "run_modifier FROM sde_decryptors ORDER BY probability_mult DESC, name"
+            text("SELECT type_id, name, probability_mult, me_modifier, te_modifier,"
+                 " run_modifier FROM sde_decryptors"
+                 " ORDER BY probability_mult DESC, name")
         ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    except _NO_SUCH_TABLE:
+        return _table_missing(conn)
     return [Decryptor(*r) for r in rows]

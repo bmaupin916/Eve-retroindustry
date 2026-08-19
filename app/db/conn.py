@@ -31,7 +31,11 @@ from __future__ import annotations
 
 import sqlite3
 
-from sqlalchemy import event, text
+import os
+from functools import lru_cache
+
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.pool import NullPool
 
@@ -59,6 +63,30 @@ def _configure_sqlite(dbapi_conn, _record) -> None:
         pass
     finally:
         cur.close()
+
+
+#: "That table is not in this database." SQLite raises OperationalError ("no
+#: such table"); Postgres raises ProgrammingError (UndefinedTable). Code that
+#: catches the *driver's* exception class keeps working right up until the
+#: driver changes, and then fails silently — the fallback simply stops running.
+NO_SUCH_TABLE = (OperationalError, ProgrammingError)
+
+
+def recover_from_missing_table(conn: Connection) -> list:
+    """Roll back after a missing-table error and return the empty answer.
+
+    The rollback is not tidiness. Postgres aborts the entire transaction on any
+    failed statement and refuses every later one with InFailedSqlTransaction
+    until it is rolled back. So the `try/except: return []` idiom — which this
+    codebase uses in a dozen places to tolerate an older SDE — works perfectly
+    on SQLite and leaves the connection unusable on Postgres, with the damage
+    appearing in whatever unrelated query happens to run next.
+    """
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    return []
 
 
 def engine(url: str | None = None) -> Engine:
@@ -105,6 +133,30 @@ def connect(url: str | None = None) -> Connection:
     isolation mode commits some statements for you.
     """
     return engine(url).connect()
+
+
+@lru_cache(maxsize=8)
+def _engine_for_path(db_path: str) -> Engine:
+    engine = create_engine(f"sqlite:///{os.path.abspath(db_path)}", poolclass=NullPool)
+    event.listen(engine, "connect", _configure_sqlite)
+    return engine
+
+
+def connect_to_path(db_path: str) -> Connection:
+    """A connection to *this* database file, not the configured one.
+
+    For the call sites that are handed an explicit path — the BOM resolver's
+    callers, which take `db_path` precisely so the caller decides which
+    database. Routing them through `connect()` instead would quietly ignore the
+    argument and open whatever `EVE_DATABASE_URL`/`EVE_APP_DIR` happens to say,
+    which is correct in the app and wrong in every test that builds a
+    throwaway database in a tmp directory.
+
+    Engines are cached per path because an Engine owns a pool; NullPool keeps
+    the old one-connection-per-call behaviour so nothing holds a file handle
+    open between calls.
+    """
+    return _engine_for_path(db_path).connect()
 
 
 def dispose() -> None:

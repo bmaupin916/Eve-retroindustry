@@ -37,6 +37,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import sqlite3
 
+def _sde_conn(db_path: str):
+    """A portable connection for the parts already converted.
+
+    `BOMResolver` and `app.manufacturing.invention` take a SQLAlchemy
+    Connection now; everything else in this module still speaks sqlite3 through
+    the `conn` it is handed. Both open the same database and see each other's
+    committed writes, which is exactly the property that lets the query
+    conversion proceed one module at a time. This helper disappears when this
+    module is converted and its caller passes the connection in.
+    """
+    from app.db.conn import connect_to_path
+    return connect_to_path(db_path)
+
+
 from app.bom.resolver import (
     BOMResolver, InventionParams, StationFacility, total_invention_cost,
 )
@@ -268,11 +282,13 @@ def compute_margin(
     adjusted = get_adjusted_prices_cached(conn)
 
     inv_params, inv_warnings = (
-        inv if inv is not None else build_invention_params(conn, defaults, basis))
+        inv if inv is not None else build_invention_params(
+            conn, defaults, basis, db_path))
     row.unpriced.extend(inv_warnings)
 
+    sde = _sde_conn(db_path)
     resolver = BOMResolver(
-        db_path,
+        sde,
         blueprints=blueprints or [],
         runs_per_job=None,                # one batched job — this is a rate, not a job queue
         adjusted_prices=adjusted,
@@ -340,11 +356,11 @@ def compute_margin(
         row.day_volume = _avg_day_volume(conn, type_id)
         return row
     finally:
-        resolver.close()
+        sde.close()
 
 
 def build_invention_params(conn: sqlite3.Connection, defaults: dict,
-                           basis: str) -> tuple[InventionParams | None, list[str]]:
+                           basis: str, db_path: str) -> tuple[InventionParams | None, list[str]]:
     """Invention settings for the resolver, plus anything left unpriced.
 
     Public because `/plan` needs the identical thing. It lives here rather than
@@ -371,10 +387,13 @@ def build_invention_params(conn: sqlite3.Connection, defaults: dict,
     if not int(defaults.get("invent_t2", 1) or 0):
         return None, []
 
-    decryptor = invention_mod.load_decryptor(
-        conn, int(defaults.get("decryptor_type_id") or 0))
-
-    wanted = invention_mod.invention_material_ids(conn)
+    sde = _sde_conn(db_path)
+    try:
+        decryptor = invention_mod.load_decryptor(
+            sde, int(defaults.get("decryptor_type_id") or 0))
+        wanted = invention_mod.invention_material_ids(sde)
+    finally:
+        sde.close()
     if decryptor:
         wanted.add(decryptor.type_id)
     cached = _cached_prices(conn, wanted)

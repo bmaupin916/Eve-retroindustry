@@ -516,10 +516,12 @@ async def plan_result(
         # tree contains, so their per-run times can be turned into per-product
         # job splits. Skipped entirely when splitting is off (the default), so
         # an unconfigured install pays nothing for it.
+        from app.db.conn import connect_to_path
+        sde_conn = connect_to_path(database_path())       # for the converted BOMResolver
         _max_job_days = float(app_defaults.get_defaults(conn).get("max_job_days") or 0)
         _job_splits: dict[int, int] = {}
         if _max_job_days > 0:
-            probe = BOMResolver(database_path(), blueprints=blueprints, runs_per_job=rpj_int)
+            probe = BOMResolver(sde_conn, blueprints=blueprints, runs_per_job=rpj_int)
             try:
                 _job_splits = _derive_job_splits(
                     conn,
@@ -531,28 +533,28 @@ async def plan_result(
                     char_skills=char_skills,
                 )
             finally:
-                probe.close()
+                pass
 
         # Invention: a T2 item needs an invented BPC, and until v0.9.29 this page
         # charged nothing for it — not on nested components and not even on the
         # product itself, since only the margin tracker ever called that code.
         # Same builder the tracker uses, so the two pages price datacores alike.
         inv_params, inv_warnings = build_invention_params(
-            conn, app_defaults.get_defaults(conn), input_basis)
+            conn, app_defaults.get_defaults(conn), input_basis, database_path())
 
         # Pass 2 — the real resolve, with the splits applied. ME rounds once per
         # job, so the splits reach the material totals here and in build_plan
         # below; both resolutions must use them or the two views disagree.
         # The resolver gets all of the character's blueprints → per-product ME is
         # looked up for each intermediate step (Capital Armor Plates ME may differ from root ME).
-        resolver = BOMResolver(database_path(), blueprints=blueprints, runs_per_job=rpj_int,
+        resolver = BOMResolver(sde_conn, blueprints=blueprints, runs_per_job=rpj_int,
                                adjusted_prices=adj_prices, rate_mfg=rate_mfg, rate_rxn=rate_rxn,
                                runs_per_job_by_product=_job_splits,
                                invention=inv_params)
         root = resolver.resolve(type_id, qty, me=me,
                                 mfg_facility=mfg_facility,
                                 rxn_facility=rxn_facility)
-        resolver.close()
+        sde_conn.close()
 
         all_ids = list(set(_collect_type_ids(root) + [type_id]))
         prices = await get_prices_for_ids(conn, all_ids)

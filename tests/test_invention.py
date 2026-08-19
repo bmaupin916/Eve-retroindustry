@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 
 import pytest
+from sqlalchemy import text
 
 from app.bom.resolver import BOMResolver, InventionParams, total_invention_cost
 from app.manufacturing import invention as inv
@@ -37,9 +38,19 @@ def sde_path(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def sde(sde_path):
-    conn = sqlite3.connect(sde_path)
+    """A SQLAlchemy connection: `invention` and `BOMResolver` are converted.
+
+    It used to be `sqlite3.connect(sde_path)`. Both modules now speak the
+    portable query layer, so a raw DBAPI connection here would test a
+    combination that no longer exists in the app.
+    """
+    from sqlalchemy import create_engine
+
+    engine = create_engine(f"sqlite:///{sde_path}")
+    conn = engine.connect()
     yield conn
     conn.close()
+    engine.dispose()
 
 
 # ── the formula ────────────────────────────────────────────────────────────
@@ -118,10 +129,10 @@ def test_a_datacore_with_no_dogma_record_still_resolves(sde):
 def test_every_invented_product_resolves_two_science_skills(sde):
     """The property that caught two separate bugs. If this regresses, some
     class of item is being quietly underrated."""
-    products = [r[0] for r in sde.execute(
+    products = [r[0] for r in sde.execute(text(
         "SELECT DISTINCT p.product_type_id FROM sde_blueprint_products p "
         "WHERE p.activity='manufacturing' AND p.blueprint_type_id IN "
-        "(SELECT product_type_id FROM sde_blueprint_products WHERE activity='invention')")]
+        "(SELECT product_type_id FROM sde_blueprint_products WHERE activity='invention')"))]
     assert len(products) > 1000
     short = [p for p in products
              if len((inv.find_recipe(sde, p) or inv.InventionRecipe(0, 0, 0, 0, 0)).science_skill_ids) != 2]
@@ -222,19 +233,18 @@ def _all_priced(conn, **kw) -> InventionParams:
         science_level=5, encryption_level=5, **kw)
 
 
-def _resolve(db_path, type_id, quantity=1, invention=None):
-    resolver = BOMResolver(db_path, runs_per_job=None, invention=invention)
-    try:
-        return resolver.resolve(type_id, quantity), list(resolver.invention_unpriced)
-    finally:
-        resolver.close()
+def _resolve(conn, type_id, quantity=1, invention=None):
+    """Takes a connection now, not a path — the resolver borrows rather than
+    opens, so the caller decides what database it is talking to."""
+    resolver = BOMResolver(conn, runs_per_job=None, invention=invention)
+    return resolver.resolve(type_id, quantity), list(resolver.invention_unpriced)
 
 
-def test_the_root_of_a_t2_build_is_charged_at_all(sde_path, sde):
+def test_the_root_of_a_t2_build_is_charged_at_all(sde):
     """The `/plan` half of the bug. Nothing here is subtle: a T2 module's
     blueprint had to be invented, and the planner charged zero for it."""
-    free, _ = _resolve(sde_path, DAMAGE_CONTROL_II)
-    charged, _ = _resolve(sde_path, DAMAGE_CONTROL_II, invention=_all_priced(sde))
+    free, _ = _resolve(sde, DAMAGE_CONTROL_II)
+    charged, _ = _resolve(sde, DAMAGE_CONTROL_II, invention=_all_priced(sde))
 
     assert free.invention_cost == 0.0            # no params → not modelled
     assert charged.invention_cost > 0.0
@@ -242,26 +252,26 @@ def test_the_root_of_a_t2_build_is_charged_at_all(sde_path, sde):
     assert charged.invention_runs == 10
 
 
-def test_a_manufactured_t1_product_is_never_charged(sde_path, sde):
+def test_a_manufactured_t1_product_is_never_charged(sde):
     """`find_recipe` returning None has to stay distinguishable from zero.
 
     The product is discovered rather than hardcoded: any type with a
     manufacturing blueprint and no invention recipe will do, and picking it from
     the data means the test cannot be pinned to an id that gets retired.
     """
-    t1 = [r[0] for r in sde.execute("""
+    t1 = [r[0] for r in sde.execute(text("""
         SELECT product_type_id FROM sde_blueprint_products
         WHERE activity='manufacturing' AND blueprint_type_id NOT IN
           (SELECT product_type_id FROM sde_blueprint_products WHERE activity='invention')
         ORDER BY product_type_id LIMIT 15
-    """)]
+    """))]
     assert t1
     for type_id in t1:
-        node, _ = _resolve(sde_path, type_id, invention=_all_priced(sde))
+        node, _ = _resolve(sde, type_id, invention=_all_priced(sde))
         assert total_invention_cost(node) == 0.0, f"charged invention on T1 {type_id}"
 
 
-def test_the_charge_matches_the_cost_model_and_scales_with_quantity(sde_path, sde):
+def test_the_charge_matches_the_cost_model_and_scales_with_quantity(sde):
     """The node holds per_unit × quantity — the amortised view, so 3 runs off a
     10-run BPC is charged 3/10 of it and the rest keeps its value."""
     recipe = inv.find_recipe(sde, DAMAGE_CONTROL_II)
@@ -269,14 +279,14 @@ def test_the_charge_matches_the_cost_model_and_scales_with_quantity(sde_path, sd
         recipe, {t: DATACORE_PRICE for t, _n, _q in recipe.datacores},
         _levels(recipe)).per_unit
 
-    one, _ = _resolve(sde_path, DAMAGE_CONTROL_II, 1, _all_priced(sde))
-    seven, _ = _resolve(sde_path, DAMAGE_CONTROL_II, 7, _all_priced(sde))
+    one, _ = _resolve(sde, DAMAGE_CONTROL_II, 1, _all_priced(sde))
+    seven, _ = _resolve(sde, DAMAGE_CONTROL_II, 7, _all_priced(sde))
 
     assert one.invention_cost == pytest.approx(expected)
     assert seven.invention_cost == pytest.approx(expected * 7)
 
 
-def test_a_nested_t2_component_is_charged_too(sde_path, sde):
+def test_a_nested_t2_component_is_charged_too(sde):
     """The `/margins` half of the bug, and the reason this moved into the
     resolver. The affected set is real but narrower than the design doc claimed:
     130 products have an invented item in their BOM, and none of them is a
@@ -284,7 +294,7 @@ def test_a_nested_t2_component_is_charged_too(sde_path, sde):
     ('Augmented' drones from T2 drones, Kronos Police Edition from a Kronos).
     Capital components are T1 blueprints, so a capital tree meets no invention.
     """
-    parents = [r[0] for r in sde.execute("""
+    parents = [r[0] for r in sde.execute(text("""
         WITH invented_bp AS (
           SELECT DISTINCT product_type_id AS bp_id
           FROM sde_blueprint_products WHERE activity='invention'),
@@ -300,7 +310,7 @@ def test_a_nested_t2_component_is_charged_too(sde_path, sde):
         WHERE m.activity='manufacturing'
           AND m.material_type_id IN (SELECT pid FROM invented_product)
           AND pp.product_type_id NOT IN (SELECT pid FROM invented_product)
-    """)]
+    """))]
     # Not asserted as exactly 130: an SDE update may add or retire a variant.
     # Zero, though, would mean the query stopped describing anything real.
     assert len(parents) > 50
@@ -309,24 +319,24 @@ def test_a_nested_t2_component_is_charged_too(sde_path, sde):
     # dominate the suite's runtime for no extra confidence.
     sample = sorted(parents)[:20]
     charged = [p for p in sample
-               if total_invention_cost(_resolve(sde_path, p, 1, _all_priced(sde))[0]) > 0]
+               if total_invention_cost(_resolve(sde, p, 1, _all_priced(sde))[0]) > 0]
     # Every one of them contains an invented component by construction, so every
     # one must now carry a cost — and each is itself not invented, so the cost
     # can only have come from inside the tree.
     assert charged == sample
 
 
-def test_an_unpriced_datacore_surfaces_on_the_resolver(sde_path):
+def test_an_unpriced_datacore_surfaces_on_the_resolver(sde):
     """Cost understated rather than wrong is only acceptable if it is *said*.
     Empty prices means every datacore is unpriced, and none is counted as free."""
     node, unpriced = _resolve(
-        sde_path, DAMAGE_CONTROL_II, 1,
+        sde, DAMAGE_CONTROL_II, 1,
         InventionParams(prices={}, science_level=5, encryption_level=5))
     assert unpriced                              # named, for the UI to show
     assert node.invention_cost == 0.0            # not silently invented for free
 
 
-def test_make_vs_buy_counts_the_blueprint_on_the_make_side(sde_path, sde):
+def test_make_vs_buy_counts_the_blueprint_on_the_make_side(sde):
     """`optimize` already added job_fee for this reason: a make cost missing a
     real term over-selects "make". A bought T2 component carries someone else's
     invention in its price, so the comparison is only fair if ours is on the make
@@ -337,8 +347,8 @@ def test_make_vs_buy_counts_the_blueprint_on_the_make_side(sde_path, sde):
     """
     from app.bom.optimizer import optimize
 
-    free, _ = _resolve(sde_path, DAMAGE_CONTROL_II, 1)
-    charged, _ = _resolve(sde_path, DAMAGE_CONTROL_II, 1, _all_priced(sde))
+    free, _ = _resolve(sde, DAMAGE_CONTROL_II, 1)
+    charged, _ = _resolve(sde, DAMAGE_CONTROL_II, 1, _all_priced(sde))
     assert total_invention_cost(charged) > 0.0
 
     # Every input at 10 ISK; the product itself priced out of reach so "make"

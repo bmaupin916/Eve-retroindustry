@@ -166,7 +166,7 @@ def build_view_model(conn: sqlite3.Connection, db_path: str,
     # Hoisted for the same reason as ctx: the datacore price lookup is identical
     # for every row, and a watchlist prices dozens of them.
     inv = build_invention_params(
-        conn, defaults, str(defaults.get("input_basis") or "sell"))
+        conn, defaults, str(defaults.get("input_basis") or "sell"), db_path)
 
     for item in items:
         row = compute_margin(conn, db_path, item["type_id"], item["me"], item["te"],

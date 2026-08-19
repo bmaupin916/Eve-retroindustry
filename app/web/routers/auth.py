@@ -485,7 +485,10 @@ async def settings_page(request: Request):
         # Only the eight canonical decryptors: the faction-flavoured duplicates
         # and the ancient-relic ones behave identically or belong to reverse
         # engineering, and 64 entries would make the picker unusable.
-        decryptors = [d for d in invention.list_decryptors(conn)
+        from app.db.conn import connect
+        with connect() as _sde:
+            _decs = invention.list_decryptors(_sde)
+        decryptors = [d for d in _decs
                       if d.name.endswith("Decryptor")]
     finally:
         conn.close()

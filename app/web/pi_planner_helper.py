@@ -450,7 +450,9 @@ def build_view_model(
             return view
 
         type_id, name = row["type_id"], row["name"]
-        bom = BOMResolver(db_path, runs_per_job=None)
+        from app.db.conn import connect_to_path
+        sde = connect_to_path(db_path)                 # for the converted BOMResolver
+        bom = BOMResolver(sde, runs_per_job=None)
         blueprint = bom.find_blueprint(type_id)
         is_pi = pi.is_pi_commodity(type_id)
         view["show_me"] = blueprint is not None
@@ -530,5 +532,5 @@ def build_view_model(
         return view
     finally:
         if bom is not None:
-            bom.close()
+            sde.close()
         pi.close()

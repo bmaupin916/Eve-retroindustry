@@ -12,6 +12,8 @@ import os
 
 import pytest
 
+from app.db.conn import connect_to_path
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SDE = os.path.join(REPO, "sde_base.db")
 
@@ -22,7 +24,7 @@ MORPHITE = 11399
 @pytest.fixture
 def resolver():
     from app.bom.resolver import BOMResolver
-    r = BOMResolver(SDE)
+    r = BOMResolver(connect_to_path(SDE))
     yield r
     r.close()
 
@@ -61,7 +63,7 @@ def test_per_product_split_overrides_the_global_one():
     resolver has to accept a map rather than one number for the whole tree."""
     from app.bom.resolver import BOMResolver
 
-    r = BOMResolver(SDE, runs_per_job=None, runs_per_job_by_product={WASP_II: 1})
+    r = BOMResolver(connect_to_path(SDE), runs_per_job=None, runs_per_job_by_product={WASP_II: 1})
     try:
         assert r._runs_per_job_for(WASP_II) == 1        # the override
         assert r._runs_per_job_for(MORPHITE) is None    # falls back to global
@@ -74,7 +76,7 @@ def test_per_product_split_changes_material_totals():
     from app.bom.resolver import BOMResolver
 
     def morphite(by_product):
-        r = BOMResolver(SDE, runs_per_job=None, runs_per_job_by_product=by_product)
+        r = BOMResolver(connect_to_path(SDE), runs_per_job=None, runs_per_job_by_product=by_product)
         try:
             node = r.resolve(WASP_II, 10 * 5000, me=7)
             return next((q for t, (_n, q) in node.aggregate_leaves().items()
@@ -92,8 +94,8 @@ def test_absent_map_leaves_behaviour_identical():
     """The margin tracker constructs BOMResolver without the new argument."""
     from app.bom.resolver import BOMResolver
 
-    plain = BOMResolver(SDE, runs_per_job=None)
-    mapped = BOMResolver(SDE, runs_per_job=None, runs_per_job_by_product={})
+    plain = BOMResolver(connect_to_path(SDE), runs_per_job=None)
+    mapped = BOMResolver(connect_to_path(SDE), runs_per_job=None, runs_per_job_by_product={})
     try:
         a = plain.resolve(WASP_II, 5000, me=7).aggregate_leaves()
         b = mapped.resolve(WASP_II, 5000, me=7).aggregate_leaves()

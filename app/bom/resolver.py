@@ -10,7 +10,9 @@ Leaf node = a type with no blueprint in the SDE (minerals, PI, moon goo, ...)
 from __future__ import annotations
 from dataclasses import dataclass, field
 from math import ceil
-import sqlite3
+
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 
 from app.character.blueprints import CharBlueprint
 from app.manufacturing import invention as invention_mod
@@ -19,6 +21,27 @@ from app.manufacturing.invention import Decryptor
 # Sentinel for "cache miss" — `None` is a valid stored value (no group for the
 # given type_id), so we need a separate marker.
 _MISSING = object()
+
+#: Blueprint names CCP ships in the SDE that are not real blueprints — test
+#: fixtures, QA items and tournament prizes. Several make the same product as a
+#: real blueprint with different numbers, so picking one silently changes a
+#: costing. Tungsten Carbide is the known case and has its own test.
+#:
+#: **Case-sensitive on purpose, and matched in Python for that reason.** The
+#: SQL version used `NOT GLOB`, which is SQLite-only; `LIKE` cannot replace it
+#: because SQLite's LIKE ignores case and Postgres's does not, so the same
+#: spelling means two different things — and the case-insensitive reading
+#: throws away real items ("Protest ...", anything containing "quality").
+_INTERNAL_PREFIXES = ("Test ", "Tournament ", "QA ")
+_INTERNAL_INFIXES = (" TEST ",)
+_INTERNAL_SUFFIXES = (" TEST Blueprint",)
+
+
+def is_internal_blueprint_name(name: str) -> bool:
+    """True for a developer-internal blueprint that must never be costed."""
+    return (name.startswith(_INTERNAL_PREFIXES)
+            or any(part in name for part in _INTERNAL_INFIXES)
+            or name.endswith(_INTERNAL_SUFFIXES))
 
 
 @dataclass(frozen=True)
@@ -110,9 +133,18 @@ def total_invention_cost(node: BOMNode) -> float:
 
 
 class BOMResolver:
+    #: Rows leave this class as plain dicts, never as driver rows.
+    #:
+    #: Callers in five modules read them by string key (`blueprint["product_qty"]`,
+    #: `mat["material_type_id"]`). `sqlite3.Row` supports that and SQLAlchemy's
+    #: `Row` does not — it takes attribute access or `._mapping`. Converting here
+    #: rather than at fifteen call sites is not just less work: a resolver whose
+    #: return type is the DBAPI's row type makes the driver part of its public
+    #: interface, which is the second abstraction `app/db/conn.py` exists to
+    #: avoid having.
     def __init__(
         self,
-        db_path: str,
+        conn: Connection,
         blueprints: list[CharBlueprint] | None = None,
         runs_per_job: int | None = 1,
         adjusted_prices: dict[int, float] | None = None,
@@ -121,8 +153,11 @@ class BOMResolver:
         runs_per_job_by_product: dict[int, int] | None = None,
         invention: InventionParams | None = None,
     ):
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
+        # Borrowed, not owned. It used to open its own `sqlite3.connect(db_path)`,
+        # which meant `build_plan` held two connections to one file for one plan
+        # and nothing outside could put the resolver's reads in the same
+        # transaction as anything else. The caller opens and closes it now.
+        self.conn = conn
         # Per-job install-fee inputs (optional). When adjusted_prices is given,
         # each node gets job_fee = EIV × rate, where EIV = Σ(adjusted_price ×
         # BASE material qty × runs) — the same Fenris Creations formula used for the displayed
@@ -150,8 +185,8 @@ class BOMResolver:
         # repeating the same DB lookups for the same type_id (Wasp I appears
         # in every Wasp II run, Tungsten Carbide reaction repeats across
         # branches…) is pure waste.
-        self._bp_cache: dict[int, sqlite3.Row | None] = {}
-        self._mat_cache: dict[tuple[int, str], list[sqlite3.Row]] = {}
+        self._bp_cache: dict[int, dict | None] = {}
+        self._mat_cache: dict[tuple[int, str], list[dict]] = {}
         self._name_cache: dict[int, str] = {}
         # type_id → group_id (for rig_applies_to_product fast-path)
         self._type_group_cache: dict[int, int | None] = {}
@@ -172,7 +207,16 @@ class BOMResolver:
             self._build_bp_index(blueprints)
 
     def close(self):
-        self.conn.close()
+        """Kept, and deliberately does nothing.
+
+        The connection is the caller's now. This stays because seven call sites
+        used to close the resolver, and the alternative — deleting the method —
+        turns each of them into an AttributeError at runtime rather than a
+        compile-time complaint. They are updated in this commit; this is here so
+        a missed one is harmless instead of a 500, and so a future caller that
+        assumes ownership finds the answer here rather than closing a connection
+        somebody else is still using.
+        """
 
     def _runs_per_job_for(self, type_id: int) -> int | None:
         """Runs per job for one product: its own limit, else the global one."""
@@ -184,9 +228,10 @@ class BOMResolver:
         if cached is not _MISSING:
             return cached  # type: ignore[return-value]
         row = self.conn.execute(
-            "SELECT group_id FROM sde_types WHERE type_id=?", (type_id,)
+            text("SELECT group_id FROM sde_types WHERE type_id = :tid"),
+            {"tid": type_id},
         ).fetchone()
-        gid = row["group_id"] if row else None
+        gid = row.group_id if row else None
         self._type_group_cache[type_id] = gid
         return gid
 
@@ -195,9 +240,10 @@ class BOMResolver:
         if cached is not _MISSING:
             return cached  # type: ignore[return-value]
         row = self.conn.execute(
-            "SELECT group_id FROM sde_types WHERE type_id=?", (rig_type_id,)
+            text("SELECT group_id FROM sde_types WHERE type_id = :tid"),
+            {"tid": rig_type_id},
         ).fetchone()
-        gid = row["group_id"] if row else None
+        gid = row.group_id if row else None
         self._rig_group_cache[rig_type_id] = gid
         return gid
 
@@ -223,15 +269,18 @@ class BOMResolver:
         bp_type_ids = list({bp.type_id for bp in blueprints})
         if not bp_type_ids:
             return
-        ph = ",".join("?" * len(bp_type_ids))
+        # Expanding bindparam rather than a hand-built placeholder string: the
+        # driver decides its own placeholder style, which is the whole point.
         rows = self.conn.execute(
-            f"""SELECT blueprint_type_id, product_type_id
-                FROM sde_blueprint_products
-                WHERE blueprint_type_id IN ({ph})
-                  AND activity IN ('manufacturing','reaction')""",
-            bp_type_ids,
+            text("""SELECT blueprint_type_id, product_type_id
+                    FROM sde_blueprint_products
+                    WHERE blueprint_type_id IN :bp_ids
+                      AND activity IN ('manufacturing','reaction')""")
+            .bindparams(bindparam("bp_ids", expanding=True)),
+            {"bp_ids": list(bp_type_ids)},
         ).fetchall()
-        product_by_bp: dict[int, int] = {r["blueprint_type_id"]: r["product_type_id"] for r in rows}
+        product_by_bp: dict[int, int] = {
+            r.blueprint_type_id: r.product_type_id for r in rows}
 
         best: dict[int, tuple[int, int]] = {}  # product → (priority, me)
         # priority: BPO = 0 (better), BPC = 1; lower wins
@@ -250,13 +299,14 @@ class BOMResolver:
         if cached is not None:
             return cached
         row = self.conn.execute(
-            "SELECT name FROM sde_types WHERE type_id=?", (type_id,)
+            text("SELECT name FROM sde_types WHERE type_id = :tid"),
+            {"tid": type_id},
         ).fetchone()
-        name = row["name"] if row else f"Unknown ({type_id})"
+        name = row.name if row else f"Unknown ({type_id})"
         self._name_cache[type_id] = name
         return name
 
-    def find_blueprint(self, product_type_id: int) -> sqlite3.Row | None:
+    def find_blueprint(self, product_type_id: int) -> dict | None:
         """Finds the blueprint that produces the given type (manufacturing or reaction).
 
         Selection rules — resolves cases where the SDE carries several recipes for the same product:
@@ -273,41 +323,59 @@ class BOMResolver:
         cached = self._bp_cache.get(product_type_id, _MISSING)
         if cached is not _MISSING:
             return cached  # type: ignore[return-value]
-        # GLOB is case-sensitive in SQLite (LIKE is not, so 'Protest' would
-        # match '%TEST%'). Patterns target only the known developer-internal BP
-        # naming conventions.
-        row = self.conn.execute("""
+        # The developer-internal blueprints are excluded in Python, not in SQL.
+        #
+        # This used to be five `NOT GLOB` clauses. GLOB is SQLite-only, and the
+        # obvious swap does not work either: the reason for GLOB is that it is
+        # case-*sensitive* while SQLite's LIKE is not, so `NOT LIKE '%TEST%'`
+        # would also throw away "Protest". Postgres LIKE *is* case-sensitive, so
+        # one spelling cannot mean the same thing on both. Filtering here is the
+        # only version that is identical on every backend — and the predicate
+        # becomes something a test can call directly.
+        #
+        # The ordering moves with it: candidates per product are one or two, so
+        # sorting a short list costs nothing and keeps the tie-break rule
+        # (largest yield, then highest blueprint id) in one readable place.
+        rows = self.conn.execute(
+            text("""
             SELECT p.blueprint_type_id, p.quantity AS product_qty, p.activity,
-                   b.manufacturing_time, b.reaction_time
+                   b.manufacturing_time, b.reaction_time, t.name AS bp_name
             FROM sde_blueprint_products p
             JOIN sde_blueprints b ON b.blueprint_type_id = p.blueprint_type_id
             JOIN sde_types t ON t.type_id = p.blueprint_type_id
-            WHERE p.product_type_id = ?
+            WHERE p.product_type_id = :pid
               AND p.activity IN ('manufacturing', 'reaction')
-              AND t.name NOT GLOB 'Test *'
-              AND t.name NOT GLOB '* TEST *'
-              AND t.name NOT GLOB '* TEST Blueprint'
-              AND t.name NOT GLOB 'Tournament *'
-              AND t.name NOT GLOB 'QA *'
-            ORDER BY p.quantity DESC, p.blueprint_type_id DESC
-            LIMIT 1
-        """, (product_type_id,)).fetchone()
+            """),
+            {"pid": product_type_id},
+        ).fetchall()
+
+        usable = [dict(r._mapping) for r in rows
+                  if not is_internal_blueprint_name(r.bp_name or "")]
+        usable.sort(key=lambda r: (r["product_qty"] or 0, r["blueprint_type_id"]),
+                    reverse=True)
+        row = usable[0] if usable else None
+        if row is not None:
+            row.pop("bp_name", None)
         self._bp_cache[product_type_id] = row
         return row
 
-    def get_materials(self, blueprint_type_id: int, activity: str) -> list[sqlite3.Row]:
+    def get_materials(self, blueprint_type_id: int, activity: str) -> list[dict]:
         key = (blueprint_type_id, activity)
         cached = self._mat_cache.get(key)
         if cached is not None:
             return cached
-        rows = self.conn.execute("""
+        rows = self.conn.execute(
+            text("""
             SELECT m.material_type_id, m.quantity, t.name
             FROM sde_blueprint_materials m
             JOIN sde_types t ON t.type_id = m.material_type_id
-            WHERE m.blueprint_type_id = ? AND m.activity = ?
-        """, (blueprint_type_id, activity)).fetchall()
-        self._mat_cache[key] = rows
-        return rows
+            WHERE m.blueprint_type_id = :bp AND m.activity = :activity
+            """),
+            {"bp": blueprint_type_id, "activity": activity},
+        ).fetchall()
+        materials = [dict(r._mapping) for r in rows]
+        self._mat_cache[key] = materials
+        return materials
 
     def _product_facility_multiplier(
         self,

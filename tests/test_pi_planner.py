@@ -10,6 +10,8 @@ import sqlite3
 
 import pytest
 
+from app.db.conn import connect_to_path
+
 from app.planetary.planet_data import single_planet_types
 from app.web.routers import planets as planets_router
 from app.planetary.schematics import PIResolver, split_pi_leaves, whole_units
@@ -134,7 +136,7 @@ def test_fuel_block_handoff():
     """
     from app.bom.resolver import BOMResolver
 
-    bom = BOMResolver(SDE)
+    bom = BOMResolver(connect_to_path(SDE))
     pi = PIResolver(SDE)
     try:
         leaves = bom.resolve(NITROGEN_FUEL_BLOCK, 40, me=10).aggregate_leaves()
@@ -180,7 +182,7 @@ def test_fuel_block_golden():
     """
     from app.bom.resolver import BOMResolver
 
-    bom = BOMResolver(SDE, runs_per_job=None)   # one batched job = exact ME
+    bom = BOMResolver(connect_to_path(SDE), runs_per_job=None)   # one batched job = exact ME
     pi = PIResolver(SDE)
     try:
         # 1,250 runs of 40 blocks = 50,000/week → 178.57 runs/day.
@@ -230,7 +232,7 @@ def test_fuel_block_colonies():
     from app.bom.resolver import BOMResolver
     from app.planetary.colonies import plan_colonies
 
-    bom = BOMResolver(SDE, runs_per_job=None)
+    bom = BOMResolver(connect_to_path(SDE), runs_per_job=None)
     pi = PIResolver(SDE)
     try:
         leaves = bom.resolve(NITROGEN_FUEL_BLOCK, 50_000, me=10).aggregate_leaves()
