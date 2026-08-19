@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.web import security
+from app.web.routers import auth as auth_router
 from tests.conftest import OWNER_CHARACTER_ID
 
 OTHER_CHARACTER_ID = 900000002
@@ -285,7 +286,7 @@ def test_the_callback_issues_a_session(app_module, monkeypatch):
 
     monkeypatch.setattr(esi_oauth, "complete_login",
                         lambda code, state: (OWNER_CHARACTER_ID, "Test Pilot Alpha"))
-    monkeypatch.setattr(app_module, "complete_login",
+    monkeypatch.setattr(auth_router, "complete_login",
                         lambda code, state: (OWNER_CHARACTER_ID, "Test Pilot Alpha"))
 
     c = TestClient(app_module.app)
@@ -296,7 +297,7 @@ def test_the_callback_issues_a_session(app_module, monkeypatch):
 
 
 def test_a_non_owner_gets_no_session_from_the_callback(app_module, monkeypatch):
-    monkeypatch.setattr(app_module, "complete_login",
+    monkeypatch.setattr(auth_router, "complete_login",
                         lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
 
     c = TestClient(app_module.app)
@@ -311,7 +312,7 @@ def test_a_failed_login_sets_no_session(app_module, monkeypatch):
     def _fail(code, state):
         raise LoginError("This login has expired, or was not started here.")
 
-    monkeypatch.setattr(app_module, "complete_login", _fail)
+    monkeypatch.setattr(auth_router, "complete_login", _fail)
 
     c = TestClient(app_module.app)
     r = c.get("/callback?code=x&state=stale", follow_redirects=False)
@@ -468,7 +469,7 @@ def test_login_sends_an_unconfigured_localhost_install_to_setup(app_module, unco
 def test_the_owner_can_add_a_second_character(app_module, monkeypatch, client):
     """The alt is stored and the owner is returned to the app, not shown a
     'Login failed. Nothing was changed.' page that is wrong on both counts."""
-    monkeypatch.setattr(app_module, "complete_login",
+    monkeypatch.setattr(auth_router, "complete_login",
                         lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
 
     r = client.get("/callback?code=x&state=y", follow_redirects=False)
@@ -480,7 +481,7 @@ def test_the_owner_can_add_a_second_character(app_module, monkeypatch, client):
 
 
 def test_adding_a_character_does_not_transfer_ownership(app_module, monkeypatch, client, conn):
-    monkeypatch.setattr(app_module, "complete_login",
+    monkeypatch.setattr(auth_router, "complete_login",
                         lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
 
     client.get("/callback?code=x&state=y", follow_redirects=False)
@@ -489,7 +490,7 @@ def test_adding_a_character_does_not_transfer_ownership(app_module, monkeypatch,
 
 def test_a_stranger_without_a_session_still_gets_the_refusal(app_module, monkeypatch):
     """The heuristic must not become 'anyone completing SSO is welcome'."""
-    monkeypatch.setattr(app_module, "complete_login",
+    monkeypatch.setattr(auth_router, "complete_login",
                         lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
 
     c = TestClient(app_module.app)          # no session cookie
@@ -521,7 +522,7 @@ def test_an_uninvited_character_is_not_left_stored(app_module, monkeypatch, conn
             conn2.close()
         return stranger_id, "Passing Stranger"
 
-    monkeypatch.setattr(app_module, "complete_login", _stores_then_returns)
+    monkeypatch.setattr(auth_router, "complete_login", _stores_then_returns)
 
     c = TestClient(app_module.app)               # no session
     r = c.get("/callback?code=x&state=y", follow_redirects=False)
@@ -540,7 +541,7 @@ def test_a_known_character_survives_a_refused_reauth(app_module, monkeypatch, co
     save_tokens(conn, "access-tok", "refresh-tok", 1200,
                 OTHER_CHARACTER_ID, "Test Pilot Beta")
 
-    monkeypatch.setattr(app_module, "complete_login",
+    monkeypatch.setattr(auth_router, "complete_login",
                         lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
 
     c = TestClient(app_module.app)               # session expired -> none sent

@@ -8,24 +8,26 @@ from __future__ import annotations
 
 import pytest
 
+from app.web.routers import auth as auth_router
+
 
 @pytest.fixture
 def sync_state(app_module):
     """Snapshot and restore the module-global sync state around each test."""
-    original = dict(app_module._sync_state)
-    yield app_module._sync_state
-    app_module._sync_state.clear()
-    app_module._sync_state.update(original)
+    original = dict(auth_router._sync_state)
+    yield auth_router._sync_state
+    auth_router._sync_state.clear()
+    auth_router._sync_state.update(original)
 
 
 def test_pct_rises_monotonically_through_the_whole_sync(app_module, sync_state):
-    steps = app_module._SYNC_STEPS
+    steps = auth_router._SYNC_STEPS
     seen = []
     for index in range(1, 13):
         for step in steps:
             sync_state.update({"running": True, "done": False, "total": 12,
                                "index": index, "step": step, "phase": "characters"})
-            seen.append(app_module._sync_pct())
+            seen.append(auth_router._sync_pct())
     assert seen == sorted(seen), "progress must never go backwards"
     assert seen[0] < seen[-1]
     # The character loop stops short of 100 — the trailing steps own the rest.
@@ -38,19 +40,19 @@ def test_pct_boundaries(app_module, sync_state):
     # Nothing known yet: a sliver, so the bar is visibly present but not lying.
     sync_state.update({"running": True, "done": False, "total": 0, "index": 0,
                        "step": "", "phase": ""})
-    assert app_module._sync_pct() == 2
+    assert auth_router._sync_pct() == 2
     # Station-name resolution is the tail, past every character.
     sync_state.update({"total": 12, "index": 12, "step": "", "phase": "locations"})
-    assert app_module._sync_pct() == 96
+    assert auth_router._sync_pct() == 96
     sync_state.update({"done": True})
-    assert app_module._sync_pct() == 100
+    assert auth_router._sync_pct() == 100
 
 
 def test_pct_survives_an_unknown_step(app_module, sync_state):
     """A future step name must not raise ValueError from .index()."""
     sync_state.update({"running": True, "done": False, "total": 4, "index": 2,
                        "step": "something new", "phase": "characters"})
-    pct = app_module._sync_pct()
+    pct = auth_router._sync_pct()
     assert 2 <= pct <= 95
 
 
@@ -78,7 +80,7 @@ def test_reset_clears_stale_progress(app_module, sync_state):
     sync_state.update({"running": False, "done": True, "total": 12, "index": 12,
                        "char": "Retrovisor", "step": "corp assets",
                        "phase": "locations", "failed": 3})
-    app_module._sync_reset()
+    auth_router._sync_reset()
     assert sync_state["running"] is True and sync_state["done"] is False
     assert (sync_state["total"], sync_state["index"], sync_state["failed"]) == (0, 0, 0)
     assert sync_state["char"] == "" and sync_state["step"] == "" and sync_state["phase"] == ""

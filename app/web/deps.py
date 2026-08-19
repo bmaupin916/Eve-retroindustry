@@ -428,3 +428,20 @@ def _container_display_name(custom_name: str, type_name: str, container_id: int)
     if not custom:
         return type_name
     return f"{custom} ({type_name})"
+
+
+async def _valid_token_async(char_id: int) -> str | None:
+    """Fetch (refreshing if expired) a character's access token WITHOUT blocking
+    the event loop. get_valid_token() does a synchronous httpx.post on expiry;
+    calling it inline on the async loop froze the whole app. Run it in a worker
+    thread with its own SQLite connection (sqlite objects are single-thread)."""
+    def _work() -> str | None:
+        c = get_conn()
+        try:
+            return _get_valid_token_for(c, char_id)
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+    return await asyncio.to_thread(_work)
