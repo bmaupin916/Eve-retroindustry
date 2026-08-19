@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* **v0.9.49 is not on `docs/hosted-v2-design` yet.** It sits on
+* **v0.9.50 is not on `docs/hosted-v2-design` yet.** It sits on
   `claude/fix-sde-conn-leak`, cut from `4b59264`: one commit, the leaked SDE
   connection in `plan_result` plus the two tests that pin it. Merge it before
   touching `app/web/routers/plan.py` or the next session fixes it a second
@@ -14,7 +14,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   entirely; `main` and `docs/hosted-v2-design` have diverged, so "the repo is
   on main" does not mean what it usually means here. `git log --oneline -1`
   before trusting a checkout.
-* Code state at v0.9.49 — `docs/hosted-v2-design` once the merge above lands.
+* Code state at v0.9.50 — `docs/hosted-v2-design` once the merge above lands.
   **683 tests green, 1 skipped**; 681 of those were green at v0.9.48 and the
   two new ones are the connection-lifetime pair. The one skip is POSIX file
   modes on Windows, not a backend. Postgres 17 has
@@ -128,7 +128,7 @@ exactly that for `invention.list_decryptors`. Three rules learned doing it:
   `_derive_job_splits`, `build_invention_params` and two `resolve` calls that
   all raise on bad input, then closed by a bare `sde_conn.close()` at the
   bottom with no `try`/`finally`. `plan_result` held two connections and only
-  one of them got the lesson. Fixed in v0.9.49 with a `with` block, which the
+  one of them got the lesson. Fixed in v0.9.50 with a `with` block, which the
   resolver allows: it documents its connection as borrowed rather than owned,
   and rows leave it as plain dicts, so nothing below the block needs it open.
 Passing the SQLAlchemy connection instead fails with
@@ -310,7 +310,7 @@ work, not a move, and the event model has to be decided before it is written.
 all **done**. What that left is below.
 
 0. **Merge `claude/fix-sde-conn-leak` into `docs/hosted-v2-design`** before
-   anything else. It is one commit (v0.9.49) against `4b59264` and it touches
+   anything else. It is one commit (v0.9.50) against `4b59264` and it touches
    `app/web/routers/plan.py`, so it conflicts with any further conversion of
    that router. Do it first and the rest of the list is unaffected.
 
@@ -371,7 +371,7 @@ session cost 25 minutes between them. Most of the 71 told us nothing.
   no `try`/`finally`. `find_blueprint_for_product()` and `resolver.resolve()`
   both sit in that span and both raise on bad input, and `build_plan` is called
   from the same `except Exception` handler, so it leaks **two** handles per
-  failed plan with no symptom. Left alone deliberately in v0.9.49 to keep that
+  failed plan with no symptom. Left alone deliberately in v0.9.50 to keep that
   commit to one file. The trap when fixing it: `sqlite3.Connection` as a context
   manager commits or rolls back and does **not** close, so it needs
   `contextlib.closing(...)`, not a bare `with`. `pi_planner_helper.py` was
