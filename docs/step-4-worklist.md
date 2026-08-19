@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.40. **551 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.41. **571 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -95,9 +95,14 @@ next module is the same until shown otherwise.
   has to start emitting named binds in the same commit as its call sites.
 * **`cursor.lastrowid`** has no equivalent; `RETURNING id` replaces it and
   needs SQLite >= 3.35 (3.49.1 here, asserted rather than assumed).
-* **`ON CONFLICT ... DO UPDATE SET x = x + excluded.x`** — the bare `x` on the
-  right means the stored row on SQLite and the *proposed* row on Postgres.
-  Qualify it: `SET x = tbl.x + excluded.x`.
+* **`ON CONFLICT ... DO UPDATE SET x = x + excluded.x`** — qualify it:
+  `SET x = tbl.x + excluded.x`. **Corrected 2026-08-19 by running it:** this
+  used to say Postgres resolves the bare `x` against the proposed row and
+  silently double-counts. It does not — the name is visible on both the target
+  table and `excluded`, and Postgres refuses to guess, raising
+  `AmbiguousColumn: column reference "x" is ambiguous`. SQLite resolves it to
+  the stored row and runs. So it is a loud failure on first contact rather than
+  a quiet miscount, which is worth knowing before hunting for one.
 * **Two LEFT JOINs off one row is a cartesian product**, so `SUM(CASE ...)`
   over either of them counts each match once per row of the other. Use
   `COUNT(DISTINCT CASE WHEN ... THEN id END)`. This was live in
@@ -176,24 +181,24 @@ work, not a move, and the event model has to be decided before it is written.
 
 ## Start here next session
 
-In order. The first is ten minutes and is the only one that can invalidate work
-already committed.
+~~Run `projects` against Postgres~~ and ~~sign in~~ are both **done**. What that
+left is below.
 
-1. **Run `projects` against Postgres.** This is the one that matters now. The
-   Postgres suite covers the *schema*; `tests/test_projects.py` runs entirely
-   on the SQLite `client` fixture, so the two changes in `projects_helper.py`
-   that exist *only* because Postgres differs have never executed there:
-   the qualified `SET needed = project_shopping.needed + excluded.needed` (an
-   unqualified column resolves to the proposed row on Postgres and the stored
-   row on SQLite) and the `COUNT(DISTINCT CASE …)` that undoes the two-LEFT-JOIN
-   cartesian product. One converted module, and its Postgres-specific behaviour
-   is still unproven on Postgres. Do this before converting the other ten.
-2. **Sign in.** `characters` and `app_owner` are empty after the test-data
-   cleanup, so the worker has nothing to sync and every page is blank. The
-   cached assets, blueprints, wallet and skills for all three real characters
-   are still there and come back on login.
-3. **Then pick up the conversion** — `industry` is next by size, and it is a
+1. **A sync-health page.** The strongest item, and the argument for it is
+   evidence rather than taste. `worker.status()`, `quarantine_state()`,
+   `etag_stats()` and the whole `sync_events` log have **no non-test caller**:
+   the worker writes events nothing reads. Two shipped defects were found on
+   2026-08-19 within an hour of each other, and both were visible only because
+   a `[sync]` line happened to be printed to a terminal somebody was watching —
+   the failure reasons were sitting in `sync_events`, queryable, the whole time.
+   Building one real consumer also tests the event model before anything else
+   depends on it, which is much cheaper now than after five pages do.
+2. **Then pick up the conversion** — `industry` is next by size, and it is a
    router plus two helpers (`margins_helper`, `reactions_helper`).
+   `tests/test_projects_on_postgres.py` is the pattern to copy: drive the
+   helper directly, parameterised over both backends, so the same assertion
+   runs twice. It is what proves a conversion rather than merely exercising it.
+3. **Cache-only routes**, eight pages left. `/jobs` is the worked example.
 
 ## How to work on this without wasting an afternoon
 

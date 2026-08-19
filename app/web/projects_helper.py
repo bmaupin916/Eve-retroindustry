@@ -109,10 +109,13 @@ def add_plan_to_project(
     for mat in plan_data.get("materials", []):
         missing = mat.get("missing") or 0
         if missing > 0:
-            # `needed` is qualified rather than bare: Postgres resolves an
-            # unqualified column in DO UPDATE against the *proposed* row, so
-            # `needed = needed + excluded.needed` would double-count there
-            # while working on SQLite.
+            # `needed` is qualified rather than bare. Inside DO UPDATE the name
+            # is visible on both the target table and the `excluded` pseudo-row,
+            # and Postgres refuses to guess: `needed = needed + excluded.needed`
+            # raises `AmbiguousColumn: column reference "needed" is ambiguous`.
+            # SQLite resolves it to the stored row and runs happily, so this is
+            # a statement that works until the day it meets Postgres — verified
+            # both ways in tests/test_projects_on_postgres.py.
             conn.execute(
                 text("""
                 INSERT INTO project_shopping (project_id, type_id, name, needed, purchased)
