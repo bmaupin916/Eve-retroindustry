@@ -307,3 +307,30 @@ def test_plan_contract_price_requires_login(client):
                    params={"location_id": 60003760, "type_id": 34})
     assert r.status_code == 200
     assert r.json().get("ok") is not True
+
+
+def test_background_price_warmup_actually_reaches_esi(app_module, monkeypatch):
+    """/api/prices/search and /api/prices/suggest kick off a warm-up for the
+    types they could not price. It had never fetched anything.
+
+    The body called `_esi_client()`; the import is `esi_client`. NameError is an
+    Exception, and the whole thing sits inside `except Exception: pass` — so the
+    task was created, raised immediately, and was swallowed. The next search for
+    the same item was just as cold as the first.
+    """
+    import asyncio
+
+    seen: list[list[int]] = []
+
+    async def _bulk(client, conn, type_ids, force=False):
+        seen.append(list(type_ids))
+
+    import app.market.prices as prices_mod
+    monkeypatch.setattr(prices_mod, "fetch_jita_prices_bulk", _bulk)
+
+    asyncio.run(app_module._bg_fetch_prices([34, 35]))
+
+    assert seen == [[34, 35]], (
+        f"the warm-up never reached fetch_jita_prices_bulk (saw {seen}) — "
+        "an exception was swallowed on the way"
+    )

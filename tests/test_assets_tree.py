@@ -571,3 +571,62 @@ def test_all_characters_view_shows_every_pilots_ship_name(app_module, client, mo
                 conn.execute("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
                              " VALUES (?,?,?)", (cid, orig[0], orig[1]))
         conn.commit(); conn.close()
+
+
+# ── the corp variant of the same resolver ────────────────────────────────────
+
+def test_corp_resolver_asks_only_about_ids_the_corp_owns(app_module):
+    """The corp resolver is a copy of the character one that never got the fix.
+
+    It posted `owned_ids` — a name only the character variant builds. Python
+    raised NameError, `except Exception: custom_names = {}` ate it, and every
+    corp container in the hangar fell back to its bare type name. Nothing in
+    the UI or the log said why, which is why this sat there: found by pyflakes,
+    not by anything failing.
+    """
+    import asyncio, json as _j
+
+    posted: list[list[int]] = []
+
+    class _Resp:
+        status_code = 200
+        def json(self): return [{"item_id": 5001, "name": "Ore Bin"}]
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, **kw):
+            posted.append(_j.loads(kw["content"]))
+            return _Resp()
+
+    from app.web import main as m
+    ours = [{"item_id": 5001, "type_id": MEGATHRON, "location_id": 60003760}]
+    orig = m.esi_client
+    m.esi_client = lambda *a, **k: _Client()
+    try:                                          # 7777 belongs to someone else
+        got = asyncio.run(m._resolve_corp_container_names(
+            98000001, "tok", [5001, 7777], ours))
+    finally:
+        m.esi_client = orig
+
+    assert posted == [[5001]], posted             # only our own id went out
+    assert got == {5001: ("Ore Bin (Megathron)", 60003760)}
+
+
+def test_corp_resolver_skips_esi_entirely_when_it_owns_nothing(app_module):
+    """Matches its character twin: nothing owned means no call at all."""
+    import asyncio
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, *a, **k): raise AssertionError("should not post")
+
+    from app.web import main as m
+    orig = m.esi_client
+    m.esi_client = lambda *a, **k: _Client()
+    try:
+        assert asyncio.run(m._resolve_corp_container_names(
+            98000001, "tok", [5001, 7777], [])) == {}
+    finally:
+        m.esi_client = orig

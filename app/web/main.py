@@ -3378,6 +3378,13 @@ async def _resolve_corp_container_names(
     asset_map = {item["item_id"]: item for item in corp_assets_raw}
     result: dict[int, tuple[str, int]] = {}
 
+    # Same filter as the character variant, and for the same reason: posting an
+    # id the corporation does not own fails the whole batch, so every container
+    # falls back to its bare type name.
+    owned_ids = [cid for cid in container_ids if cid in asset_map]
+    if not owned_ids:
+        return result
+
     try:
         async with esi_client() as client:
             r = await client.post(
@@ -4567,7 +4574,7 @@ async def _bg_fetch_prices(type_ids: list[int]) -> None:
     from app.market.prices import fetch_jita_prices_bulk as _bulk
     conn = get_conn()
     try:
-        async with _esi_client() as client:
+        async with esi_client() as client:
             await _bulk(client, conn, type_ids, force=True)
     except Exception:
         pass

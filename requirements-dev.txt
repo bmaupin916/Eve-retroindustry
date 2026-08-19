@@ -1,3 +1,8 @@
 # Dev/test dependencies (not needed at runtime).
 -r requirements.txt
 pytest>=8.0
+# tests/test_no_undefined_names.py runs this over the whole package. Two live
+# bugs were sitting behind broad `except` clauses where a NameError never
+# surfaced; W6 makes the class more likely still, since moving a handler to a
+# router without its imports fails exactly this way.
+pyflakes>=3.2
