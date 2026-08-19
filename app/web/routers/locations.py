@@ -1,0 +1,600 @@
+"""Stations, structures and the lookups the plan form hangs off.
+
+Moved out of `main.py` unchanged (W6). What ties these together is the
+location: naming one, resolving one, rigging one, finding what is near one, and
+pricing an item at one. `/api/suggest` is here for the same reason — it answers
+"what do I own, and where", which is a question about places as much as items.
+"""
+from __future__ import annotations
+
+import asyncio
+
+from fastapi import APIRouter, Form, Request
+
+from app.esi.client import esi_client
+from app.market.prices import (
+    ensure_price_table,
+    fetch_station_volumes,
+    fetch_structure_market,
+)
+from app.web import contracts_helper
+from app.web.deps import (
+    _load_assets_from_cache,
+    _load_blueprints_from_cache,
+    get_active_character,
+    get_active_token,
+    get_conn,
+)
+from app.web.industry_helper import (
+    get_rig_types,
+    get_sci_for_system,
+    get_station_me_bonus_pct,
+    get_station_rigs_full,
+    populate_rig_bonuses,
+    save_station_rigs_full,
+)
+from app.web.location_resolver import (
+    ensure_location_name_table,
+    get_region_for_location,
+    get_security_status,
+    load_location_names_from_db,
+    locations_in_system,
+    resolve_station_names_bulk,
+)
+
+router = APIRouter()
+
+
+@router.get("/api/station-industry-info")
+async def station_industry_info(request: Request, location_id: int):
+    """
+    Return SCI, facility tax, ME bonus and security multiplier for the given station/structure.
+    Facility tax is derived from the character's recent jobs (cost/EIV − SCI).
+    """
+    conn = get_conn()
+    sys_row = conn.execute(
+        "SELECT solar_system_id FROM location_name_cache WHERE location_id=?",
+        (location_id,),
+    ).fetchone()
+    solar_system_id: int | None = sys_row[0] if sys_row and sys_row[0] else None
+
+    mfg_sci = rxn_sci = 0.0
+    security_status: float | None = None
+    if solar_system_id:
+        mfg_sci = await get_sci_for_system(conn, solar_system_id, "manufacturing")
+        rxn_sci = await get_sci_for_system(conn, solar_system_id, "reaction")
+        # Pre-fetch security_status into the cache so the synchronous helper
+        # get_station_me_bonus_pct can scale rig bonuses correctly (×1.0 / ×1.9 / ×2.1).
+        security_status = await get_security_status(conn, solar_system_id)
+
+    # We can't read facility tax exactly from ESI (deriving it from the job average was inaccurate).
+    # The user enters it manually and can save the value as a default (localStorage).
+    rig_info = get_station_rigs_full(conn, location_id)
+    # ME bonus recomputed with the security multiplier (overrides the stale stored value)
+    me_bonus_live = get_station_me_bonus_pct(conn, location_id)
+    conn.close()
+    return {
+        "solar_system_id":  solar_system_id,
+        "security_status":  security_status,
+        "mfg_sci":          mfg_sci,
+        "rxn_sci":          rxn_sci,
+        "me_bonus_pct":     me_bonus_live,
+        "structure_type":   rig_info["structure_type"],
+        "rigs":             rig_info["rigs"],
+    }
+
+
+@router.post("/api/station-rigs")
+async def save_station_rigs(request: Request):
+    """Save the rig configuration for the given station/structure."""
+    try:
+        data = await request.json()
+        location_id = int(data.get("location_id", 0))
+        if not location_id:
+            return {"ok": False, "error": "missing location_id"}
+        structure_type = data.get("structure_type") or None
+        rig1 = int(data["rig1_type_id"]) if data.get("rig1_type_id") else None
+        rig2 = int(data["rig2_type_id"]) if data.get("rig2_type_id") else None
+        rig3 = int(data["rig3_type_id"]) if data.get("rig3_type_id") else None
+        conn = get_conn()
+        save_station_rigs_full(conn, location_id, structure_type, rig1, rig2, rig3)
+        # Return the security-adjusted ME bonus (the helper applies the sec multiplier to rigs)
+        me_bonus = get_station_me_bonus_pct(conn, location_id)
+        conn.close()
+        return {"ok": True, "me_bonus_pct": me_bonus}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@router.get("/api/rig-types")
+async def api_rig_types(structure_type: str = ""):
+    """Return the available rigs for the given structure type (raitaru/azbel/sotiyo/athanor/tatara)."""
+    conn = get_conn()
+    populate_rig_bonuses(conn)
+    rigs = get_rig_types(conn, structure_type)
+    conn.close()
+    return {"rigs": rigs}
+
+
+@router.get("/api/suggest-station")
+async def suggest_station(request: Request, q: str = ""):
+    if len(q.strip()) < 2:
+        return {"owned": [], "other": []}
+
+    conn = get_conn()
+    ensure_location_name_table(conn)
+    char = get_active_character(request, conn)
+    token = get_active_token(request, conn)
+    pattern = q.strip().lower()
+
+    # Locations where the character has assets (personal + corporate)
+    asset_locs: set[int] = set()
+    if char:
+        raw = _load_assets_from_cache(conn, char[0])
+        for a in raw:
+            if not a.get("is_singleton", False):
+                asset_locs.add(a["location_id"])
+
+    all_names = load_location_names_from_db(conn)
+    cache_empty = len(all_names) == 0
+
+    # Stations with assets — filter by name
+    owned_ids: set[int] = set()
+    owned = []
+    for loc_id in asset_locs:
+        name = all_names.get(loc_id, str(loc_id))
+        if pattern in name.lower() or pattern in str(loc_id):
+            owned.append({"location_id": loc_id, "name": name})
+            owned_ids.add(loc_id)
+    owned.sort(key=lambda x: x["name"])
+
+    # Other known stations from the cache without assets
+    other = []
+    other_ids: set[int] = set()
+    for loc_id, name in all_names.items():
+        if loc_id not in asset_locs and (pattern in name.lower() or pattern in str(loc_id)):
+            other.append({"location_id": loc_id, "name": name})
+            other_ids.add(loc_id)
+    other.sort(key=lambda x: x["name"])
+
+    # ESI search — NPC stations + systems + player structures (in parallel)
+    try:
+        async with esi_client() as client:
+            esi_tasks: list = [
+                client.get(
+                    "https://esi.evetech.net/latest/search/",
+                    params={"categories": "station", "search": q.strip(),
+                            "datasource": "tranquility", "strict": "false"},
+                    timeout=5.0,
+                ),
+                client.get(
+                    "https://esi.evetech.net/latest/search/",
+                    params={"categories": "solar_system", "search": q.strip(),
+                            "datasource": "tranquility", "strict": "false"},
+                    timeout=5.0,
+                ),
+            ]
+            # Authenticated search for player structures (citadels, engineering complexes…)
+            if char and token:
+                esi_tasks.append(
+                    client.get(
+                        f"https://esi.evetech.net/latest/characters/{char[0]}/search/",
+                        params={"categories": "structure", "search": q.strip(),
+                                "datasource": "tranquility", "strict": "false"},
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=5.0,
+                    )
+                )
+
+            results = await asyncio.gather(*esi_tasks, return_exceptions=True)
+            station_search = results[0]
+            system_search = results[1]
+            structure_search = results[2] if len(results) > 2 else None
+
+            # NPC stations — direct result from the ESI search
+            if not isinstance(station_search, Exception) and station_search.status_code == 200:
+                npc_ids = station_search.json().get("station", [])[:20]
+                new_ids = [sid for sid in npc_ids if sid not in all_names]
+                if new_ids:
+                    new_names = await resolve_station_names_bulk(new_ids, token=None, conn=conn)
+                    all_names.update(new_names)
+                for sid in npc_ids:
+                    if sid in asset_locs and sid not in owned_ids:
+                        owned.append({"location_id": sid, "name": all_names.get(sid, str(sid))})
+                        owned_ids.add(sid)
+                    elif sid not in asset_locs and sid not in other_ids:
+                        other.append({"location_id": sid, "name": all_names.get(sid, str(sid))})
+                        other_ids.add(sid)
+
+            # Player structures — result from the authenticated character search
+            if (structure_search and not isinstance(structure_search, Exception)
+                    and structure_search.status_code == 200):
+                struct_ids = structure_search.json().get("structure", [])[:20]
+                new_struct_ids = [sid for sid in struct_ids if sid not in all_names]
+                if new_struct_ids:
+                    new_names = await resolve_station_names_bulk(new_struct_ids, token=token, conn=conn)
+                    all_names.update(new_names)
+                for sid in struct_ids:
+                    if sid in asset_locs and sid not in owned_ids:
+                        owned.append({"location_id": sid, "name": all_names.get(sid, str(sid))})
+                        owned_ids.add(sid)
+                    elif sid not in asset_locs and sid not in other_ids:
+                        other.append({"location_id": sid, "name": all_names.get(sid, str(sid))})
+                        other_ids.add(sid)
+
+            # Systems — find structures in our cache + NPC stations in the system
+            system_ids: list[int] = []
+            if not isinstance(system_search, Exception) and system_search.status_code == 200:
+                system_ids = system_search.json().get("solar_system", [])
+
+            for sys_id in system_ids[:10]:
+                for entry in locations_in_system(conn, sys_id):
+                    lid = entry["location_id"]
+                    if lid in asset_locs and lid not in owned_ids:
+                        owned.append(entry)
+                        owned_ids.add(lid)
+                    elif lid not in asset_locs and lid not in other_ids:
+                        other.append(entry)
+                        other_ids.add(lid)
+
+            # NPC stations in the found systems
+            sys_tasks = [
+                client.get(
+                    f"https://esi.evetech.net/latest/universe/systems/{sid}/",
+                    params={"datasource": "tranquility"}, timeout=4.0,
+                )
+                for sid in system_ids[:5]
+            ]
+            if sys_tasks:
+                sys_results = await asyncio.gather(*sys_tasks, return_exceptions=True)
+                new_npc: list[int] = []
+                for sys_r in sys_results:
+                    if not isinstance(sys_r, Exception) and sys_r.status_code == 200:
+                        new_npc.extend(sys_r.json().get("stations", []))
+                new_npc_ids = [sid for sid in new_npc if sid not in all_names]
+                if new_npc_ids:
+                    new_names = await resolve_station_names_bulk(new_npc_ids, token=None, conn=conn)
+                    all_names.update(new_names)
+                for sid in new_npc:
+                    if sid not in asset_locs and sid not in other_ids:
+                        other.append({"location_id": sid, "name": all_names.get(sid, str(sid))})
+                        other_ids.add(sid)
+
+            other.sort(key=lambda x: x["name"])
+            owned.sort(key=lambda x: x["name"])
+    except Exception:
+        pass
+
+    conn.close()
+    return {"owned": owned[:15], "other": other[:10], "cache_empty": cache_empty and not owned and not other}
+
+
+@router.post("/api/add-station")
+async def add_station(request: Request, raw: str = Form(...)):
+    """
+    Add a structure to the cache. Accepts:
+    - structure ID (a number)
+    - EVE URL format: <url=showinfo:TYPE//ID>Name</url>
+    - ID<space>Name: e.g. "1045667241057 C-N4OD - Fortizar"
+    """
+    import re
+    conn = get_conn()
+    ensure_location_name_table(conn)
+    token = get_active_token(request, conn)
+
+    raw = raw.strip()
+    structure_id: int | None = None
+    hint_name: str | None = None
+
+    # EVE URL format: showinfo:TYPE//ID or showinfo:TYPE//ID>Name
+    m = re.search(r'showinfo:\d+//(\d+)(?:[^>]*>([^<]+))?', raw)
+    if m:
+        structure_id = int(m.group(1))
+        hint_name = m.group(2).strip() if m.group(2) else None
+    # Just a number, or "ID name"
+    elif raw:
+        parts = raw.split(None, 1)
+        if parts[0].isdigit():
+            structure_id = int(parts[0])
+            hint_name = parts[1].strip() if len(parts) > 1 else None
+
+    if not structure_id:
+        return {"error": "Could not recognize the structure ID"}, 400
+
+    resolved_name = hint_name
+    sys_id: int | None = None
+
+    # Try ESI
+    try:
+        async with esi_client() as client:
+            if structure_id < 1_000_000_000_000:
+                r = await client.get(
+                    f"https://esi.evetech.net/latest/universe/stations/{structure_id}/",
+                    params={"datasource": "tranquility"}, timeout=8,
+                )
+            else:
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                r = await client.get(
+                    f"https://esi.evetech.net/latest/universe/structures/{structure_id}/",
+                    params={"datasource": "tranquility"}, headers=headers, timeout=8,
+                )
+            if r.status_code == 200:
+                data = r.json()
+                resolved_name = data.get("name") or resolved_name
+                sys_id = data.get("solar_system_id") or data.get("system_id")
+    except Exception:
+        pass
+
+    if not resolved_name:
+        resolved_name = f"[Structure {structure_id}]"
+
+    conn.execute(
+        "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
+        (structure_id, resolved_name, sys_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"location_id": structure_id, "name": resolved_name, "solar_system_id": sys_id}
+
+
+@router.post("/api/location/rename")
+async def location_rename(request: Request):
+    """Save a user-entered location name to the cache."""
+    body = await request.json()
+    location_id = int(body["location_id"])
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return {"ok": False, "error": "Empty name"}
+    conn = get_conn()
+    ensure_location_name_table(conn)
+    conn.execute(
+        "INSERT INTO location_name_cache (location_id, name) VALUES (?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name",
+        (location_id, name),
+    )
+    conn.commit()
+    conn.close()
+    from app.web.location_resolver import _cache
+    _cache[location_id] = name
+    return {"ok": True, "location_id": location_id, "name": name}
+
+
+@router.get("/api/location/resolve")
+async def location_resolve(request: Request, location_id: int):
+    """Try to look up the structure name via ESI with the current token."""
+    conn = get_conn()
+    token = get_active_token(request, conn)
+    if not token:
+        conn.close()
+        return {"ok": False, "error": "Not signed in"}
+    from app.web.location_resolver import resolve_station_name, _cache
+    _cache.pop(location_id, None)  # force a fresh ESI call
+    async with esi_client() as client:
+        name, sys_id = await resolve_station_name(client, location_id, token)
+    resolved = name != str(location_id) and not name.startswith("[")
+    if resolved:
+        ensure_location_name_table(conn)
+        conn.execute(
+            "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
+            (location_id, name, sys_id),
+        )
+        conn.commit()
+    conn.close()
+    return {"ok": resolved, "name": name, "solar_system_id": sys_id}
+
+
+@router.get("/api/my-location")
+async def my_location(request: Request):
+    """Return the character's current location (structure_id if docked in a structure)."""
+    conn = get_conn()
+    token = get_active_token(request, conn)
+    char = get_active_character(request, conn)
+    if not token or not char:
+        conn.close()
+        return {"error": "Not signed in"}
+    ensure_location_name_table(conn)
+
+    try:
+        async with esi_client() as client:
+            r = await client.get(
+                f"https://esi.evetech.net/latest/characters/{char[0]}/location/",
+                params={"datasource": "tranquility"},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                return {"error": f"ESI {r.status_code}"}
+            loc = r.json()
+
+        structure_id: int | None = loc.get("structure_id") or loc.get("station_id")
+        sys_id: int = loc.get("solar_system_id", 0)
+
+        if not structure_id:
+            # Load the system name
+            async with esi_client() as client:
+                sr = await client.get(
+                    f"https://esi.evetech.net/latest/universe/systems/{sys_id}/",
+                    params={"datasource": "tranquility"}, timeout=5,
+                )
+                sys_name = sr.json().get("name", str(sys_id)) if sr.status_code == 200 else str(sys_id)
+            return {"in_space": True, "solar_system_id": sys_id, "solar_system_name": sys_name}
+
+        # Resolve the structure/station name and save it to the cache
+        resolved_name = str(structure_id)
+        try:
+            async with esi_client() as client:
+                if structure_id < 1_000_000_000_000:
+                    r2 = await client.get(
+                        f"https://esi.evetech.net/latest/universe/stations/{structure_id}/",
+                        params={"datasource": "tranquility"}, timeout=8,
+                    )
+                else:
+                    r2 = await client.get(
+                        f"https://esi.evetech.net/latest/universe/structures/{structure_id}/",
+                        params={"datasource": "tranquility"},
+                        headers={"Authorization": f"Bearer {token}"}, timeout=8,
+                    )
+                if r2.status_code == 200:
+                    data = r2.json()
+                    resolved_name = data.get("name", resolved_name)
+                    sys_id = data.get("solar_system_id") or data.get("system_id") or sys_id
+        except Exception:
+            pass
+
+        conn.execute(
+            "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
+            (structure_id, resolved_name, sys_id),
+        )
+        conn.commit()
+        conn.close()
+        return {"location_id": structure_id, "name": resolved_name,
+                "solar_system_id": sys_id, "in_space": False}
+    except Exception as e:
+        conn.close()
+        return {"error": str(e)}
+
+
+@router.get("/api/plan/fetch-sell-price")
+async def fetch_plan_sell_price(request: Request, location_id: int, type_id: int):
+    """Fetch the best sell price of a specific product at the given station, save it to station_volume_cache."""
+    conn = get_conn()
+    token = get_active_token(request, conn)
+    ensure_price_table(conn)
+
+    # Ensure the type_id is present in market_price_cache (the fetchers need it for filtering)
+    conn.execute(
+        "INSERT INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0) ON CONFLICT (type_id) DO NOTHING",
+        (type_id,),
+    )
+    conn.commit()
+
+    region_id = await get_region_for_location(conn, location_id, token)
+
+    try:
+        if location_id >= 1_000_000_000:
+            if not token:
+                conn.close()
+                return {"ok": False, "error": "Sign-in is required to access the structure market."}
+            result = await fetch_structure_market(conn, location_id, token, {type_id}, region_id)
+        else:
+            if not region_id:
+                conn.close()
+                return {"ok": False, "error": "Could not determine the region for this location."}
+            result = await fetch_station_volumes(conn, location_id, region_id, [type_id])
+    except PermissionError as e:
+        conn.close()
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        conn.close()
+        return {"ok": False, "error": str(e)}
+
+    conn.close()
+    best_sell = result.get(type_id, (None, None, None))[1] if result else None
+    return {"ok": True, "best_sell": best_sell}
+
+
+@router.get("/api/plan/contract-price")
+async def api_plan_contract_price(request: Request, location_id: int, type_id: int):
+    """Cheapest price per unit of the product from indexed public contracts in
+    the given station's region. Requires the region to have been indexed first (Public browser)."""
+    conn = get_conn()
+    try:
+        token = get_active_token(request, conn)
+        region_id = await get_region_for_location(conn, location_id, token)
+        if not region_id:
+            return {"ok": False, "error": "Could not determine the station's region."}
+        status = contracts_helper.get_index_status(conn, region_id)
+        if not status:
+            return {"ok": False, "not_indexed": True, "region_id": region_id,
+                    "error": "The contract region is not indexed — index it in the Public browser."}
+        best = contracts_helper.best_contract_price(conn, region_id, type_id)
+        if not best:
+            return {"ok": False, "error": "No public contract with this product in the region.",
+                    "region_id": region_id, "indexed_at": status.get("indexed_at")}
+        best["ok"] = True
+        best["region_id"] = region_id
+        best["indexed_at"] = status.get("indexed_at")   # so the client can re-index a stale index
+        return best
+    finally:
+        conn.close()
+
+
+@router.get("/api/suggest")
+async def suggest(request: Request, q: str = ""):
+    if len(q.strip()) < 2:
+        return {"owned": [], "other": []}
+
+    conn = get_conn()
+    char = get_active_character(request, conn)
+    pattern = f"%{q.strip().lower()}%"
+    owned: list[dict] = []
+    owned_product_ids: set[int] = set()
+
+    if char:
+        char_id, _ = char
+        raw_bps = _load_blueprints_from_cache(conn, char_id)
+        if raw_bps:
+            bp_type_ids = list({bp["type_id"] for bp in raw_bps})
+            # Group by type_id — pick the best one (BPO > BPC, highest ME)
+            bp_by_type: dict[int, dict] = {}
+            for bp in raw_bps:
+                tid = bp["type_id"]
+                if tid not in bp_by_type:
+                    bp_by_type[tid] = bp
+                else:
+                    cur = bp_by_type[tid]
+                    if (bp.get("quantity", 1) == -1, bp.get("material_efficiency", 0)) > \
+                       (cur.get("quantity", 1) == -1, cur.get("material_efficiency", 0)):
+                        bp_by_type[tid] = bp
+
+            ph = ",".join("?" * len(bp_type_ids))
+            rows = conn.execute(f"""
+                SELECT sbp.blueprint_type_id, sbp.product_type_id, t.name
+                FROM sde_blueprint_products sbp
+                JOIN sde_types t ON t.type_id = sbp.product_type_id
+                WHERE sbp.blueprint_type_id IN ({ph})
+                  AND sbp.activity IN ('manufacturing', 'reaction')
+                  AND LOWER(t.name) LIKE ?
+                ORDER BY t.name
+            """, bp_type_ids + [pattern]).fetchall()
+
+            for bp_type_id, product_type_id, product_name in rows:
+                owned_product_ids.add(product_type_id)
+                bp = bp_by_type.get(bp_type_id, {})
+                is_original = bp.get("quantity", 1) == -1
+                runs = bp.get("runs", -1)
+                owned.append({
+                    "name": product_name,
+                    "type_id": product_type_id,
+                    "me": bp.get("material_efficiency", 0),
+                    "te": bp.get("time_efficiency", 0),
+                    "is_original": is_original,
+                    "runs": "∞" if runs == -1 else runs,
+                })
+
+    # SDE — other blueprints (not owned)
+    if owned_product_ids:
+        ph2 = ",".join("?" * len(owned_product_ids))
+        other_rows = conn.execute(f"""
+            SELECT DISTINCT t.type_id, t.name
+            FROM sde_types t
+            JOIN sde_blueprint_products sbp ON sbp.product_type_id = t.type_id
+            WHERE LOWER(t.name) LIKE ?
+              AND sbp.activity IN ('manufacturing', 'reaction')
+              AND t.type_id NOT IN ({ph2})
+            ORDER BY t.name LIMIT 15
+        """, [pattern] + list(owned_product_ids)).fetchall()
+    else:
+        other_rows = conn.execute("""
+            SELECT DISTINCT t.type_id, t.name
+            FROM sde_types t
+            JOIN sde_blueprint_products sbp ON sbp.product_type_id = t.type_id
+            WHERE LOWER(t.name) LIKE ?
+              AND sbp.activity IN ('manufacturing', 'reaction')
+            ORDER BY t.name LIMIT 15
+        """, [pattern]).fetchall()
+
+    conn.close()
+    return {
+        "owned": owned,
+        "other": [{"name": r[1], "type_id": r[0]} for r in other_rows],
+    }
