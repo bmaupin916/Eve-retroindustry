@@ -5,10 +5,19 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.37. **525 tests green**, 8 skip unless a
-  Postgres is reachable — and they have skipped through every commit of this
-  work, so nothing here is verified against Postgres yet.
-* **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
+* Branch `docs/hosted-v2-design`, v0.9.38. **541 tests green, 1 skipped** — and
+  the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
+  now been run: the schema builds, all three migrations reach head on it, and
+  the eight tests that had skipped through every previous commit all pass. The
+  first run did fail once, correctly: `test_only_our_own_ids_are_generated`
+  whitelists the tables allowed to mint their own ids, and `sync_events` —
+  added after that whitelist was written — belongs on it, because its id *is*
+  the cursor a consumer resumes from. Its sibling `char_jobs_cache` correctly
+  did **not** appear, being keyed on a CCP character id. The assertion did its
+  job on a table it had never seen.
+* **W11 is done.** SQLite holds up under the sync worker, and that is now
+  asserted rather than assumed — see `tests/test_sqlite_under_the_worker.py`.
+* **W6 is done.** `main.py` 7,112 → 835 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
 * Step 4 is **7.5 of 8** items. What is left is the rest of the cache-only
   conversion (`/jobs` done, eight pages to go) and the query conversion
@@ -161,10 +170,15 @@ work, not a move, and the event model has to be decided before it is written.
 In order. The first is ten minutes and is the only one that can invalidate work
 already committed.
 
-1. **Start Postgres and run the suite against it.** Eight tests have skipped
-   through every commit of this work. The schema, both new migrations and the
-   one converted query module are unverified against the backend the whole
-   conversion exists for.
+1. **Run `projects` against Postgres.** This is the one that matters now. The
+   Postgres suite covers the *schema*; `tests/test_projects.py` runs entirely
+   on the SQLite `client` fixture, so the two changes in `projects_helper.py`
+   that exist *only* because Postgres differs have never executed there:
+   the qualified `SET needed = project_shopping.needed + excluded.needed` (an
+   unqualified column resolves to the proposed row on Postgres and the stored
+   row on SQLite) and the `COUNT(DISTINCT CASE …)` that undoes the two-LEFT-JOIN
+   cartesian product. One converted module, and its Postgres-specific behaviour
+   is still unproven on Postgres. Do this before converting the other ten.
 2. **Sign in.** `characters` and `app_owner` are empty after the test-data
    cleanup, so the worker has nothing to sync and every page is blank. The
    cached assets, blueprints, wallet and skills for all three real characters
@@ -174,9 +188,11 @@ already committed.
 
 ## How to work on this without wasting an afternoon
 
-Measured from the session that built most of Step 4: **1,166 tool calls, of
-which 65 were full-suite runs at three minutes each — over three hours of
-wall-clock spent re-running tests.** Most of those runs told us nothing.
+Measured from the session that built most of Step 4, by timing every tool call
+in the transcript rather than counting them: **4.7 hours were spent inside tool
+calls, and 3.5 of those hours were 71 whole-suite pytest runs — 74% of all
+working time spent waiting for tests.** The 209 targeted runs in the same
+session cost 25 minutes between them. Most of the 71 told us nothing.
 
 * **Run the targeted file while working; run the full suite once, before the
   commit.** Not after every edit. `pytest tests/test_x.py` is two seconds.
@@ -184,10 +200,13 @@ wall-clock spent re-running tests.** Most of those runs told us nothing.
   runs; at three minutes each that is half an hour to learn something a
   two-second run tells you.
 * **Never build Python source in a bash heredoc.** The tool collapses
-  backslashes, so a string containing `
-` arrives as a real newline and the
-  file no longer parses. This cost four separate repair cycles before the
-  lesson stuck. Use the Write or Edit tool for anything with escapes in it.
+  backslashes, so a two-character escape sequence arrives in the file as a real
+  newline and the source no longer parses. **This bullet was itself written
+  through a heredoc and corrupted by the bug it describes** — it has said
+  "a string containing `" followed by a line break ever since, which is the
+  most direct demonstration available. Use the Write or Edit tool for anything
+  containing escapes, regexes, or nested quotes. Four separate repair cycles in
+  one session before the lesson stuck.
 * **Never `git add -A`.** It swept unrelated files into a commit twice, each
   needing a reset and a re-commit. Name the paths.
 * **When a test is flaky, probe the state — do not re-run the suite.** The

@@ -98,7 +98,11 @@ def test_only_our_own_ids_are_generated(pg):
         pg, "SELECT table_name FROM information_schema.columns "
             "WHERE table_schema='pytest_eve' AND column_default LIKE 'nextval%'")}
     assert generated == {"margin_watchlist", "production_projects",
-                         "project_jobs", "project_plans"}
+                         "project_jobs", "project_plans", "sync_events"}
+    # `sync_events` mints its own ids on purpose: the id *is* the cursor a
+    # consumer resumes from, so it has to be monotonic and locally assigned.
+    # Its sibling `char_jobs_cache` is keyed on a CCP character_id and is
+    # absent from this set, which is the distinction the test exists to keep.
 
 
 def test_epoch_columns_survive_2038(pg):
