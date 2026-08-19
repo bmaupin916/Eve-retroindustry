@@ -41,7 +41,7 @@ import sqlite3
 from app.bom.resolver import BOMResolver
 from app.manufacturing.margins import _station_context
 from app.manufacturing.planner import calc_job_time
-from app.market.taxes import selling_costs
+from app.market.taxes import BuyingCosts, buying_costs, selling_costs
 from app.web.app_defaults import get_defaults, is_configured
 from app.web.industry_helper import get_adjusted_prices_cached
 
@@ -269,14 +269,21 @@ def raw_unit_cost(resolver: BOMResolver, type_id: int, prices: dict[int, float |
     return memo[type_id]
 
 
-def _prices(conn: sqlite3.Connection, type_ids: set[int],
-            basis: str) -> dict[int, float | None]:
+def _prices(conn: sqlite3.Connection, type_ids: set[int], basis: str,
+            costs: BuyingCosts | None = None) -> dict[int, float | None]:
     """{type_id: unit price} on the given basis, custom overrides winning.
 
     Deliberately the same rule the margin tracker follows — an override is a
     deliberate "this is what it actually costs me" statement, so it beats the
     market on both sides. A second, subtly different price path would make this
     page disagree with `/margins` about the same material.
+
+    `costs` adds the acquisition broker fee for an input basis. It is applied
+    to the *market* price only and before overrides land, for the same reason
+    overrides win at all: a stated real cost already includes whatever it
+    really cost, and marking it up would contradict the statement. Pass None
+    for the output basis — that is the selling side, and its costs come from
+    `selling_costs`.
     """
     if not type_ids:
         return {}
@@ -288,7 +295,8 @@ def _prices(conn: sqlite3.Connection, type_ids: set[int],
         f"WHERE type_id IN ({ph})", ids
     ):
         chosen = buy if basis == "buy" else sell
-        out[tid] = chosen or None
+        chosen = chosen or None
+        out[tid] = costs.paid(chosen) if costs else chosen
     try:
         for tid, override in conn.execute(
             f"SELECT type_id, price FROM custom_price_override WHERE type_id IN ({ph})", ids
@@ -448,8 +456,10 @@ def build_board(conn: sqlite3.Connection, db_path: str,
     venue_info = local
 
     all_ids = {r[0] for r in conn.execute("SELECT type_id FROM market_price_cache")}
-    raw_prices = _prices(conn, all_ids, raw_basis)
-    int_prices = _prices(conn, all_ids, int_basis)
+    # Inputs carry the acquisition broker fee; the output does not — that side
+    # is priced by `selling_costs`, and charging both would double-count.
+    raw_prices = _prices(conn, all_ids, raw_basis, buying_costs(raw_basis, defaults))
+    int_prices = _prices(conn, all_ids, int_basis, buying_costs(int_basis, defaults))
     out_prices = _prices(conn, all_ids, out_basis)
     volumes = _volumes(conn)
     raw_memo: dict[int, float | None] = {}

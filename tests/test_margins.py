@@ -336,3 +336,105 @@ def test_settings_exposes_industry_defaults(client):
     assert "Industry defaults" in page
     assert client.post("/api/settings/defaults",
                        json={"build_station_id": "60003760"}).json()["ok"] is True
+
+
+# ── The acquisition broker fee ───────────────────────────────────────────────
+#
+# `app/market/taxes.py` was sell-side only: buying materials was modelled as
+# free on every basis. It is free on one — buying instantly off a sell order.
+# Placing your own buy order costs a broker fee, and the input-basis setting
+# picks between exactly those two. Understated cost is overstated profit, so
+# this failed in the flattering direction.
+
+def _margin_on(conn, path, basis, **extra):
+    from app.manufacturing.margins import compute_margin
+    from app.web.app_defaults import get_defaults
+
+    defaults = dict(get_defaults(conn))
+    defaults["input_basis"] = basis
+    defaults.update(extra)
+    return compute_margin(conn, path, CRANE, me=0, te=0, defaults=defaults)
+
+
+def _price_tree_flat(conn, path, unit=10.0):
+    """Every leaf at the same price on *both* sides.
+
+    The shared fixture prices buy at 90% of sell, which is realistic and useless
+    here: comparing bases would then measure the spread, not the fee. With both
+    sides equal the only thing that can move the cost is the broker fee.
+    """
+    from app.bom.resolver import BOMResolver
+    resolver = BOMResolver(connect_to_path(path))
+    leaves = resolver.resolve(CRANE, 1, me=0).aggregate_leaves()
+    for leaf_id in leaves:
+        _price(conn, leaf_id, unit, buy=unit)
+    for dc_id in _datacores(conn, CRANE):
+        _price(conn, dc_id, unit, buy=unit)
+    _price(conn, CRANE, 500_000_000.0)
+    return leaves
+
+
+def test_buying_on_orders_costs_more_than_buying_instantly(db):
+    """The whole point, stated as an event: at the same quoted price, the basis
+    that requires placing an order has to cost more than taking one."""
+    path, conn = db
+    _price_tree_flat(conn, path)
+
+    instant = _margin_on(conn, path, "sell", broker_relations_skill=0)
+    on_orders = _margin_on(conn, path, "buy", broker_relations_skill=0)
+
+    assert on_orders.material_cost > instant.material_cost, (
+        "placing buy orders was costed as free — the broker fee is missing")
+
+
+def test_the_markup_is_exactly_the_broker_rate(db):
+    """Not just "more": the right amount more. A fee applied twice, or applied
+    to the job fee as well, would also pass the test above."""
+    path, conn = db
+    from app.market.taxes import buying_costs
+    _price_tree_flat(conn, path)
+
+    instant = _margin_on(conn, path, "sell", broker_relations_skill=0)
+    on_orders = _margin_on(conn, path, "buy", broker_relations_skill=0)
+    rate = buying_costs("buy", {"broker_relations_skill": 0}).broker_fee
+
+    assert on_orders.material_cost == pytest.approx(
+        instant.material_cost * (1.0 + rate)), (
+        f"expected exactly a {rate:.1%} markup on the material cost")
+
+
+def test_broker_relations_shows_up_in_the_build_cost(db):
+    """The skill has to reach the number, not just the fee helper."""
+    path, conn = db
+    _price_tree_flat(conn, path)
+
+    untrained = _margin_on(conn, path, "buy", broker_relations_skill=0)
+    trained = _margin_on(conn, path, "buy", broker_relations_skill=5)
+
+    assert trained.material_cost < untrained.material_cost, (
+        "Broker Relations does not reach the material cost")
+
+
+def test_a_custom_override_is_not_marked_up(db):
+    """An override is a deliberate "this is what it really costs me". Adding a
+    broker fee on top contradicts the statement the user made."""
+    path, conn = db
+    from app.manufacturing.margins import _cached_prices
+
+    leaves = _price_tree_flat(conn, path)
+    target = next(iter(leaves))
+    conn.execute("INSERT OR REPLACE INTO custom_price_override (type_id, price)"
+                 " VALUES (?,?)", (target, 10.0))
+    conn.commit()
+
+    prices, overridden = _cached_prices(conn, {target})
+    assert target in overridden, "the override was not reported as one"
+
+    with_override = _margin_on(conn, path, "buy", broker_relations_skill=0)
+    conn.execute("DELETE FROM custom_price_override WHERE type_id=?", (target,))
+    conn.commit()
+    without = _margin_on(conn, path, "buy", broker_relations_skill=0)
+
+    assert with_override.material_cost < without.material_cost, (
+        "the overridden material was marked up like a market buy, so the "
+        "user's stated real cost was overridden in turn")

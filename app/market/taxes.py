@@ -186,3 +186,72 @@ def order_broker_fee(order_value: float, rate: float) -> float:
     if rate <= 0 or order_value <= 0:
         return 0.0
     return max(MIN_BROKER_FEE, order_value * rate)
+
+
+# ── Buying ───────────────────────────────────────────────────────────────────
+#
+# The other half of the trade, and it was missing entirely. This module opened
+# with "What it costs to sell", and every profit figure in the app was built on
+# the assumption that acquiring materials is free. It is, but only one way:
+#
+#   * buying off an existing **sell** order is instant and costs no broker fee
+#   * placing your own **buy** order and waiting costs a broker fee, same rate
+#     and same standings maths as listing a sell order
+#
+# The input basis setting chooses between exactly those two. So a basis of
+# "buy" — which is the reactions board's default for raw inputs — understated
+# material cost by the full broker rate, and understatement of cost is
+# overstatement of profit.
+
+
+@dataclass(frozen=True)
+class BuyingCosts:
+    """What acquiring a unit costs on top of its quoted price."""
+    broker_fee: float = 0.0     # fraction added to the quoted price
+    basis: str = "sell"
+
+    @property
+    def pct(self) -> float:
+        return self.broker_fee * 100.0
+
+    def on(self, gross: float | None) -> float:
+        """ISK of fee on a purchase of `gross`."""
+        return (gross or 0.0) * self.broker_fee
+
+    def paid(self, unit: float | None) -> float | None:
+        """What one unit really costs, fee included. None stays None, because
+        "not priced" must not silently become "free"."""
+        return None if unit is None else unit * (1.0 + self.broker_fee)
+
+
+def buying_costs(basis: str | None = None, defaults: dict | None = None,
+                 **overrides) -> BuyingCosts:
+    """Build `BuyingCosts` for an input basis, from the app defaults.
+
+    `basis` picks which cost applies, mirroring `sales_method` on the sell
+    side:
+      * ``"sell"`` — buy instantly off someone's sell order: no broker fee
+      * ``"buy"``  — place a buy order and wait: broker fee, same rate as a
+        sell order at the same venue and standings
+
+    Anything unrecognised is treated as ``"sell"``, which is the no-fee answer
+    — an unknown basis must not invent a charge.
+    """
+    cfg = dict(defaults or {})
+    cfg.update({k: v for k, v in overrides.items() if v is not None})
+
+    chosen = str(basis or cfg.get("input_basis") or "sell").lower()
+    if chosen != "buy":
+        return BuyingCosts(broker_fee=0.0, basis="sell")
+
+    # Buy orders are placed at the venue you are buying *in*. There is no
+    # separate "buy venue" setting, so the sell venue stands in for it: both
+    # describe the station this character trades at.
+    fee = broker_fee_rate(
+        venue=cfg.get("sell_venue", "npc"),
+        broker_relations=cfg.get("broker_relations_skill"),
+        faction_standing=cfg.get("faction_standing"),
+        corp_standing=cfg.get("corp_standing"),
+        structure_fee_pct=cfg.get("structure_broker_pct"),
+    )
+    return BuyingCosts(broker_fee=fee, basis="buy")

@@ -660,3 +660,57 @@ def test_the_filter_stays_case_sensitive():
     assert not bad("Contest Trophy Blueprint")
     assert not bad("test drive blueprint"), "lowercase is not CCP's convention"
     assert not bad("Latest Model Blueprint")
+
+
+# ── The acquisition broker fee ───────────────────────────────────────────────
+#
+# This board is the surface most affected by it: `raw_input_basis` defaults to
+# "buy", meaning the model assumes you place buy orders for moon materials —
+# which costs a broker fee that `taxes.py` did not charge. Every reaction's
+# input cost was understated, so every margin on the page was flattered.
+
+def _tc_row(conn, path, **defaults):
+    from app.web.app_defaults import get_defaults, save_defaults
+    from app.web.reactions_helper import build_board
+    if defaults:
+        save_defaults(conn, defaults)
+    get_defaults(conn)
+    return next(r for r in build_board(conn, path)["rows"]
+                if r["type_id"] == TUNGSTEN_CARBIDE)
+
+
+def _price_tc_inputs(conn, path, unit=10.0):
+    from app.bom.resolver import BOMResolver
+    resolver = BOMResolver(connect_to_path(path))
+    bp = resolver.find_blueprint(TUNGSTEN_CARBIDE)
+    for mat in resolver.get_materials(bp["blueprint_type_id"], "reaction"):
+        _price(conn, mat["material_type_id"], unit, buy=unit)
+    _price(conn, TUNGSTEN_CARBIDE, 500.0, buy=500.0)
+
+
+def test_reaction_inputs_carry_the_acquisition_fee(db):
+    """Same quoted price on both sides, so the only thing that can move the
+    input cost between bases is the broker fee."""
+    path, conn = db
+    _price_tc_inputs(conn, path)
+
+    instant = _tc_row(conn, path, raw_input_basis="sell",
+                      intermediate_input_basis="sell", broker_relations_skill=0)
+    on_orders = _tc_row(conn, path, raw_input_basis="buy",
+                        intermediate_input_basis="buy", broker_relations_skill=0)
+
+    assert on_orders["material_cost"] > instant["material_cost"], (
+        "reaction inputs on the buy basis were costed as free to acquire")
+
+
+def test_the_output_is_not_charged_an_acquisition_fee(db):
+    """The output is sold, not bought. Charging it the buy-side fee as well
+    would double-count against `selling_cost`, which already prices that side."""
+    path, conn = db
+    _price_tc_inputs(conn, path)
+
+    row = _tc_row(conn, path, raw_input_basis="buy",
+                  intermediate_input_basis="buy", broker_relations_skill=0)
+
+    assert row["sell_price"] == pytest.approx(500.0), (
+        "the sale price was marked up by the acquisition fee")

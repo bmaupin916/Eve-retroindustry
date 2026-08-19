@@ -55,7 +55,7 @@ from app.bom.resolver import (
     BOMResolver, InventionParams, StationFacility, total_invention_cost,
 )
 from app.manufacturing.planner import calc_job_time
-from app.market.taxes import selling_costs
+from app.market.taxes import buying_costs, selling_costs
 from app.manufacturing import invention as invention_mod
 
 # Sales tax component of the official job-cost formula:
@@ -107,27 +107,35 @@ class MarginRow:
         return self.error is None and not self.unpriced and self.sell_price is not None
 
 
-def _cached_prices(conn: sqlite3.Connection, type_ids: set[int]) -> dict[int, tuple]:
-    """{type_id: (sell, buy)} from the Jita cache, custom overrides winning.
+def _cached_prices(conn: sqlite3.Connection,
+                   type_ids: set[int]) -> tuple[dict[int, tuple], set[int]]:
+    """`({type_id: (sell, buy)}, overridden_ids)` — custom overrides winning.
 
     An override is a deliberate "this is what it really costs me" statement, so
-    it beats the market on both sides.
+    it beats the market on both sides. The id set is returned because that same
+    statement means an override must *not* then have an acquisition broker fee
+    added on top: the user has already said what it costs. The fee cannot be
+    folded into the prices here, because this one dict serves both "what I pay
+    for a material" and "what I sell the product for", and only the first side
+    is a purchase.
     """
     if not type_ids:
-        return {}
+        return {}, set()
     placeholders = ",".join("?" * len(type_ids))
     ids = list(type_ids)
     prices = {r[0]: (r[1], r[2]) for r in conn.execute(
         f"SELECT type_id, sell_price, buy_price FROM market_price_cache "
         f"WHERE type_id IN ({placeholders})", ids)}
+    overridden: set[int] = set()
     try:
         for type_id, override in conn.execute(
             f"SELECT type_id, price FROM custom_price_override WHERE type_id IN ({placeholders})", ids
         ):
             prices[type_id] = (override, override)
+            overridden.add(type_id)
     except sqlite3.OperationalError:
         pass                      # overrides table not created yet
-    return prices
+    return prices, overridden
 
 
 def _pick(price: tuple | None, basis: str) -> float | None:
@@ -310,11 +318,18 @@ def compute_margin(
 
         leaves = node.aggregate_leaves()
         wanted = set(leaves) | {type_id}
-        prices = _cached_prices(conn, wanted)
+        prices, overridden = _cached_prices(conn, wanted)
+
+        # Acquiring the materials is not free on every basis: placing a buy
+        # order costs a broker fee, buying instantly off a sell order does not.
+        # Without this the "buy" basis reported a cheaper build than it is, and
+        # understated cost is overstated profit.
+        buy_costs = buying_costs(basis, defaults)
 
         cost = 0.0
         for leaf_id, (leaf_name, qty) in leaves.items():
-            unit = _pick(prices.get(leaf_id), basis)
+            quoted = _pick(prices.get(leaf_id), basis)
+            unit = quoted if leaf_id in overridden else buy_costs.paid(quoted)
             if unit is None:
                 row.unpriced.append(leaf_name)
                 continue
@@ -396,8 +411,16 @@ def build_invention_params(conn: sqlite3.Connection, defaults: dict,
         sde.close()
     if decryptor:
         wanted.add(decryptor.type_id)
-    cached = _cached_prices(conn, wanted)
-    unit_prices = {tid: _pick(cached.get(tid), basis) for tid in wanted}
+    cached, dc_overridden = _cached_prices(conn, wanted)
+    # Datacores are bought like any other material, so they carry the same
+    # broker fee on a "buy" basis. Pricing them differently from the rest of
+    # the row is how two figures on one page start disagreeing.
+    dc_costs = buying_costs(basis, defaults)
+    unit_prices = {
+        tid: (_pick(cached.get(tid), basis) if tid in dc_overridden
+              else dc_costs.paid(_pick(cached.get(tid), basis)))
+        for tid in wanted
+    }
 
     warnings: list[str] = []
     decryptor_price = 0.0

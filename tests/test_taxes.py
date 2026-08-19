@@ -139,3 +139,59 @@ def test_upwell_settings_ignore_the_stored_skills():
     c = selling_costs(saved)
     assert c.broker_fee == pytest.approx(0.015)     # 0.5% SCC + 1% owner, no skills
     assert c.sales_tax == pytest.approx(0.03375)    # Accounting still applies
+
+
+# ── Buying: the other half of the trade ──────────────────────────────────────
+#
+# This module was sell-side only, and every profit figure in the app was built
+# on the assumption that acquiring materials is free. It is — but only when you
+# buy instantly off somebody's sell order. Placing your own buy order and
+# waiting costs a broker fee at the same rate, and the input-basis setting
+# chooses between exactly those two.
+#
+# The reactions board defaults its raw inputs to the "buy" basis, so this was
+# understating cost — and therefore overstating profit — on the page most
+# likely to be used for a build/skip decision.
+
+from app.market.taxes import BuyingCosts, buying_costs
+
+
+def test_buying_off_a_sell_order_costs_no_broker_fee():
+    """You are taking someone else's order, not placing one."""
+    assert buying_costs("sell").broker_fee == 0.0
+    assert buying_costs("sell").paid(100.0) == 100.0
+
+
+def test_placing_a_buy_order_costs_the_broker_fee():
+    costs = buying_costs("buy")
+    assert costs.broker_fee == pytest.approx(0.03), "base NPC broker fee is 3%"
+    assert costs.paid(100.0) == pytest.approx(103.0)
+
+
+def test_broker_relations_reduces_the_buy_fee_like_the_sell_fee():
+    """Same rate, same skill, same standings — it is the same broker."""
+    trained = buying_costs("buy", {"broker_relations_skill": 5})
+    assert trained.broker_fee == pytest.approx(0.015)
+    assert trained.broker_fee < buying_costs("buy").broker_fee
+
+
+def test_an_unknown_basis_invents_no_charge():
+    """A typo in a stored setting must not silently add a fee to every input."""
+    assert buying_costs("nonsense").broker_fee == 0.0
+    assert buying_costs(None).broker_fee == 0.0
+    assert buying_costs("").broker_fee == 0.0
+
+
+def test_an_unpriced_input_stays_unpriced():
+    """None means "we could not price this" and has to survive the fee, or a
+    missing price becomes a confident zero — the exact failure this codebase
+    reports rather than hides."""
+    assert buying_costs("buy").paid(None) is None
+    assert buying_costs("sell").paid(None) is None
+
+
+def test_the_fee_is_a_markup_not_a_deduction():
+    """Direction matters: buying costs *more*, selling nets *less*. Getting the
+    sign wrong would flatter the build instead of charging it."""
+    assert buying_costs("buy").paid(1000.0) > 1000.0
+    assert BuyingCosts(broker_fee=0.03).on(1000.0) == pytest.approx(30.0)
