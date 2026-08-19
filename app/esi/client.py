@@ -1,6 +1,10 @@
-import httpx
 import asyncio
+import hashlib
 import time
+from collections import OrderedDict
+
+import httpx
+
 from typing import Optional
 
 from app.version import USER_AGENT
@@ -230,6 +234,105 @@ class _EntityQuarantine:
 _QUARANTINE = _EntityQuarantine()
 
 
+# --- conditional requests -----------------------------------------------------
+# ESI answers every GET with an ETag and honours If-None-Match. A 304 costs one
+# token of the error budget instead of two, carries no body, and returns in a
+# fraction of the time — and most of what this app fetches (assets, blueprints,
+# skills, contracts) changes far less often than it is asked for.
+#
+# Doing it here rather than at each call site means every fetch gets it, and no
+# caller has to learn about 304: a hit is replayed as the 200 it was, with the
+# headers that mattered — X-Pages above all, since the paginated fetchers read
+# it to decide how many more requests to make.
+#
+# `app/market/prices.py` keeps its own ETag store, persisted, because market
+# history needs the *previous body* recomputed against a moving 7-day window
+# rather than replayed. It sets If-None-Match itself, and a request that already
+# carries one is left alone.
+class _ETagCache:
+    #: Total body bytes held. Assets for a large character run to a few MB.
+    MAX_BYTES = 32 * 1024 * 1024
+    #: Bodies larger than this are not worth holding; they are also the rarest.
+    MAX_ENTRY = 4 * 1024 * 1024
+    #: Replayed on a hit. Everything else is regenerated or irrelevant.
+    KEEP_HEADERS = ("content-type", "x-pages", "expires", "last-modified")
+
+    def __init__(self) -> None:
+        self._entries: "OrderedDict[str, tuple[str, bytes, list[tuple[str, str]]]]" = (
+            OrderedDict()
+        )
+        self._bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def key(request: httpx.Request) -> str:
+        """URL plus a fingerprint of the credential.
+
+        Two characters asking for /characters/{id}/assets/ use different URLs,
+        but corp endpoints do not — the same /corporations/{id}/assets/ answers
+        differently depending on whose token asked, and roles differ per member.
+        The token itself is never stored.
+        """
+        auth = request.headers.get("authorization", "")
+        who = hashlib.sha256(auth.encode()).hexdigest()[:16] if auth else "-"
+        return f"{request.method} {request.url} {who}"
+
+    def etag_for(self, key: str) -> Optional[str]:
+        entry = self._entries.get(key)
+        return entry[0] if entry else None
+
+    def replay(self, key: str, request: httpx.Request) -> Optional[httpx.Response]:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        self._entries.move_to_end(key)
+        _etag, body, headers = entry
+        self.hits += 1
+        return httpx.Response(
+            200, request=request, content=body,
+            headers=headers + [("x-eve-retroindustry-etag", "hit")],
+        )
+
+    def store(self, key: str, response: httpx.Response, body: bytes) -> None:
+        etag = response.headers.get("etag")
+        if not etag or len(body) > self.MAX_ENTRY:
+            return
+        headers = [(name, response.headers[name])
+                   for name in self.KEEP_HEADERS if name in response.headers]
+        if key in self._entries:
+            self._bytes -= len(self._entries[key][1])
+        self._entries[key] = (etag, body, headers)
+        self._entries.move_to_end(key)
+        self._bytes += len(body)
+        self.misses += 1
+        while self._bytes > self.MAX_BYTES and len(self._entries) > 1:
+            _dropped, (_e, dropped_body, _h) = self._entries.popitem(last=False)
+            self._bytes -= len(dropped_body)
+
+    def drop(self, key: str) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._bytes -= len(entry[1])
+
+    def reset(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+        self.hits = self.misses = 0
+
+    def stats(self) -> dict:
+        return {"entries": len(self._entries), "bytes": self._bytes,
+                "hits": self.hits, "misses": self.misses}
+
+
+_ETAGS = _ETagCache()
+
+
+def etag_stats() -> dict:
+    """How much the conditional-request cache is saving. For tests and health views."""
+    return _ETAGS.stats()
+
+
 def quarantine_state() -> dict[str, float]:
     """Entities currently held back, and for how many more seconds. For tests
     and for whatever ends up reporting sync health."""
@@ -323,6 +426,15 @@ class _GovernedTransport(httpx.AsyncHTTPTransport):
             request.headers["Authorization"] = auth
             added_auth = True
 
+        # Ask conditionally when we have seen this exact request before. Set
+        # after the market token, because that token is part of the cache key.
+        etag_key = None
+        if request.method == "GET" and "if-none-match" not in request.headers:
+            etag_key = _ETagCache.key(request)
+            known = _ETAGS.etag_for(etag_key)
+            if known:
+                request.headers["If-None-Match"] = known
+
         last: Optional[httpx.Response] = None
         for attempt in range(4):
             await _ERROR_LIMIT.wait()
@@ -369,6 +481,26 @@ class _GovernedTransport(httpx.AsyncHTTPTransport):
                 _QUARANTINE.refused(entity, response.status_code)
             elif response.is_success:
                 _QUARANTINE.succeeded(entity)
+
+            if etag_key is not None:
+                if response.status_code == 304:
+                    await response.aread()
+                    await response.aclose()
+                    replayed = _ETAGS.replay(etag_key, request)
+                    if replayed is not None:
+                        _QUARANTINE.succeeded(entity)   # 304 means the token worked
+                        return replayed
+                    # The entry went away between asking and answering; without
+                    # a body there is nothing to hand back, so ask again
+                    # unconditionally rather than returning an empty 304.
+                    del request.headers["If-None-Match"]
+                    continue
+                if response.status_code == 200:
+                    body = await response.aread()
+                    _ETAGS.store(etag_key, response, body)
+                    return httpx.Response(200, request=request, content=body,
+                                          headers=response.headers)
+                _ETAGS.drop(etag_key)
             return response
         return last  # exhausted retries — hand it back so raise_for_status fires
 

@@ -9,7 +9,8 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   Postgres is reachable.
 * **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
-* Step 4 is **5 of 8** items, plus the Postgres groundwork. The query
+* Step 4 is **6 of 8** items, plus the Postgres groundwork. What is left is
+  the background sync worker and the cache-only routes that depend on it. The query
   conversion has started: `projects` is done, ten modules to go.
 
 To bring the Postgres tests back:
@@ -110,7 +111,8 @@ Ordered by dependency, not by size.
 * **Cache-only routes** — no route fetches from ESI on the request path.
   `margins.py` is the reference, including how it reports what it could not
   price.
-* **ETags on every fetch.**
+* ~~**ETags on every fetch.**~~ **Done.** In the transport alongside the
+  quarantine. `etag_stats()` reports hits, misses and bytes held.
 * ~~**4XX quarantine per character.**~~ **Done.** In the transport
   (`app/esi/client.py`), keyed on the entity in the URL. `quarantine_state()`
   reports what is currently held, which is what a sync-health view would show.
