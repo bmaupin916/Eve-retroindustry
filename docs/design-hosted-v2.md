@@ -1224,7 +1224,7 @@ of this work), each mapped to the step that retires it:
 | W3 | OAuth callback binds all interfaces; `state` generated but never validated | **Step 2 — done, v0.9.27** |
 | W4 | Refresh tokens plaintext; no file permissions on `eve_cache.db` | Permissions **done, v0.9.27**; encryption at rest still Step 5 |
 | W5 | Full tracebacks returned to clients on 500 | **Step 2 — done, v0.9.27** |
-| W6 | `main.py` at 7,352 lines / 80 routes | Step 4 — **7,386 / 76 as of v0.9.29; it is still growing** |
+| W6 | `main.py` at 7,352 lines / 80 routes | **Done — Step 4, v0.9.31.** 822 lines and 3 routes; eleven routers under `app/web/routers/`, plus `app/web/deps.py` for what they share. The route table is pinned by `tests/test_route_inventory.py` and did not change. |
 | W7 | Three substantial features sitting uncommitted (PI planner, margins, job splitting) | **Step 0 — done, v0.9.23** |
 | W8 | Invention absent from the data model — every T2 figure optimistic | **Done — root v0.9.25, whole tree v0.9.29** |
 | W9 | Synchronous token refresh blocks the event loop (the v0.9.22 bug class) | Step 4 |
@@ -1460,13 +1460,13 @@ worker~~; split `main.py` into routers while every route is being touched anyway
 |---|---|
 | **Schema declared once** | ✅ **done.** `app/db/schema.py` holds all 51 tables as SQLAlchemy Core metadata. It replaced 34 DDL statements in 14 modules, 20 `ensure_*()` functions, 8 `ALTER TABLE` probes and a second copy of the SDE schema in `import_sde.py` — 549 lines deleted. Pinned by a call-site scan: no DDL may exist outside that module. |
 | **Migrations** | ✅ **done.** Alembic, baseline `5c9156e72c43`, run at startup. Pre-Alembic databases are stamped rather than rebuilt. `test_the_migrations_match_the_declaration` fails if the declaration and the history drift. |
-| **Postgres itself** | 🟡 **started.** The declaration emits Postgres DDL and `EVE_DATABASE_URL` is the seam. All 38 `INSERT OR REPLACE` statements are now `ON CONFLICT ... DO UPDATE`, which runs on both dialects; `strftime` is gone from queries and the pragma set is pinned. What remains is moving the call sites: ~316 statements use `?` placeholders and a raw `sqlite3.Connection`, and psycopg wants `%s`. `app/db/conn.py` is the seam and is proven against both backends; the schema, the migrations and the upsert helper all run on Postgres (`tests/test_postgres_schema.py`). The flip is atomic — `get_conn()` is shared by every module — and 105 of the statements are inside `main.py`, which argues for taking W6 first. |
+| **Postgres itself** | 🟡 **started.** The declaration emits Postgres DDL and `EVE_DATABASE_URL` is the seam. All 38 `INSERT OR REPLACE` statements are now `ON CONFLICT ... DO UPDATE`, which runs on both dialects; `strftime` is gone from queries and the pragma set is pinned. What remains is moving the call sites: ~316 statements use `?` placeholders and a raw `sqlite3.Connection`, and psycopg wants `%s`. `app/db/conn.py` is the seam and is proven against both backends; the schema, the migrations and the upsert helper all run on Postgres (`tests/test_postgres_schema.py`). The flip is atomic — `get_conn()` is shared by every module — which is why W6 went first: those 105 statements are now spread across eleven reviewable routers instead of one 7,000-line file. |
 | **Async token refresh** (W9) | ⬜ not started |
 | **Background sync worker** | ⬜ not started. Must emit events, not just fill caches — §9.5 depends on it. |
 | **Cache-only routes** | ⬜ not started |
 | **ETags on every fetch** | ⬜ not started |
 | **4XX quarantine per character** | ⬜ not started |
-| **Split `main.py`** (W6) | ⬜ not started. 7,386 lines / 76 routes. |
+| **Split `main.py`** (W6) | ✅ **done.** 7,112 → 822 lines. Eleven routers, one commit each, route table checked after every one. `app/web/deps.py` holds what more than one router needs — `get_conn`, `_tr`, the template filters, the active character — and may never import `main`, which is what makes the split possible. |
 
 Compatibility dates are struck through because that question was answered on 2026-08-18
 and was already handled — see §14.

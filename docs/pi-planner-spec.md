@@ -46,7 +46,8 @@ leaves up and keeps walking.
 ## 3. Module layout
 
 Follow existing conventions — logic in a package, view model in a
-`*_helper.py`, `main.py` stays thin (it is already 296 KB).
+`*_helper.py`, the route thin. Since W6 the routes live in
+`app/web/routers/`; the PI ones are in `routers/planets.py`.
 
 ```
 app/planetary/__init__.py
@@ -58,7 +59,7 @@ app/web/templates/pi_planner.html
 tests/test_pi_planner.py
 ```
 
-Plus: one route in `app/web/main.py`, one nav entry in
+Plus: one route in `app/web/routers/planets.py`, one nav entry in
 `app/web/templates/base.html`.
 
 ---
@@ -385,8 +386,10 @@ any of these — each affected product lands in the same bucket after ceiling.
 
 ## 10. Notes for the implementer
 
-- `app/web/main.py` is 296 KB. Put logic in the modules above; the route
-  should be thin.
+- Put logic in the modules above; the route should be thin. This spec was
+  written when every route lived in a 296 KB `main.py` — W6 has since split
+  that into `app/web/routers/`, but the reason for keeping a route thin has
+  not changed.
 - Mirror `BOMResolver`'s caching approach — memoise schematic lookups, type
   names and tiers on the resolver instance.
 - The resolver must be usable headless (constructor takes `db_path`) so tests

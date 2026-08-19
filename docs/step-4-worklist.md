@@ -3,14 +3,13 @@
 Delete this file when Step 4 closes. It is a worklist, not design: the design
 lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
-## Where the last session ended
+## Where this session ended
 
-* Branch `docs/hosted-v2-design` at **5911a72**, pushed to `fork`. `origin/main`
-  untouched at `7cce487`.
-* **438 tests green.** 8 skip unless a Postgres is reachable.
-* Step 4 is **2 of 8** items, plus most of the Postgres groundwork.
-* Local `eve_cache.db` is stamped at baseline `5c9156e72c43`, all six SDE
-  indexes present, 3 characters intact.
+* Branch `docs/hosted-v2-design`, v0.9.31. **433 tests green**, 8 skip unless a
+  Postgres is reachable.
+* **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
+  `app/web/routers/`, plus `app/web/deps.py` for what they share.
+* Step 4 is **3 of 8** items, plus the Postgres groundwork.
 
 To bring the Postgres tests back:
 
@@ -18,75 +17,37 @@ To bring the Postgres tests back:
 docker run -d --name eve-pg -e POSTGRES_PASSWORD=eve -e POSTGRES_USER=eve -e POSTGRES_DB=eve_retroindustry -p 55432:5432 postgres:17
 ```
 
-## Order, and why it is this order
+## The thing to read first
 
-1. **W6 first.** 105 of the ~316 statements are inside `main.py`. Converting
-   them there, in a 7,112-line file, during a cutover that cannot be done
-   halfway, is the highest-risk way to do it.
-2. **Then the query conversion.** It is atomic — `get_conn()` is shared by
-   every module, so the moment it returns a SQLAlchemy `Connection`, every
-   query must already speak named binds. Small reviewable routers make that
-   survivable.
-3. **Then the worker and the rest**, which are new code rather than moves.
+`tests/conftest.py`. The suite spent at least one session writing to the real
+`eve_cache.db`, because `EVE_APP_DIR` was set inside a fixture and fixtures run
+after collection — by which time a test module with a module-level app import
+had already bound the path. It cost the three real characters and their refresh
+tokens.
 
----
+Two guards now exist and both are mutation-checked: conftest sets the
+environment at import, and `pytest_collection_finish` refuses to run if
+`app.web.deps.DB_ABS` or `app.db.location.DB_PATH` point anywhere else.
 
-## 1. W6 — split `main.py` into routers
+**The shape of the bug is still in the code**: those two modules freeze a
+filesystem path at import, while `app/auth/esi_oauth.py` and
+`app/web/bootstrap.py` resolve it per call. Converting the other two would end
+the class rather than guard it — worth doing, ~7 call sites for `DB_ABS`.
 
-**Net:** `tests/test_route_inventory.py`. 80 routes by exact path and method,
-no duplicates, every handler named. Mutation-checked.
+## 1. The query conversion — atomic
 
-**Method: one router per commit.** Move, run `pytest
-tests/test_route_inventory.py`, run the full suite, commit. Each step is
-independently revertable — which matters, because step 2 is not.
-
-**Do this before moving any route.** The routers will all need `get_conn`,
-`_tr`, `_isk`, `_isk0`, `_wants_html` and friends, which are module-level in
-`main.py` today. Moving a route without moving those first means either a
-circular import or a copy. Give them a home — `app/web/deps.py` — as commit
-one, with `main.py` importing from it, and no routes moved at all. That commit
-should be a pure no-op to the route table.
-
-**Suggested order**, leaf-most first so each move touches fewer shared helpers:
-
-| # | Router | Routes | Notes |
-|---|---|---|---|
-| 1 | `prices` | 12 | includes 3 SSE streams — check `StreamingResponse` still returns from a router |
-| 2 | `projects` | 8 | |
-| 3 | `contracts` | 5 | |
-| 4 | `planets` / PI | 3 | |
-| 5 | `characters` | ~10 | assets, wallet, orders, blueprints, portrait |
-| 6 | `industry` | ~10 | station rigs, plan, jobs |
-| 7 | `auth` + `setup` | 8 | `/callback` sets the session cookie — exercise a real login after |
-| 8 | remainder | ~24 | dashboard, settings, margins, reactions, about, sync |
-
-**Stays in `main.py`:** the `app` object itself (the `app_module` test fixture
-imports it), the startup handler, and the `_setup_gate` / Host-check
-middleware.
-
-**Traps:**
-
-* Templates call `url_for` with **handler names**. Renaming a function while
-  moving it breaks a page with no test failure. The inventory test checks names
-  exist, not that they are unchanged — so do not rename.
-* `_SDE_READY` and the other module-level `list[bool]` flags are read by both
-  the middleware and the routers. They belong in `deps.py`, not duplicated.
-* Two decorators on one path is the classic botched move. FastAPI serves the
-  first and the second becomes live-looking dead code; the inventory test
-  catches it.
-
-**Done when:** `main.py` is plausibly under ~1,000 lines, the inventory test is
-untouched and green, and W6 can be marked closed in the worry register.
-
----
-
-## 2. The query conversion — atomic
-
-**Target:** `app/db/conn.py`, already proven on both backends
-(`tests/test_db_conn.py`, `tests/test_postgres_schema.py`).
+**Target:** `app/db/conn.py`, proven on both backends (`tests/test_db_conn.py`,
+`tests/test_postgres_schema.py`).
 
 `?` + tuple → `:name` + dict, then `get_conn()` returns a SQLAlchemy
-`Connection`. Roughly 316 statements.
+`Connection`. Roughly 316 statements. W6 went first so this lands in eleven
+reviewable files instead of one; the routers can be converted one at a time,
+but **the flip itself cannot** — `get_conn()` is shared, so the last commit
+changes every remaining call site at once.
+
+Suggested order, smallest first: `projects` (150 lines), `media`, `industry`,
+`contracts`, `characters`, `planets`, `locations`, `prices`, `assets`, `plan`,
+then `deps.py` + `main.py` + the flip.
 
 **Traps, each already pinned by a test or found the hard way:**
 
@@ -99,23 +60,22 @@ untouched and green, and W6 can be marked closed in the worry register.
   `bindparam(..., expanding=True)`, not string building.
 * **`executemany`** takes a list of dicts, not a list of tuples.
 * **`row[0]` still works** — SQLAlchemy `Row` indexes positionally. Verified,
-  so the readers of results do not have to change.
+  so readers of results do not have to change.
 * **`upsert()` still emits `?`** by design, because its callers pass tuples. It
   has to start emitting named binds in the same commit as its call sites.
 * **`cursor.lastrowid`** has no direct equivalent; use `RETURNING id`.
 
-**Verify:** full suite on SQLite, then the same suite with
-`EVE_DATABASE_URL` pointed at the container. Both must pass before the commit
-lands.
+**Verify:** full suite on SQLite, then the same suite with `EVE_DATABASE_URL`
+pointed at the container. Both must pass before the commit lands.
 
----
-
-## 3. Remaining Step 4 items
+## 2. Remaining Step 4 items
 
 Ordered by dependency, not by size.
 
 * **W9 — async token refresh.** The current refresh is synchronous and blocks
   the event loop; this is the v0.9.22 bug class and it is still live.
+  `deps._valid_token_async` is the pattern to follow — it already exists and
+  already does the right thing for the dashboard and the first sync.
 * **Background sync worker** — delay-after-completion plus jitter, so N
   characters do not stampede ESI in lockstep. **Decide the event model before
   writing it**: §9.5 needs it to emit events rather than only fill caches,
@@ -128,21 +88,31 @@ Ordered by dependency, not by size.
 * **4XX quarantine per character** — one revoked token must not burn the shared
   error budget for everyone.
 
----
+## What W6 taught that applies to the rest
+
+* **A test that patches `app_module.X` breaks silently when `X` moves.** Nine
+  test files needed repointing. The attribute-access form fails at the call
+  site; the string form (`monkeypatch.setattr(app_module, "X", ...)`) fails at
+  the patch, which is louder. Prefer the string form.
+* **pyflakes earns its place.** It found two live bugs on the first run —
+  `_bg_fetch_prices` calling `_esi_client()` and `_resolve_corp_container_names`
+  posting an undefined `owned_ids`, both swallowed by a broad `except` — and it
+  is what makes a router move safe to do quickly.
+  `tests/test_no_undefined_names.py` runs it over the package.
+* **A green suite is not a working suite.** The route inventory would have
+  stopped seeing routes the moment the first one moved into a router, because
+  FastAPI 0.141 does not flatten included routers into `app.routes`. Check that
+  a net still catches something before trusting it.
 
 ## Honest scope note
 
 The design doc estimates 3–5 sessions for all of Step 4, at **low confidence**,
-and calls it the item most likely to double. One long session produced 2 of 8
-items plus the Postgres groundwork.
+and calls it the item most likely to double. Two long sessions have produced 3
+of 8 items plus the Postgres groundwork — roughly on the pessimistic end of
+that estimate, which is where it was always likely to land.
 
-W6 and the query conversion together are a realistic session. Expecting W6, the
-conversion, the worker, ETags, quarantine and cache-only routes in one is not —
-and the worker in particular is new design work, not a move.
-
-If the goal is to *close* Step 4 rather than progress it, the thing to protect
-is the sequencing: W6 → conversion → worker. Doing the conversion before the
-split, or the worker before the conversion, is how the estimate doubles.
+The conversion and the worker are each a session. The worker is new design
+work, not a move, and the event model has to be decided before it is written.
 
 ## Still unresolved
 
@@ -150,3 +120,7 @@ split, or the worker before the conversion, is how the estimate doubles.
   the hosted tool it is plumbing for, which inverts the order §11 argues for.
 * **Open question 8** — verify sales tax and broker's fee in game against the
   wallet journal. Only you can do this one.
+* **The characters were not restored.** `eve_cache.db.bak-before-character-reset`
+  still holds Astroasia and Tracy Juan with their refresh tokens if signing in
+  again turns out not to be enough. `app_owner` is empty, so the first real
+  login claims the instance.
