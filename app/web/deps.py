@@ -1,0 +1,293 @@
+"""Shared request-scoped plumbing: the database connection, the template
+environment and its filters, and the active character.
+
+This module exists for W6 (`docs/design-hosted-v2.md` §11), which splits
+`app/web/main.py` into routers. Every router needs `get_conn()` and `_tr()`,
+and both lived in `main.py` — so a router importing them would import the
+module that imports the router. This is the leaf that breaks that cycle.
+
+Nothing here may import `app.web.main`, now or later. That is the whole
+property the module is for.
+"""
+from __future__ import annotations
+
+import datetime
+import os
+import sqlite3
+import time as _time
+from pathlib import Path
+
+from fastapi import Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+
+from app.auth.token_store import (
+    list_characters,
+    get_character_row,
+    get_valid_token as _get_valid_token_for,
+)
+from app.db.schema import (
+    ensure_schema as ensure_db_schema,
+    ensure_sde_schema,
+)
+
+# Path resolution. EVE_APP_DIR is the writable data directory and is what a
+# deployment sets; EVE_BUNDLE_DIR is a leftover seam from the retired desktop
+# build, where read-only bundled files lived apart from writable ones. Both
+# default to the project root, which is correct for a server install.
+_APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
+_BUNDLE_DIR = os.environ.get("EVE_BUNDLE_DIR") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
+
+DB_ABS = os.path.join(_APP_DIR, "eve_cache.db")
+TEMPLATES_DIR = Path(_BUNDLE_DIR) / "app" / "web" / "templates"
+STATIC_DIR = Path(_BUNDLE_DIR) / "app" / "web" / "static"
+
+# Set to True once SDE tables are confirmed present. Guards the setup gate.
+_SDE_READY: list[bool] = [False]
+
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+
+def _wants_html(request: Request) -> bool:
+    return "text/html" in request.headers.get("accept", "")
+
+
+def _deny(request: Request, status: int, message: str):
+    """Refuse a request the way its caller can understand."""
+    from fastapi.responses import JSONResponse, PlainTextResponse
+
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"ok": False, "error": message}, status_code=status)
+    if status == 401 and _wants_html(request):
+        return RedirectResponse("/auth/login", status_code=303)
+    return PlainTextResponse(message, status_code=status)
+
+
+def _isk(v: float | None) -> str:
+    if v is None:
+        return "N/A"
+    return f"{v:,.2f}".replace(",", " ")
+
+
+def _isk0(v: float | None) -> str:
+    """Whole ISK, no decimals, space thousands (used where cents are just noise)."""
+    if v is None:
+        return "N/A"
+    try:
+        return f"{round(float(v)):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _format_number(v) -> str:
+    try:
+        return f"{int(v):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _format_date(v) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(float(v)).strftime('%d.%m.%Y %H:%M')
+    except Exception:
+        return str(v)
+
+
+def _ts_ago(ts: float) -> str:
+    """Human-readable relative time from Unix timestamp."""
+    try:
+        delta = int(_time.time() - float(ts))
+    except (TypeError, ValueError):
+        return "?"
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        m = delta // 60
+        return f"{m}m ago"
+    if delta < 86400:
+        h = delta // 3600
+        return f"{h}h ago"
+    d = delta // 86400
+    return f"{d}d ago"
+
+
+def _ts_to_str(ts: float) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        return ""
+
+
+def _price_eu(v) -> str:
+    """Default price format: <10k keeps 2 decimals, >=10k drops them. Space thousands."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    s = f"{v:,.2f}" if abs(v) < 10000 else f"{v:,.0f}"
+    return s.replace(",", " ")
+
+
+def _count_eu(v) -> str:
+    """Integer count (volume / available): no decimals, space thousands."""
+    try:
+        v = int(round(float(v)))
+    except (TypeError, ValueError):
+        return "—"
+    return f"{v:,}".replace(",", " ")
+
+
+def _age_short(ts) -> str:
+    """Compact relative age of a timestamp: 'now' / '5m' / '10h' / '2d'.
+    Returns '—' when there's no timestamp (never fetched)."""
+    try:
+        delta = int(_time.time() - float(ts))
+    except (TypeError, ValueError):
+        return "—"
+    if delta < 60:
+        return "now"
+    if delta < 3600:
+        return f"{delta // 60}m"
+    if delta < 86400:
+        return f"{delta // 3600}h"
+    return f"{delta // 86400}d"
+
+
+templates.env.filters["isk"] = _isk
+templates.env.filters["isk0"] = _isk0
+templates.env.filters["format_number"] = _format_number
+templates.env.filters["format_date"] = _format_date
+templates.env.filters["age_short"] = _age_short
+templates.env.filters["price_eu"] = _price_eu
+templates.env.filters["count_eu"] = _count_eu
+templates.env.filters["ts_ago"] = _ts_ago
+templates.env.filters["ts_to_str"] = _ts_to_str
+
+
+# `get_conn()` is on the hot path — runs on every request, so the table
+# bootstrap must not. `ensure_db_schema()` memoizes per database file: the
+# first connection in the process builds the schema, the rest just open the
+# DB. It replaces a scattered set of ensure_*() calls that between them built
+# only the twelve tables the startup path happened to know about — the rest
+# appeared later, on whichever page first needed them.
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Bootstrap every table the app owns. Idempotent and cheap to re-call."""
+    ensure_db_schema(conn)
+    # Static data is created empty here so a query against a table CCP's
+    # importer has not filled yet returns no rows instead of raising —
+    # `import_sde.py` is what fills them.
+    ensure_sde_schema(conn)
+
+
+def get_conn() -> sqlite3.Connection:
+    # WAL + a long busy timeout so concurrent work never trips "database is
+    # locked". In the default rollback-journal mode a writer blocks all readers,
+    # so the burst when a character is added (background sync writing large asset
+    # caches) collided with rotating-refresh-token writes — a commit that waited
+    # past the timeout raised, the token came back None, and the dashboard showed
+    # no location / skill training for every character. WAL lets readers and one
+    # writer run concurrently; the timeout absorbs brief writer-writer waits.
+    conn = sqlite3.connect(DB_ABS, timeout=30.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    ensure_schema(conn)   # memoized per database file; a no-op after the first
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Active character helpers (cookie-based)
+# ---------------------------------------------------------------------------
+
+ACTIVE_COOKIE = "active_char"
+
+
+def get_active_character_id(request: Request, conn: sqlite3.Connection | None = None) -> int | None:
+    """Return the active character id from cookie, or fall back to first char in DB."""
+    cookie = request.cookies.get(ACTIVE_COOKIE) if request else None
+    own_conn = conn is None
+    if own_conn:
+        conn = get_conn()
+    try:
+        if cookie:
+            try:
+                cid = int(cookie)
+            except ValueError:
+                cid = None
+            if cid and get_character_row(conn, cid):
+                return cid
+        chars = list_characters(conn)
+        return chars[0][0] if chars else None
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def get_active_character(request: Request, conn: sqlite3.Connection | None = None) -> tuple[int, str] | None:
+    """Return (char_id, char_name) for the active character, or None."""
+    own_conn = conn is None
+    if own_conn:
+        conn = get_conn()
+    try:
+        cid = get_active_character_id(request, conn)
+        if cid is None:
+            return None
+        row = get_character_row(conn, cid)
+        if row:
+            return (row["character_id"], row["character_name"])
+        return None
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def get_active_token(request: Request, conn: sqlite3.Connection | None = None) -> str | None:
+    """Return a fresh access token for the active character."""
+    own_conn = conn is None
+    if own_conn:
+        conn = get_conn()
+    try:
+        cid = get_active_character_id(request, conn)
+        if cid is None:
+            return None
+        return _get_valid_token_for(conn, cid)
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def get_token_for(character_id: int, conn: sqlite3.Connection | None = None) -> str | None:
+    """Return a fresh access token for a specific character."""
+    own_conn = conn is None
+    if own_conn:
+        conn = get_conn()
+    try:
+        return _get_valid_token_for(conn, character_id)
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _tr(name: str, request: Request, context: dict) -> HTMLResponse:
+    """Starlette's new API: request as the first argument."""
+    conn = get_conn()
+    try:
+        active = get_active_character(request, conn)
+        all_chars = list_characters(conn)
+    finally:
+        conn.close()
+    context.setdefault("character", active)
+    context.setdefault("all_characters", all_chars)
+    context.setdefault("active_char_id", active[0] if active else None)
+    # Every rendered page carries the session's CSRF token, so base.html can put
+    # it in a <meta> for the fetch wrapper and forms can put it in a hidden field.
+    session = getattr(request.state, "session", None)
+    context.setdefault("csrf_token", session["csrf_token"] if session else "")
+    return templates.TemplateResponse(request, name, context)
