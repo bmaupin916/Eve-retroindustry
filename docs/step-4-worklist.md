@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.46. **624 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.47. **655 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -139,12 +139,41 @@ the portability fix and check the failure *shape*: reverting
 `PRAGMA table_info` fails Postgres and passes SQLite, which is what proves the
 test can see a backend difference at all.
 
-**Open gap found doing `industry`: the SDE tables are not created on Postgres.**
-The Alembic history covers `APP_TABLES` only, and `import_sde.py` builds the SDE
-with `apply_sde_schema` against SQLite with no Postgres path. Six statements
-JOIN `sde_types` to runtime tables, so Postgres cannot serve the app until this
-is closed. `tests/test_industry_on_postgres.py` creates them in its fixture to
-test the conversion independently of it.
+~~**Open gap found doing `industry`: the SDE tables are not created on
+Postgres.**~~ **Closed in v0.9.47.** `create_sde_schema(bind)` builds them on
+whatever dialect is underneath, `import_sde.py` writes through SQLAlchemy so it
+can fill them, and startup creates them before it counts `sde_types`.
+`tests/test_sde_on_postgres.py` runs the whole importer on both backends.
+
+**Two things learned closing it, both of which contradicted the guess going
+in.** They are worth carrying into the modules still to convert:
+
+* **The SDE DDL was already portable.** All fourteen tables compile to
+  byte-identical DDL on both dialects, and every SQLite-compiled statement runs
+  on Postgres unchanged — checked, not assumed. The reason is that every SDE
+  primary key is a natural key CCP assigned, so nothing there is a `SERIAL`,
+  where six of the *app* tables are. `test_no_sde_table_mints_its_own_id` pins
+  that, because the day it stops being true is the day the two backends quietly
+  disagree about the SDE's shape. The defect was the duller one: a function
+  nothing on Postgres could call.
+* **The importer's default target was wrong on any real deployment.** It wrote
+  to a fixed `eve_cache.db` beside the script rather than to
+  `EVE_APP_DIR`/`EVE_DATABASE_URL`. Those coincide in the documented VPS layout
+  and diverge the moment the data directory is not the checkout — the import
+  then reported success into a database nothing opened. Found by converting the
+  target resolution, not by anything failing.
+
+**The importer's cross-backend result, measured on the real 99 MB archive:** all
+fourteen tables match row-for-row between the two backends, the Nidhoggur bill
+of materials is identical, and so are the invention probabilities. Postgres
+takes 10.9s to SQLite's 3.0s, which is fine for a thing run on deploy.
+
+**Scope, stated honestly: this does not make the app run on Postgres.**
+`deps.get_conn()` is still `sqlite3.connect(database_path())`, and every
+unconverted module goes through it. What is closed is that the static data can
+now be *created and filled* there, which was the item blocking everything
+else — the remaining modules can now be converted and tested against a Postgres
+database that has an SDE in it.
 
 ## 2. Remaining Step 4 items
 
@@ -219,13 +248,14 @@ work, not a move, and the event model has to be decided before it is written.
 ~~Run `projects` against Postgres~~, ~~sign in~~ and ~~the sync-health page~~ are
 all **done**. What that left is below.
 
-1. **Pick up the conversion** — `industry` is next by size, and it is a router
-   plus two helpers (`margins_helper`, `reactions_helper`).
-   `tests/test_projects_on_postgres.py` is the pattern to copy: drive the
-   helper directly, parameterised over both backends, so the same assertion
-   runs twice. That is what *proves* a conversion rather than merely exercising
-   it — the mutation run there failed 7 Postgres tests and 0 SQLite ones, which
-   is the shape every one of these conversions should be checked against.
+1. **Pick up the conversion.** `app_defaults` next, not the smallest module:
+   it accounts for four of the six remaining `dbapi()` boundaries and has ~16
+   callers, so it unblocks the most. `grep -rn "dbapi(" app/` is the live list.
+   `tests/test_sde_on_postgres.py` is the newest pattern to copy — drive the
+   code directly, parameterised over both backends, then mutate the portability
+   fix and check the *shape* of the failure. Forcing `_upsert` to build a
+   SQLite construct there failed **8 Postgres tests and 0 SQLite ones**; that
+   asymmetry is what proves the test can see a backend difference at all.
 2. **Cache-only routes**, eight pages left. `/jobs` is the worked example.
 3. **Give the health page a second consumer, or don't.** `/sync-health` reads
    the log; nothing subscribes to it with a cursor. That is fine — `since()`

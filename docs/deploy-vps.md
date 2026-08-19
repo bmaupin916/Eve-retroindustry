@@ -113,6 +113,24 @@ Until it has run, every page redirects to `/setup`, which tells you this.
 > what makes a Postgres target possible at all. `sde_base.db` remains in the
 > repository as a test fixture only.
 
+Since v0.9.47 that is literally true rather than aspirational: the importer
+writes through SQLAlchemy and takes a database URL, so
+
+```bash
+sudo -u eve EVE_DATABASE_URL=postgresql+psycopg://… .venv/bin/python import_sde.py
+```
+
+builds the static data on Postgres. With no `--out` it targets whatever the
+application itself reads, which is the point — the previous default was a fixed
+file beside the script, and on a deployment whose data directory is not the
+checkout the import landed somewhere nothing opened and still reported success.
+
+> **This alone does not make the app run on Postgres.** The request path still
+> opens `sqlite3` connections for every module the query conversion has not
+> reached. What it removes is the item that blocked the rest: the static data
+> can now exist on Postgres, so the remaining modules can be converted against
+> a database that has an SDE in it.
+
 That is a few minutes and several hundred MB of downloads. The build number it
 pins is recorded in the database, so a later run knows whether it has anything
 to do — and so does startup, which upgrades an existing database from the
@@ -181,6 +199,8 @@ EVE_SYNC_WORKER=1
 
 # Postgres, when the query conversion finishes. Unset means SQLite at
 # $EVE_APP_DIR/eve_cache.db, which is what this deployment uses today.
+# The migrations and the SDE importer already run against it; the request path
+# does not yet, so setting this now gets you a schema and no working pages.
 # EVE_DATABASE_URL=postgresql+psycopg://user:pass@host:5432/eve_retroindustry
 ```
 

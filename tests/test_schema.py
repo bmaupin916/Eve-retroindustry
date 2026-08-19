@@ -421,15 +421,17 @@ def test_the_importer_indexes_what_it_builds():
                 for ix in metadata.tables[name].indexes}
     assert declared, "the SDE declares no indexes at all"
 
-    conn = sqlite3.connect(":memory:")
-    try:
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite://")           # in-memory, one connection
+    with engine.connect() as conn:
         import_sde.init_db(conn)
-        built = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")}
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
-    finally:
-        conn.close()
+        built = {r[0] for r in conn.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name LIKE 'idx_%'"))}
+        tables = {r[0] for r in conn.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='table'"))}
+    engine.dispose()
 
     assert declared <= built, f"importer skipped: {sorted(declared - built)}"
     assert SDE_TABLES <= tables

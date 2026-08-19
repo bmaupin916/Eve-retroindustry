@@ -796,6 +796,46 @@ def apply_sde_schema(conn: sqlite3.Connection) -> None:
     _apply(conn, SDE_TABLES)
 
 
+def create_sde_schema(bind) -> None:
+    """Create the static-data tables on *any* backend. Idempotent.
+
+    `apply_sde_schema` above takes a `sqlite3.Connection`, because that is what
+    the importer and the test fixtures have always handed it. On Postgres there
+    is no such object to pass, so on that backend there was simply **nothing
+    that could create these tables** — which is the actual defect, and it is a
+    duller one than it first looked.
+
+    **The DDL itself was never the problem, and it is worth writing down that
+    it was checked rather than assumed.** All fourteen SDE tables compile to
+    byte-identical DDL on both dialects, and every SQLite-compiled statement
+    runs on Postgres unaltered. The reason is `test_no_sde_table_mints_its_own_id`
+    over in `tests/test_sde_on_postgres.py`: every SDE primary key is a natural
+    key CCP assigned, so nothing here is a `SERIAL`, and `SERIAL` versus
+    `INTEGER PRIMARY KEY` is where six of the *app* tables do diverge.
+
+    So `create_all` is not buying a translation today. It is buying the
+    guarantee that it keeps compiling for whatever dialect is underneath if
+    that stops being true — the first SDE table to want a generated id would
+    otherwise be a silent divergence, not an error.
+
+    **Why the SDE is not in the Alembic history**, given that the app tables
+    are: these are replaced wholesale on every SDE build and carry no user
+    data, so there is nothing to migrate *from*. Versioning them would mean
+    writing a migration every time CCP adds a column, to move data that is
+    about to be overwritten anyway. `app/db/migrate.py` excludes them from
+    autogenerate for the same reason. The consequence is that something else
+    has to create them, and until now nothing did on Postgres — six statements
+    JOIN `sde_types` to runtime tables, so the app could not serve a page.
+
+    `checkfirst=True` is the default and is what makes this idempotent; it also
+    means an existing table is left exactly as it is rather than being altered
+    to match, so a *changed* SDE table shape still needs the drop-and-rebuild
+    that `import_sde.py --fresh` does.
+    """
+    tables = [metadata.tables[n] for n in sorted(SDE_TABLES)]
+    metadata.create_all(bind, tables=tables, checkfirst=True)
+
+
 def upsert(table: str, columns, update=None) -> str:
     """`INSERT ... ON CONFLICT (pk) DO UPDATE SET ...` for one table.
 

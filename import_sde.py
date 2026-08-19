@@ -1,5 +1,11 @@
 """
-Import the EVE Online static data export into SQLite.
+Import the EVE Online static data export into the application's database.
+
+Writes through SQLAlchemy, so `--out` accepts a SQLite path *or* a database
+URL and the same import lands on either backend. It used to open
+`sqlite3.connect()` directly, which meant the SDE tables simply did not exist
+on Postgres — and six of the app's statements JOIN `sde_types` to runtime
+tables, so no page could render there.
 
 Reads CCP's **JSONL** export, downloaded straight from their static-data service
 and pinned to a build number — see `app/sde/feed.py` for why. The previous
@@ -8,24 +14,33 @@ which is not in `requirements.txt`; that is why the dev-setup doc told you not
 to run this script. It is now safe to run.
 
 Usage:
-    python import_sde.py                      # newest build -> eve_cache.db
-    python import_sde.py --out sde_base.db    # fresh bundle DB from scratch
+    python import_sde.py                      # newest build -> the app's database
+    python import_sde.py --out sde_base.db    # a SQLite file, for the test fixture
     python import_sde.py --build 3470007      # pin to a specific build
     python import_sde.py --zip some.zip       # use an archive already on disk
+    EVE_DATABASE_URL=postgresql+psycopg://... python import_sde.py
+
+The default target is whatever `EVE_DATABASE_URL`/`EVE_APP_DIR` say the
+application uses, not a fixed file beside this script. Those coincided in the
+documented deployment and diverge the moment the data directory is not the
+checkout — in which case the old default imported the SDE into a database
+nothing ever read.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import re
-import sqlite3
 import time
 import zipfile
 
 from rich.console import Console
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection, make_url
 
 from app.sde import feed
-from app.db.schema import apply_sde_schema
+from app.db.location import database_url
+from app.db.schema import SDE_TABLES, create_sde_schema, metadata
 
 # Matches "1% reduction in manufacturing time" or "...in reaction time".
 # Reactions skill (45746) has "...reaction time per skill level" — without
@@ -38,8 +53,28 @@ _BONUS_RE = re.compile(
 console = Console()
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(_ROOT, "eve_cache.db")
 CACHE_DIR = os.path.join(_ROOT, "data", "sde-archives")
+
+
+def _target_url(out: str | None) -> str:
+    """The database to import into, as a SQLAlchemy URL.
+
+    `--out` is still a file path, because that is what building the test
+    fixture wants (`--out sde_base.db`). Anything carrying a scheme is passed
+    through untouched, so `--out postgresql+psycopg://...` works and so does
+    leaving it off entirely — the default is the database the *application*
+    reads, resolved the same way the app resolves it.
+
+    That default used to be a fixed `eve_cache.db` beside this script. It
+    agreed with the app only while the data directory happened to be the
+    checkout; set `EVE_APP_DIR` anywhere else and the import landed in a
+    database nothing opened, with no error to say so.
+    """
+    if not out:
+        return database_url()
+    if "://" in out:
+        return out
+    return f"sqlite:///{os.path.abspath(out)}"
 
 _SKILL_EXCLUDE = {3380, 3388}   # Handled separately in calc_job_time
 _IMPLANT_GROUP = 743            # Zainou/manufacturing implants — not fetchable via ESI skills
@@ -56,7 +91,7 @@ _IMPLANT_GROUP = 743            # Zainou/manufacturing implants — not fetchabl
 _ACTIVITIES = ("manufacturing", "reaction", "invention", "copying")
 
 
-def init_db(conn: sqlite3.Connection):
+def init_db(conn: Connection):
     """Create the static-data tables and their indexes.
 
     The DDL used to live here as one long executescript. It moved to
@@ -64,21 +99,67 @@ def init_db(conn: sqlite3.Connection):
     same declaration can emit Postgres DDL — the importer no longer owns a
     second, divergent copy of the schema.
     """
-    apply_sde_schema(conn)
-
-
-def record_build(conn: sqlite3.Connection, build: feed.Build):
-    conn.execute(
-        "INSERT INTO sde_build (id, build_number, release_date, imported_at) "
-        "VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-        "build_number=excluded.build_number, release_date=excluded.release_date, "
-        "imported_at=excluded.imported_at",
-        (build.number, build.release_date, time.time()),
-    )
+    create_sde_schema(conn)
     conn.commit()
 
 
-def import_types(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+def _upsert(conn: Connection, table: str):
+    """`INSERT ... ON CONFLICT (pk) DO UPDATE SET <every other column>`.
+
+    Every write in this file has that exact shape: re-importing a build must
+    overwrite what the last one wrote, and the primary key is the identity CCP
+    already assigned. So the statement is derived from the declared table
+    rather than written out fourteen times.
+
+    Two things this buys beyond portability. The conflict target comes from the
+    real primary key, so it cannot drift from the schema. And the column list
+    is named — several of these statements used to be `INSERT INTO t VALUES
+    (?,?,?)`, which is correct only for as long as nobody inserts a column in
+    the middle of the declaration.
+
+    `on_conflict_do_update` is dialect-specific in SQLAlchemy: the two
+    constructs take the same arguments but must be imported from the dialect
+    that is actually underneath, so the choice is made here from the live
+    connection rather than from a module-level guess about the deployment.
+    """
+    t = metadata.tables[table]
+    if conn.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+
+    stmt = insert(t)
+    pk = {c.name for c in t.primary_key.columns}
+    rest = [c.name for c in t.columns if c.name not in pk]
+    if not rest:
+        # Key-only table: the row's existence is the whole of its content.
+        return stmt.on_conflict_do_nothing(index_elements=sorted(pk))
+    return stmt.on_conflict_do_update(
+        index_elements=[c.name for c in t.primary_key.columns],
+        set_={name: getattr(stmt.excluded, name) for name in rest},
+    )
+
+
+def _write(conn: Connection, table: str, rows: list[dict]) -> None:
+    """Upsert `rows` into `table`. A no-op on an empty list.
+
+    SQLAlchemy raises on `execute(stmt, [])` rather than treating it as zero
+    work, and a miniature archive — or a dataset CCP has emptied — legitimately
+    produces none.
+    """
+    if not rows:
+        return
+    conn.execute(_upsert(conn, table), rows)
+
+
+def record_build(conn: Connection, build: feed.Build):
+    _write(conn, "sde_build", [{"id": 1, "build_number": build.number,
+                                "release_date": build.release_date,
+                                "imported_at": time.time()}])
+    conn.commit()
+
+
+def import_types(conn: Connection, z: zipfile.ZipFile) -> int:
     """types -> sde_types, and skill time bonuses in the same pass.
 
     One pass, because the descriptions the bonus regex needs live on the same
@@ -91,36 +172,34 @@ def import_types(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
         name = feed.en(r.get("name"))
         if not name:
             continue
-        rows.append((
-            type_id,
-            name,
-            r.get("groupID"),
-            1 if r.get("published", True) else 0,
-            r.get("marketGroupID"),
+        rows.append({
+            "type_id": type_id,
+            "name": name,
+            "group_id": r.get("groupID"),
+            "published": 1 if r.get("published", True) else 0,
+            "market_group_id": r.get("marketGroupID"),
             # Fall back to `volume` for the handful of types that carry no
             # packaged figure; for those two are the same anyway.
-            r.get("packagedVolume", r.get("volume")),
-            r.get("portionSize") or 1,
-        ))
+            "packaged_volume": r.get("packagedVolume", r.get("volume")),
+            "portion_size": r.get("portionSize") or 1,
+        })
         if type_id in _SKILL_EXCLUDE or r.get("groupID") == _IMPLANT_GROUP:
             continue
         m = _BONUS_RE.search(feed.en(r.get("description")))
         if m:
-            skills.append((type_id, name, float(m.group(1))))
+            skills.append({"skill_type_id": type_id, "skill_name": name,
+                           "time_bonus_pct": float(m.group(1))})
 
-    conn.executemany(
-        "INSERT INTO sde_types "
-        "(type_id, name, group_id, published, market_group_id, packaged_volume, "
-        "portion_size) VALUES (?,?,?,?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET name=excluded.name, group_id=excluded.group_id, published=excluded.published, market_group_id=excluded.market_group_id, packaged_volume=excluded.packaged_volume, portion_size=excluded.portion_size", rows)
-    conn.execute("DELETE FROM sde_skill_time_bonus")
-    conn.executemany("INSERT INTO sde_skill_time_bonus VALUES (?,?,?) ON CONFLICT (skill_type_id) DO UPDATE SET skill_name=excluded.skill_name, time_bonus_pct=excluded.time_bonus_pct", skills)
+    _write(conn, "sde_types", rows)
+    conn.execute(text("DELETE FROM sde_skill_time_bonus"))
+    _write(conn, "sde_skill_time_bonus", skills)
     conn.commit()
     console.print(f"[green]  types: {len(rows):,}[/] "
                   f"[dim]({len(skills)} with a manufacturing/reaction time bonus)[/]")
     return len(rows)
 
 
-def import_groups(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+def import_groups(conn: Connection, z: zipfile.ZipFile) -> int:
     """groups -> sde_groups.
 
     Previously populated once via ESI, which meant new groups (e.g. 5120 Command
@@ -128,48 +207,52 @@ def import_groups(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
     rig_applies_to_product then returned False through its INNER JOIN and no rig
     applied to products from those groups.
     """
-    rows = [(int(r["_key"]), feed.en(r.get("name")) or f"Group {r['_key']}")
+    rows = [{"group_id": int(r["_key"]),
+             "name": feed.en(r.get("name")) or f"Group {r['_key']}"}
             for r in feed.records(z, "groups")]
-    conn.executemany("INSERT INTO sde_groups (group_id, name) VALUES (?,?) ON CONFLICT (group_id) DO UPDATE SET name=excluded.name", rows)
+    _write(conn, "sde_groups", rows)
     conn.commit()
     console.print(f"[green]  groups: {len(rows):,}[/]")
     return len(rows)
 
 
-def import_blueprints(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+def import_blueprints(conn: Connection, z: zipfile.ZipFile) -> int:
     bp_rows, mat_rows, prod_rows, skill_rows = [], [], [], []
 
     for r in feed.records(z, "blueprints"):
         bp_id = int(r["_key"])
         activities = r.get("activities") or {}
 
-        bp_rows.append((
-            bp_id,
-            r.get("maxProductionLimit", 1),
-            (activities.get("manufacturing") or {}).get("time", 0),
-            (activities.get("reaction") or {}).get("time", 0),
-        ))
+        bp_rows.append({
+            "blueprint_type_id": bp_id,
+            "max_production_limit": r.get("maxProductionLimit", 1),
+            "manufacturing_time": (activities.get("manufacturing") or {}).get("time", 0),
+            "reaction_time": (activities.get("reaction") or {}).get("time", 0),
+        })
 
         for activity_name in _ACTIVITIES:
             activity = activities.get(activity_name)
             if not activity:
                 continue
             for mat in activity.get("materials") or []:
-                mat_rows.append((bp_id, activity_name,
-                                 int(mat["typeID"]), int(mat["quantity"])))
+                mat_rows.append({"blueprint_type_id": bp_id, "activity": activity_name,
+                                 "material_type_id": int(mat["typeID"]),
+                                 "quantity": int(mat["quantity"])})
             for prod in activity.get("products") or []:
-                prod_rows.append((bp_id, activity_name, int(prod["typeID"]),
-                                  int(prod.get("quantity", 1)),
-                                  float(prod.get("probability", 1.0))))
+                prod_rows.append({"blueprint_type_id": bp_id, "activity": activity_name,
+                                  "product_type_id": int(prod["typeID"]),
+                                  "quantity": int(prod.get("quantity", 1)),
+                                  "probability": float(prod.get("probability", 1.0))})
             for skill in activity.get("skills") or []:
-                skill_rows.append((bp_id, activity_name,
-                                   int(skill["typeID"]), int(skill.get("level", 1))))
+                skill_rows.append({"blueprint_type_id": bp_id, "activity": activity_name,
+                                   "skill_type_id": int(skill["typeID"]),
+                                   "required_level": int(skill.get("level", 1))})
 
-    conn.executemany("INSERT INTO sde_blueprints VALUES (?,?,?,?) ON CONFLICT (blueprint_type_id) DO UPDATE SET max_production_limit=excluded.max_production_limit, manufacturing_time=excluded.manufacturing_time, reaction_time=excluded.reaction_time", bp_rows)
-    conn.executemany("INSERT INTO sde_blueprint_materials VALUES (?,?,?,?) ON CONFLICT (blueprint_type_id, activity, material_type_id) DO UPDATE SET quantity=excluded.quantity", mat_rows)
-    conn.executemany("INSERT INTO sde_blueprint_products VALUES (?,?,?,?,?) ON CONFLICT (blueprint_type_id, activity, product_type_id) DO UPDATE SET quantity=excluded.quantity, probability=excluded.probability", prod_rows)
-    conn.execute("DELETE FROM sde_blueprint_skills")
-    conn.executemany("INSERT INTO sde_blueprint_skills VALUES (?,?,?,?) ON CONFLICT (blueprint_type_id, activity, skill_type_id) DO UPDATE SET required_level=excluded.required_level", skill_rows)
+    _write(conn, "sde_blueprints", bp_rows)
+    _write(conn, "sde_blueprint_materials", mat_rows)
+    _write(conn, "sde_blueprint_products", prod_rows)
+    conn.execute(text("DELETE FROM sde_blueprint_skills"))
+    _write(conn, "sde_blueprint_skills", skill_rows)
     conn.commit()
     console.print(f"[green]  blueprints: {len(bp_rows):,}[/] [dim]({len(mat_rows):,} materials, "
                   f"{len(prod_rows):,} products, {len(skill_rows):,} skills)[/]")
@@ -191,7 +274,7 @@ _DATACORE_PREFIX = "Datacore - "
 _SKILL_GROUPS = {270, 268}  # Science, Production — where invention skills live
 
 
-def import_dogma(conn: sqlite3.Connection, z: zipfile.ZipFile) -> tuple[int, int]:
+def import_dogma(conn: Connection, z: zipfile.ZipFile) -> tuple[int, int]:
     """Decryptor effects and datacore-to-skill links, in one pass over typeDogma.
 
     A decryptor is any type carrying `inventionPropabilityMultiplier` (1112).
@@ -218,9 +301,8 @@ def import_dogma(conn: sqlite3.Connection, z: zipfile.ZipFile) -> tuple[int, int
         if 1112 in attrs:
             vals = {field: float(attrs.get(attr_id) or 0.0)
                     for attr_id, field in _DECRYPTOR_ATTRS.items()}
-            decryptors.append((type_id, names.get(type_id, "?"),
-                               vals["probability_mult"], vals["me_modifier"],
-                               vals["te_modifier"], vals["run_modifier"]))
+            decryptors.append({"type_id": type_id,
+                               "name": names.get(type_id, "?"), **vals})
         if type_id in datacore_ids and attrs.get(_REQUIRED_SKILL_1):
             links[type_id] = int(attrs[_REQUIRED_SKILL_1])
 
@@ -234,16 +316,16 @@ def import_dogma(conn: sqlite3.Connection, z: zipfile.ZipFile) -> tuple[int, int
         if bare in skill_ids_by_name:
             links[type_id] = skill_ids_by_name[bare]
 
-    conn.executemany("INSERT INTO sde_decryptors VALUES (?,?,?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET name=excluded.name, probability_mult=excluded.probability_mult, me_modifier=excluded.me_modifier, te_modifier=excluded.te_modifier, run_modifier=excluded.run_modifier", decryptors)
-    conn.executemany("INSERT INTO sde_datacore_skills VALUES (?,?) ON CONFLICT (type_id) DO UPDATE SET skill_type_id=excluded.skill_type_id",
-                     sorted(links.items()))
+    _write(conn, "sde_decryptors", decryptors)
+    _write(conn, "sde_datacore_skills",
+           [{"type_id": t, "skill_type_id": s} for t, s in sorted(links.items())])
     conn.commit()
     console.print(f"[green]  decryptors: {len(decryptors)}[/] "
                   f"[dim]({len(links)} datacore skill links)[/]")
     return len(decryptors), len(links)
 
 
-def import_type_materials(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+def import_type_materials(conn: Connection, z: zipfile.ZipFile) -> int:
     """typeMaterials -> sde_type_materials: what a batch reprocesses into.
 
     Powers the refine calculator, ore valuation and the mining ledger. Note the
@@ -251,36 +333,38 @@ def import_type_materials(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
     per-unit or per-m3 figure has to divide.
     """
     rows = [
-        (int(r["_key"]), int(m["materialTypeID"]), int(m["quantity"]))
+        {"type_id": int(r["_key"]), "material_type_id": int(m["materialTypeID"]),
+         "quantity": int(m["quantity"])}
         for r in feed.records(z, "typeMaterials")
         for m in (r.get("materials") or [])
     ]
-    conn.executemany("INSERT INTO sde_type_materials VALUES (?,?,?) ON CONFLICT (type_id, material_type_id) DO UPDATE SET quantity=excluded.quantity", rows)
+    _write(conn, "sde_type_materials", rows)
     conn.commit()
     console.print(f"[green]  type materials: {len(rows):,}[/] "
                   f"[dim](reprocessing yields)[/]")
     return len(rows)
 
 
-def import_market_groups(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+def import_market_groups(conn: Connection, z: zipfile.ZipFile) -> int:
     """marketGroups -> sde_market_groups: the in-game market tree.
 
     `sde_types.market_group_id` already points into this; until now there was
     nothing to point at, so the Prices page could only be one flat list.
     """
     rows = [
-        (int(r["_key"]), r.get("parentGroupID"), feed.en(r.get("name")) or f"Group {r['_key']}",
-         1 if r.get("hasTypes") else 0, r.get("iconID"))
+        {"market_group_id": int(r["_key"]), "parent_group_id": r.get("parentGroupID"),
+         "name": feed.en(r.get("name")) or f"Group {r['_key']}",
+         "has_types": 1 if r.get("hasTypes") else 0, "icon_id": r.get("iconID")}
         for r in feed.records(z, "marketGroups")
     ]
-    conn.executemany("INSERT INTO sde_market_groups VALUES (?,?,?,?,?) ON CONFLICT (market_group_id) DO UPDATE SET parent_group_id=excluded.parent_group_id, name=excluded.name, has_types=excluded.has_types, icon_id=excluded.icon_id", rows)
+    _write(conn, "sde_market_groups", rows)
     conn.commit()
-    roots = sum(1 for r in rows if r[1] is None)
+    roots = sum(1 for r in rows if r["parent_group_id"] is None)
     console.print(f"[green]  market groups: {len(rows):,}[/] [dim]({roots} roots)[/]")
     return len(rows)
 
 
-def import_planet_schematics(conn: sqlite3.Connection, z: zipfile.ZipFile) -> int:
+def import_planet_schematics(conn: Connection, z: zipfile.ZipFile) -> int:
     """PI factory schematics: inputs -> output (type_ids + quantities) + cycle time.
 
     Powers the Planets production-chain view and the PI planner. The output is
@@ -295,14 +379,16 @@ def import_planet_schematics(conn: sqlite3.Connection, z: zipfile.ZipFile) -> in
         for spec in r.get("types") or []:
             type_id, qty = int(spec["_key"]), int(spec.get("quantity") or 0)
             if spec.get("isInput"):
-                mat_rows.append((sid, type_id, qty))
+                mat_rows.append({"schematic_id": sid, "type_id": type_id,
+                                 "quantity": qty})
             else:
                 out_id, out_qty = type_id, qty
-        sch_rows.append((sid, feed.en(r.get("name")), int(r.get("cycleTime") or 0),
-                         out_id, out_qty))
+        sch_rows.append({"schematic_id": sid, "name": feed.en(r.get("name")),
+                         "cycle_time": int(r.get("cycleTime") or 0),
+                         "output_type_id": out_id, "output_qty": out_qty})
 
-    conn.executemany("INSERT INTO sde_planet_schematics VALUES (?,?,?,?,?) ON CONFLICT (schematic_id) DO UPDATE SET name=excluded.name, cycle_time=excluded.cycle_time, output_type_id=excluded.output_type_id, output_qty=excluded.output_qty", sch_rows)
-    conn.executemany("INSERT INTO sde_planet_schematic_materials VALUES (?,?,?) ON CONFLICT (schematic_id, type_id) DO UPDATE SET quantity=excluded.quantity", mat_rows)
+    _write(conn, "sde_planet_schematics", sch_rows)
+    _write(conn, "sde_planet_schematic_materials", mat_rows)
     conn.commit()
     console.print(f"[green]  planet schematics: {len(sch_rows):,}[/] "
                   f"[dim]({len(mat_rows):,} inputs)[/]")
@@ -319,15 +405,47 @@ def _progress(done: int, total: int):
                       end="\r")
 
 
+def _display(url: str) -> str:
+    """A URL safe to print. `make_url` masks the password; a path prints whole."""
+    if url.startswith("sqlite"):
+        return make_url(url).database or url
+    return make_url(url).render_as_string(hide_password=True)
+
+
+def _drop_static_data(engine, url: str) -> None:
+    """`--fresh`: throw the existing static data away before importing.
+
+    For a SQLite *file* this deletes the file, which is what building
+    `sde_base.db` wants — a bundle with nothing else in it.
+
+    For any other target it drops the SDE tables only. Deleting the database
+    would take `characters` and every refresh token with it, which is a defect
+    this project has shipped once already, from a different button.
+    """
+    if url.startswith("sqlite"):
+        path = make_url(url).database
+        if path and os.path.exists(path):
+            engine.dispose()
+            os.remove(path)
+            console.print(f"[dim]Removed existing {path}[/]")
+        return
+    tables = [metadata.tables[n] for n in sorted(SDE_TABLES)]
+    metadata.drop_all(engine, tables=tables, checkfirst=True)
+    console.print(f"[dim]Dropped {len(tables)} static-data tables[/]")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Import the EVE SDE into SQLite.")
+    ap = argparse.ArgumentParser(
+        description="Import the EVE SDE into the application's database.")
     ap.add_argument("--build", type=int, help="pin to a specific SDE build number")
     ap.add_argument("--zip", help="use an archive already on disk instead of downloading")
-    ap.add_argument("--out", default=DB_PATH, help="database to write (default: eve_cache.db)")
+    ap.add_argument("--out", default=None,
+                    help="SQLite path or database URL (default: the app's database)")
     ap.add_argument("--cache", default=CACHE_DIR, help="where downloaded archives are kept")
     ap.add_argument("--fresh", action="store_true",
-                    help="delete the target database first (use when building a bundle)")
+                    help="start the static data from scratch (use when building a bundle)")
     args = ap.parse_args()
+    url = _target_url(args.out)
 
     console.print("[bold]EVE Retroindustry — import SDE[/]\n")
 
@@ -350,13 +468,13 @@ def main():
         archive = feed.download_archive(build.number, args.cache, progress=_progress)
         console.print(f"Archive [cyan]{archive}[/]" + " " * 30)
 
-    if args.fresh and os.path.exists(args.out):
-        os.remove(args.out)
-        console.print(f"[dim]Removed existing {args.out}[/]")
+    engine = create_engine(url)
+
+    if args.fresh:
+        _drop_static_data(engine, url)
 
     t0 = time.time()
-    conn = sqlite3.connect(args.out)
-    try:
+    with engine.connect() as conn:
         init_db(conn)
         with zipfile.ZipFile(archive) as z:
             import_types(conn, z)
@@ -367,30 +485,26 @@ def main():
             import_market_groups(conn, z)
             import_planet_schematics(conn, z)
         record_build(conn, build)
-    finally:
-        conn.close()
 
-    console.print(f"\n[bold green]Done in {time.time()-t0:.1f}s[/] -> {args.out}")
+    console.print(f"\n[bold green]Done in {time.time()-t0:.1f}s[/] -> {_display(url)}")
 
     # Smoke check — a capital that exercises the whole join path.
-    conn = sqlite3.connect(args.out)
-    try:
-        bp = conn.execute(
+    with engine.connect() as conn:
+        bp = conn.execute(text(
             "SELECT blueprint_type_id FROM sde_blueprint_products "
-            "WHERE product_type_id=? AND activity='manufacturing'", (24483,)).fetchone()
+            "WHERE product_type_id = :tid AND activity = 'manufacturing'"),
+            {"tid": 24483}).fetchone()
         if not bp:
             console.print("[red]Smoke check failed: no blueprint for Nidhoggur (24483)[/]")
             return 1
-        mats = conn.execute("""
+        mats = conn.execute(text("""
             SELECT t.name, m.quantity FROM sde_blueprint_materials m
             JOIN sde_types t ON t.type_id = m.material_type_id
-            WHERE m.blueprint_type_id=? AND m.activity='manufacturing'
-            ORDER BY m.quantity DESC""", (bp[0],)).fetchall()
+            WHERE m.blueprint_type_id = :bp AND m.activity = 'manufacturing'
+            ORDER BY m.quantity DESC"""), {"bp": bp[0]}).fetchall()
         console.print(f"\n[bold]Nidhoggur[/] — {len(mats)} materials")
         for name, qty in mats:
             console.print(f"    {name}: {qty:,}")
-    finally:
-        conn.close()
     return 0
 
 

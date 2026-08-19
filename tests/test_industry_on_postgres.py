@@ -69,14 +69,14 @@ def conn(request, tmp_path):
     engine = create_engine(scoped)
 
     # The migrations create APP_TABLES only — `test_postgres_schema.py` asserts
-    # exactly that. The SDE tables are not in the Alembic history, because
-    # `import_sde.py` builds them with `apply_sde_schema` against SQLite and has
-    # no Postgres path yet. That is a real gap in the deployment story (six
-    # statements JOIN `sde_types` to runtime tables, so Postgres cannot serve
-    # the app without them) and it is recorded in the worklist. Here the fixture
-    # creates them so the *conversion* can be tested independently of it.
-    from app.db.schema import SDE_TABLES, metadata
-    metadata.create_all(engine, tables=[metadata.tables[n] for n in sorted(SDE_TABLES)])
+    # exactly that. The SDE tables are deliberately outside the Alembic history
+    # (they are replaced wholesale on every build and carry no user data), so
+    # something else has to create them, and `create_sde_schema` is that
+    # something. This fixture calls the same function the importer does rather
+    # than open-coding `create_all`, so a change to what "the SDE schema" means
+    # reaches this test too.
+    from app.db.schema import create_sde_schema
+    create_sde_schema(engine)
 
     with engine.connect() as c:
         _seed(c)

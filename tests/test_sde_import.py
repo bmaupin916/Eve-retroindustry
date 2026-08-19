@@ -20,6 +20,7 @@ import sqlite3
 import zipfile
 
 import pytest
+from sqlalchemy import create_engine
 
 from app.sde import feed
 
@@ -85,20 +86,37 @@ def tiny(tmp_path):
     })
 
 
+def _import(archive: str, db: str, steps) -> sqlite3.Connection:
+    """Run `steps` of the importer into `db`, then hand back a reader.
+
+    The importer writes through SQLAlchemy now, so it can target Postgres. The
+    assertions below are about what the SDE *contains* rather than how it is
+    addressed, so they keep reading over plain `sqlite3` — a separate
+    connection, opened after the import has committed.
+
+    Portability is asserted in `tests/test_sde_on_postgres.py`, which runs the
+    same import twice, once per backend. Doing it here as well would double the
+    cost of every content assertion to re-prove one thing.
+    """
+    import import_sde
+
+    engine = create_engine(f"sqlite:///{db}")
+    with engine.connect() as conn:
+        import_sde.init_db(conn)
+        with zipfile.ZipFile(archive) as z:
+            for step in steps:
+                getattr(import_sde, step)(conn, z)
+        import_sde.record_build(conn, feed.Build(BUILD, "2026-08-17T11:26:56Z"))
+    engine.dispose()
+    return sqlite3.connect(db)
+
+
 @pytest.fixture
 def imported(tiny, tmp_path):
-    import import_sde
-    db = str(tmp_path / "out.db")
-    conn = sqlite3.connect(db)
-    import_sde.init_db(conn)
-    with zipfile.ZipFile(tiny) as z:
-        import_sde.import_types(conn, z)
-        import_sde.import_groups(conn, z)
-        import_sde.import_blueprints(conn, z)
-        import_sde.import_planet_schematics(conn, z)
-    import_sde.record_build(conn, feed.Build(BUILD, "2026-08-17T11:26:56Z"))
-    conn.commit()
-    return conn
+    return _import(tiny, str(tmp_path / "out.db"), (
+        "import_types", "import_groups", "import_blueprints",
+        "import_planet_schematics",
+    ))
 
 
 # ── reading the archive ────────────────────────────────────────────────────
@@ -244,15 +262,9 @@ def ore_archive(tmp_path):
 
 @pytest.fixture
 def ore_db(ore_archive, tmp_path):
-    import import_sde
-    conn = sqlite3.connect(str(tmp_path / "ore.db"))
-    import_sde.init_db(conn)
-    with zipfile.ZipFile(ore_archive) as z:
-        import_sde.import_types(conn, z)
-        import_sde.import_type_materials(conn, z)
-        import_sde.import_market_groups(conn, z)
-    conn.commit()
-    return conn
+    return _import(ore_archive, str(tmp_path / "ore.db"), (
+        "import_types", "import_type_materials", "import_market_groups",
+    ))
 
 
 def test_portion_size_is_the_reprocessing_batch(ore_db):

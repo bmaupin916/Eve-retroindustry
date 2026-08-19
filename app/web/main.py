@@ -115,7 +115,9 @@ from app.character.skills import (
     get_cached_skills,
     get_mfg_skill_ids,
 )
+from app.db import conn as db_conn
 from app.db.migrate import upgrade_to_head
+from app.db.schema import create_sde_schema
 from app.sync import worker as sync_worker
 from app.db.schema import (
     ensure_schema as ensure_db_schema,
@@ -270,6 +272,21 @@ async def _startup_populate_groups():
         # missing, so the app comes up. But it means the deployment is no
         # longer tracking revisions, which is worth shouting about.
         print(f"[db] MIGRATION FAILED — schema may be behind: {exc}", flush=True)
+
+    # The SDE is deliberately outside the migration history — it is replaced
+    # wholesale on every build and carries no user data — so `upgrade_to_head`
+    # above does not create it and something here has to. On SQLite
+    # `ensure_schema()` has always done it lazily through `get_conn()`; that
+    # path is `sqlite3`-only, so on any other backend these tables did not
+    # exist at all and the row count three lines below raised `UndefinedTable`.
+    #
+    # Empty is the right state to leave them in. `import_sde.py` is what fills
+    # them, and a query against an empty table returns no rows, whereas a query
+    # against a missing one takes the page down.
+    try:
+        create_sde_schema(db_conn.engine())
+    except Exception as exc:
+        print(f"[sde] could not create the static-data tables: {exc}", flush=True)
 
     try:
         conn = get_conn()
