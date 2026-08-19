@@ -28,6 +28,7 @@ the scope W11 was written at: the worker must not break the app.
 from __future__ import annotations
 
 import ast
+import hashlib
 import sqlite3
 import threading
 import time
@@ -382,3 +383,55 @@ def test_both_layers_writing_at_once_lose_nothing(solo_db):
     assert landed == ROUNDS * 2, (
         f"{ROUNDS * 2} rows were committed but {landed} arrived — writes are "
         "being lost, which a busy timeout would have turned into an error")
+
+
+# ── Opening a database must not rewrite it ───────────────────────────────────
+
+def test_connecting_to_a_path_does_not_change_the_file(tmp_path):
+    """`journal_mode` is a property of the *file*, not the connection.
+
+    `connect_to_path` exists for databases we are pointed at rather than own —
+    in practice the SDE, and `sde_base.db` is committed. Applying the full
+    pragma set to it flipped the header from `delete` to `wal`, which dirtied a
+    10 MB binary in git on every test run and would have shipped a database
+    that can no longer be opened read-only: WAL has to create `-wal`/`-shm`
+    files next to it.
+    """
+    from app.db.conn import connect_to_path
+
+    path = tmp_path / "borrowed.db"
+    raw = sqlite3.connect(str(path))
+    raw.execute("CREATE TABLE t (x INTEGER)")
+    raw.commit()
+    before = raw.execute("PRAGMA journal_mode").fetchone()[0].lower()
+    raw.close()
+    assert before == "delete", "fixture assumption: a fresh file is not in WAL"
+
+    digest_before = hashlib.sha256(path.read_bytes()).hexdigest()
+    with connect_to_path(str(path)) as conn:
+        conn.execute(text("SELECT COUNT(*) FROM t")).fetchone()
+
+    raw = sqlite3.connect(str(path))
+    after = raw.execute("PRAGMA journal_mode").fetchone()[0].lower()
+    raw.close()
+
+    assert after == before, (
+        f"reading through connect_to_path rewrote journal_mode {before} -> {after}")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest_before, (
+        "the file changed on disk just from being read")
+
+
+def test_the_committed_sde_is_not_in_wal_mode():
+    """The regression stated against the real artefact. If this goes red, a
+    read-only deployment of the bundled SDE has stopped working."""
+    sde = REPO / "sde_base.db"
+    if not sde.exists():                      # pragma: no cover - CI has it
+        pytest.skip("sde_base.db not present")
+    conn = sqlite3.connect(str(sde))
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+    finally:
+        conn.close()
+    assert mode != "wal", (
+        "sde_base.db is in WAL mode — something opened it with the full pragma "
+        "set and persisted it into a committed binary")

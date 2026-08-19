@@ -135,10 +135,35 @@ def connect(url: str | None = None) -> Connection:
     return engine(url).connect()
 
 
+def _configure_borrowed_sqlite(dbapi_conn, _record) -> None:
+    """Pragmas for a database we were merely *pointed at* — busy timeout only.
+
+    Deliberately **not** `journal_mode=WAL`. That setting is a property of the
+    file, not of the connection: applying it rewrites the database header and
+    persists. `connect_to_path` is used for the SDE, and `sde_base.db` is a
+    committed 10 MB binary — so applying the whole set of them flipped it from
+    `delete` to `wal`, dirtied it in git on every test run, and would have
+    shipped a database that can no longer be opened read-only, because WAL
+    needs to create `-wal`/`-shm` sidecars beside the file.
+
+    The callers here only read (see `tests/test_sqlite_under_the_worker.py`,
+    which scans for exactly that), so none of what WAL buys is needed.
+    """
+    if not isinstance(dbapi_conn, sqlite3.Connection):
+        return
+    cur = dbapi_conn.cursor()
+    try:
+        cur.execute("PRAGMA busy_timeout=30000")
+    except sqlite3.Error:
+        pass
+    finally:
+        cur.close()
+
+
 @lru_cache(maxsize=8)
 def _engine_for_path(db_path: str) -> Engine:
     engine = create_engine(f"sqlite:///{os.path.abspath(db_path)}", poolclass=NullPool)
-    event.listen(engine, "connect", _configure_sqlite)
+    event.listen(engine, "connect", _configure_borrowed_sqlite)
     return engine
 
 
