@@ -89,3 +89,61 @@ def test_deps_declares_the_helpers_the_routers_will_need():
 
     for name in ("get_conn", "_tr", "templates", "_SDE_READY"):
         assert hasattr(deps, name), f"app.web.deps is missing {name}"
+
+
+# ── the app must never be bound to the developer's real database ─────────────
+
+def test_the_app_is_bound_to_the_test_database(app_module):
+    """The one that was missing.
+
+    `EVE_APP_DIR` used to be set inside the `app_module` fixture, which runs
+    after collection — and collection imports every test module. A test module
+    with a module-level `from app.web...` import therefore made `deps` compute
+    `DB_ABS` from the unset variable and bind the real `eve_cache.db`. The suite
+    then ran against it, starting with `DELETE FROM characters`.
+
+    conftest now sets the variable at import and refuses to run if the binding
+    is wrong. This asserts the outcome rather than the mechanism, so it still
+    holds if the mechanism changes.
+    """
+    import os
+
+    from app.web import deps
+
+    # Asserted against the environment rather than against conftest's globals:
+    # importing conftest as a module would create a second one.
+    app_dir = os.environ.get("EVE_APP_DIR")
+    assert app_dir, "EVE_APP_DIR is not set, so the app picked its own path"
+    assert os.path.abspath(app_dir) != os.path.abspath(REPO), (
+        "EVE_APP_DIR points at the checkout, where the real database lives"
+    )
+
+    bound = os.path.abspath(deps.DB_ABS)
+    assert bound == os.path.abspath(os.path.join(app_dir, "eve_cache.db")), (
+        f"bound to {bound}, not to EVE_APP_DIR"
+    )
+    assert bound != os.path.abspath(REPO / "eve_cache.db"), (
+        "the suite is running against the real database"
+    )
+    assert os.path.abspath(app_module.DB_ABS) == bound
+
+
+def test_importing_a_router_does_not_bind_a_database_path_by_itself():
+    """A router imported at module level is what triggered it, so this checks
+    the case directly: importing one must not decide where the database is."""
+    import subprocess
+    import sys as _sys
+
+    probe = (
+        "import os, sys;"
+        " os.environ['EVE_APP_DIR'] = os.path.join(os.getcwd(), '_probe_dir');"
+        " from app.web.routers import prices;"
+        " from app.web import deps;"
+        " sys.exit(0 if '_probe_dir' in deps.DB_ABS else 1)"
+    )
+    proc = subprocess.run([_sys.executable, "-c", probe],
+                          cwd=str(REPO), capture_output=True, text=True)
+    assert proc.returncode == 0, (
+        "importing a router ignored EVE_APP_DIR and picked its own path\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
