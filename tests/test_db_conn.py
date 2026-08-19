@@ -176,3 +176,73 @@ def test_the_upsert_helper_still_emits_positional_placeholders():
     """
     sql = upsert("app_defaults", ["key", "value"])
     assert "?" in sql and ":" not in sql.split("ON CONFLICT")[0]
+
+
+# ── the conversion does not have to be atomic ────────────────────────────────
+
+def test_both_connection_styles_work_on_one_database(tmp_path, monkeypatch):
+    """The claim the migration plan was built on turns out to be false.
+
+    The design doc and the Step 4 worklist both said the flip was atomic:
+    `get_conn()` is shared by every module, so the moment it returns a
+    SQLAlchemy `Connection`, every one of the ~316 statements must already
+    speak named binds. That framing made the last commit of the conversion a
+    single change to the whole tree.
+
+    It is not necessary. A converted module can take its connection from
+    `app.db.conn.connect()` while everything else still calls `get_conn()` —
+    same file, same process, both see each other's committed writes. So the
+    conversion goes module by module, each independently shippable, and what
+    is left at the end is deleting `get_conn()` once nothing calls it.
+    """
+    from app.web import deps
+
+    monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
+    db.dispose()
+
+    legacy = deps.get_conn()          # raw sqlite3, positional placeholders
+    try:
+        legacy.execute(
+            "INSERT INTO production_projects (name, created_at, updated_at)"
+            " VALUES (?,?,?)", ("written by sqlite3", 1.0, 1.0))
+        legacy.commit()
+
+        with db.connect() as modern:  # SQLAlchemy, named binds
+            seen = modern.execute(
+                text("SELECT name FROM production_projects WHERE name = :n"),
+                {"n": "written by sqlite3"}).fetchone()
+            assert seen is not None, "the converted style cannot see legacy writes"
+
+            modern.execute(
+                text("INSERT INTO production_projects (name, created_at, updated_at)"
+                     " VALUES (:n, :c, :u)"),
+                {"n": "written by sqlalchemy", "c": 2.0, "u": 2.0})
+            modern.commit()
+
+        names = {r[0] for r in legacy.execute(
+            "SELECT name FROM production_projects").fetchall()}
+        assert names == {"written by sqlite3", "written by sqlalchemy"}
+    finally:
+        legacy.close()
+        db.dispose()
+
+
+def test_returning_replaces_lastrowid(sqlite_url):
+    """`cursor.lastrowid` has no SQLAlchemy equivalent, and several call sites
+    use it. `RETURNING` is the replacement, and it needs SQLite >= 3.35."""
+    import sqlite3 as _sqlite3
+
+    assert tuple(int(p) for p in _sqlite3.sqlite_version.split(".")) >= (3, 35), (
+        f"SQLite {_sqlite3.sqlite_version} has no RETURNING; the conversion "
+        "needs a different answer for lastrowid on this interpreter"
+    )
+    with db.connect() as conn:
+        apply_schema(conn.connection.driver_connection)
+        new_id = conn.execute(
+            text("INSERT INTO production_projects (name, created_at, updated_at)"
+                 " VALUES (:n, :c, :u) RETURNING id"),
+            {"n": "p", "c": 1.0, "u": 1.0}).scalar()
+        conn.commit()
+        assert new_id == conn.execute(
+            text("SELECT id FROM production_projects WHERE name = :n"), {"n": "p"}
+        ).scalar()

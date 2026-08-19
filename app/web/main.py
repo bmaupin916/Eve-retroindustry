@@ -115,13 +115,6 @@ from app.character.skills import (
     get_cached_skills,
     get_mfg_skill_ids,
 )
-from app.web.projects_helper import (
-    ensure_project_tables,
-    list_projects,
-    create_project,
-    add_plan_to_project,
-    get_project_detail,
-)
 from app.db.migrate import upgrade_to_head
 from app.db.schema import (
     ensure_schema as ensure_db_schema,

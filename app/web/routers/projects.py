@@ -1,15 +1,22 @@
 """Projects: the saved-plan collections, their pages and their APIs.
 
-Moved out of `main.py` unchanged (W6). Nothing here is shared with another
-router — the handlers reach the database directly or through
-`app.web.projects_helper`.
+Moved out of `main.py` unchanged (W6), then converted to the portable query
+layer (Step 4). Its connections come from `app.db.conn.connect()` rather than
+`deps.get_conn()`, and every statement uses named binds — so the same SQL runs
+on SQLite and on Postgres.
+
+The rest of the app has not moved yet, and does not have to: both styles work
+on one database at the same time. `app/web/projects_helper.py` carries the
+notes on what changes at a call site.
 """
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
+from sqlalchemy import bindparam, text
 
-from app.web.deps import _tr, get_conn
+from app.db.conn import connect
+from app.web.deps import _tr
 from app.web.projects_helper import (
     add_plan_to_project,
     create_project,
@@ -22,17 +29,15 @@ router = APIRouter()
 
 @router.get("/projects", response_class=HTMLResponse)
 async def projects_list(request: Request):
-    conn = get_conn()
-    projects = list_projects(conn)
-    conn.close()
+    with connect() as conn:
+        projects = list_projects(conn)
     return _tr("projects.html", request, {"projects": projects})
 
 
 @router.get("/projects/{project_id}", response_class=HTMLResponse)
 async def project_detail_page(request: Request, project_id: int):
-    conn = get_conn()
-    detail = get_project_detail(conn, project_id)
-    conn.close()
+    with connect() as conn:
+        detail = get_project_detail(conn, project_id)
     if not detail:
         return HTMLResponse("Project not found", status_code=404)
     return _tr("project_detail.html", request, {"project": detail})
@@ -40,10 +45,8 @@ async def project_detail_page(request: Request, project_id: int):
 
 @router.get("/api/projects/list")
 async def api_projects_list():
-    conn = get_conn()
-    projects = list_projects(conn)
-    conn.close()
-    return {"projects": projects}
+    with connect() as conn:
+        return {"projects": list_projects(conn)}
 
 
 @router.post("/api/projects/new")
@@ -52,9 +55,8 @@ async def api_project_new(request: Request):
     name = (body.get("name") or "").strip()
     if not name:
         return {"ok": False, "error": "The name must not be empty"}
-    conn = get_conn()
-    pid = create_project(conn, name)
-    conn.close()
+    with connect() as conn:
+        pid = create_project(conn, name)
     return {"ok": True, "project_id": pid, "name": name}
 
 
@@ -64,19 +66,18 @@ async def api_project_add_plan(project_id: int, request: Request):
     plan_data = body.get("plan_data")
     if not plan_data:
         return {"ok": False, "error": "Missing plan data"}
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT id FROM production_projects WHERE id=?", (project_id,)
-    ).fetchone()
-    if not row:
-        conn.close()
-        return {"ok": False, "error": "Project not found"}
-    plan_id = add_plan_to_project(
-        conn, project_id, plan_data,
-        body.get("station_name", ""),
-        float(body.get("facility_tax", 0)),
-    )
-    conn.close()
+    with connect() as conn:
+        exists = conn.execute(
+            text("SELECT id FROM production_projects WHERE id = :id"),
+            {"id": project_id},
+        ).fetchone()
+        if not exists:
+            return {"ok": False, "error": "Project not found"}
+        plan_id = add_plan_to_project(
+            conn, project_id, plan_data,
+            body.get("station_name", ""),
+            float(body.get("facility_tax", 0)),
+        )
     return {"ok": True, "plan_id": plan_id}
 
 
@@ -88,14 +89,16 @@ async def api_project_job_toggle(request: Request):
     target = body.get("status")  # "completed" or "pending"
     if not job_ids or target not in ("completed", "pending"):
         return {"ok": False, "error": "bad request"}
-    conn = get_conn()
-    ph = ",".join("?" * len(job_ids))
-    conn.execute(
-        f"UPDATE project_jobs SET status=? WHERE id IN ({ph})",
-        [target] + list(job_ids),
-    )
-    conn.commit()
-    conn.close()
+    with connect() as conn:
+        # `expanding` renders the IN list for whichever driver is underneath.
+        # The old version built the placeholder string by hand — one `?` per
+        # id — which is exactly the construction that does not survive a move
+        # to a driver with a different paramstyle.
+        stmt = text("UPDATE project_jobs SET status = :status WHERE id IN :ids").bindparams(
+            bindparam("ids", expanding=True)
+        )
+        conn.execute(stmt, {"status": target, "ids": [int(j) for j in job_ids]})
+        conn.commit()
     return {"ok": True, "status": target}
 
 
@@ -107,24 +110,25 @@ async def api_project_shopping_update(request: Request):
     purchased = int(body.get("purchased", 0))
     if not project_id or not type_id:
         return {"ok": False}
-    conn = get_conn()
-    conn.execute(
-        "UPDATE project_shopping SET purchased=? WHERE project_id=? AND type_id=?",
-        (purchased, project_id, type_id),
-    )
-    conn.commit()
-    conn.close()
+    with connect() as conn:
+        conn.execute(
+            text("UPDATE project_shopping SET purchased = :purchased"
+                 " WHERE project_id = :project_id AND type_id = :type_id"),
+            {"purchased": purchased, "project_id": project_id, "type_id": type_id},
+        )
+        conn.commit()
     return {"ok": True}
 
 
 @router.post("/api/projects/{project_id}/shopping/mark-all")
 async def api_project_shopping_mark_all(project_id: int):
-    conn = get_conn()
-    conn.execute(
-        "UPDATE project_shopping SET purchased=needed WHERE project_id=?", (project_id,)
-    )
-    conn.commit()
-    conn.close()
+    with connect() as conn:
+        conn.execute(
+            text("UPDATE project_shopping SET purchased = needed"
+                 " WHERE project_id = :project_id"),
+            {"project_id": project_id},
+        )
+        conn.commit()
     return {"ok": True}
 
 
@@ -132,19 +136,31 @@ async def api_project_shopping_mark_all(project_id: int):
 async def api_project_plan_toggle(plan_id: int, request: Request):
     body = await request.json()
     status = body.get("status", "completed")
-    conn = get_conn()
-    conn.execute("UPDATE project_plans SET status=? WHERE id=?", (status, plan_id))
-    conn.commit()
-    conn.close()
+    with connect() as conn:
+        conn.execute(
+            text("UPDATE project_plans SET status = :status WHERE id = :id"),
+            {"status": status, "id": plan_id},
+        )
+        conn.commit()
     return {"ok": True, "status": status}
+
+
+# Table -> the column that names the project. Written out rather than derived
+# so an f-string never carries anything but a value from this dict; the old
+# version interpolated both the table and the column into the statement.
+_PROJECT_TABLES = {
+    "project_jobs": "project_id",
+    "project_shopping": "project_id",
+    "project_plans": "project_id",
+    "production_projects": "id",
+}
 
 
 @router.delete("/api/projects/{project_id}")
 async def api_project_delete(project_id: int):
-    conn = get_conn()
-    for tbl in ("project_jobs", "project_shopping", "project_plans", "production_projects"):
-        col = "id" if tbl == "production_projects" else "project_id"
-        conn.execute(f"DELETE FROM {tbl} WHERE {col}=?", (project_id,))
-    conn.commit()
-    conn.close()
+    with connect() as conn:
+        for table, column in _PROJECT_TABLES.items():
+            conn.execute(text(f"DELETE FROM {table} WHERE {column} = :project_id"),
+                         {"project_id": project_id})
+        conn.commit()
     return {"ok": True}
