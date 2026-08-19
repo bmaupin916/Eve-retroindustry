@@ -101,7 +101,7 @@ def test_profit_is_sell_minus_materials_and_fees(db):
     leaves = _price_whole_tree(conn, path, CRANE, me=0, unit_price=10.0)
     _price(conn, CRANE, 500_000_000.0)
 
-    row = compute_margin(conn, path, CRANE, me=0, te=0, defaults=get_defaults(dbapi(conn)))
+    row = compute_margin(conn, path, CRANE, me=0, te=0, defaults=get_defaults(conn))
 
     assert row.name == "Crane"
     assert row.group_name == "Blockade Runner"        # the Group column
@@ -139,13 +139,13 @@ def test_unpriced_material_is_reported_not_treated_as_free(db):
 
     leaves = _price_whole_tree(conn, path, CRANE, me=0, unit_price=10.0)
     _price(conn, CRANE, 500_000_000.0)
-    priced_cost = compute_margin(conn, path, CRANE, 0, 0, get_defaults(dbapi(conn))).material_cost
+    priced_cost = compute_margin(conn, path, CRANE, 0, 0, get_defaults(conn)).material_cost
 
     # Drop one leaf's price and re-price.
     dropped = sorted(leaves)[0]
     conn.exec_driver_sql("DELETE FROM market_price_cache WHERE type_id=?", (dropped,))
     conn.commit()
-    row = compute_margin(conn, path, CRANE, 0, 0, get_defaults(dbapi(conn)))
+    row = compute_margin(conn, path, CRANE, 0, 0, get_defaults(conn))
 
     assert row.unpriced, "a missing price must be reported"
     assert row.priced is False
@@ -161,7 +161,7 @@ def test_negative_me_costs_more(db):
 
     _price_whole_tree(conn, path, CRANE, me=-4, unit_price=10.0)
     _price(conn, CRANE, 500_000_000.0)
-    defaults = get_defaults(dbapi(conn))
+    defaults = get_defaults(conn)
 
     worse = compute_margin(conn, path, CRANE, me=-4, te=0, defaults=defaults)
     better = compute_margin(conn, path, CRANE, me=10, te=0, defaults=defaults)
@@ -176,7 +176,7 @@ def test_unbuildable_product_reports_an_error(db):
     from app.manufacturing.margins import compute_margin
     from app.web.app_defaults import get_defaults
 
-    row = compute_margin(conn, path, TRITANIUM, 0, 0, get_defaults(dbapi(conn)))
+    row = compute_margin(conn, path, TRITANIUM, 0, 0, get_defaults(conn))
     assert row.error is not None
     assert row.profit is None
 
@@ -300,11 +300,11 @@ def test_defaults_round_trip_and_survive_garbage(db):
     path, conn = db
     from app.web.app_defaults import get_defaults, is_configured, save_defaults
 
-    base = get_defaults(dbapi(conn))
+    base = get_defaults(conn)
     assert base["build_station_id"] == 0
     assert is_configured(base) is False
 
-    saved = save_defaults(dbapi(conn), {"build_station_id": "60003760", "facility_tax": "1.5",
+    saved = save_defaults(conn, {"build_station_id": "60003760", "facility_tax": "1.5",
                                  "input_basis": "buy", "not_a_key": "ignored"})
     assert saved["build_station_id"] == 60003760
     assert saved["facility_tax"] == 1.5
@@ -315,7 +315,7 @@ def test_defaults_round_trip_and_survive_garbage(db):
     # A hand-mangled row must fall back, not take the page down.
     conn.exec_driver_sql("UPDATE app_defaults SET value='banana' WHERE key='facility_tax'")
     conn.commit()
-    assert get_defaults(dbapi(conn))["facility_tax"] == 2.5
+    assert get_defaults(conn)["facility_tax"] == 2.5
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
@@ -357,7 +357,7 @@ def _margin_on(conn, path, basis, **extra):
     from app.manufacturing.margins import compute_margin
     from app.web.app_defaults import get_defaults
 
-    defaults = dict(get_defaults(dbapi(conn)))
+    defaults = dict(get_defaults(conn))
     defaults["input_basis"] = basis
     defaults.update(extra)
     return compute_margin(conn, path, CRANE, me=0, te=0, defaults=defaults)

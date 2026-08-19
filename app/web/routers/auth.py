@@ -480,7 +480,13 @@ async def settings_page(request: Request):
     from app.auth.esi_oauth import callback_url, SCOPES
     conn = get_conn()
     try:
-        defaults = app_defaults.get_defaults(conn)
+        # `app_defaults` is converted; this router is not. It gets its own
+        # connection from the engine rather than the raw one — same database,
+        # same committed state, and both styles coexist deliberately
+        # (`test_both_connection_styles_work_on_one_database`).
+        from app.db.conn import connect
+        with connect() as _defaults_conn:
+            defaults = app_defaults.get_defaults(_defaults_conn)
         station_options = _industry_station_options(conn)
         # Only the eight canonical decryptors: the faction-flavoured duplicates
         # and the ancient-relic ones behave identically or belong to reverse
@@ -524,11 +530,11 @@ async def api_save_defaults(request: Request):
     """Saves the app-wide industry defaults used by the margin tracker and
     pre-filled into the /plan form."""
     body = await request.json()
-    conn = get_conn()
-    try:
+    # Nothing else in this handler touches the database, so it goes entirely
+    # through the engine rather than opening a raw connection to hand over.
+    from app.db.conn import connect
+    with connect() as conn:
         saved = app_defaults.save_defaults(conn, body)
-    finally:
-        conn.close()
     return {"ok": True, "defaults": saved}
 
 

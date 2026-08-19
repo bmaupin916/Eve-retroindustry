@@ -105,10 +105,14 @@ def test_settings_round_trip_reaches_the_calculation():
     """The keys the Settings page posts must survive storage and land in the
     rates. A typo in DEFAULTS would silently leave the pessimistic default in
     place, which looks like "the setting did nothing"."""
-    import sqlite3
+    from sqlalchemy import create_engine
+
     from app.web.app_defaults import get_defaults, save_defaults
 
-    conn = sqlite3.connect(":memory:")
+    # `sqlite://` is in-memory and single-connection, which is what this needs:
+    # the table is created lazily on first use and must still be there on the
+    # next call. `app_defaults` takes a SQLAlchemy connection now.
+    conn = create_engine("sqlite://").connect()
     assert selling_costs(get_defaults(conn)).pct == pytest.approx(10.5)
 
     saved = save_defaults(conn, {
@@ -128,10 +132,11 @@ def test_settings_round_trip_reaches_the_calculation():
 
 def test_upwell_settings_ignore_the_stored_skills():
     """Switching venue must drop the skill-based discount, not keep it."""
-    import sqlite3
+    from sqlalchemy import create_engine
+
     from app.web.app_defaults import save_defaults
 
-    conn = sqlite3.connect(":memory:")
+    conn = create_engine("sqlite://").connect()
     saved = save_defaults(conn, {
         "accounting_skill": "5", "broker_relations_skill": "5",
         "sell_venue": "upwell", "structure_broker_pct": "1.0",

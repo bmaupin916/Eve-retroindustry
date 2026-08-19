@@ -24,7 +24,6 @@ from sqlalchemy.exc import IntegrityError
 
 from app.db.conn import (NO_SUCH_TABLE as _NO_SUCH_TABLE,
                          recover_from_missing_table as _recover)
-from app.db.conn import dbapi
 
 from app.manufacturing.margins import (
     MarginRow, build_invention_params, compute_margin, _station_context,
@@ -174,8 +173,7 @@ def build_view_model(conn: Connection, db_path: str,
                      message: str | None = None) -> dict:
     """Prices the whole watchlist and assembles the page."""
     ensure_margin_tables(conn)
-    # app_defaults is not converted yet — hand it the driver connection.
-    defaults = get_defaults(dbapi(conn))
+    defaults = get_defaults(conn)
     items = list_items(conn)
 
     view: dict = {

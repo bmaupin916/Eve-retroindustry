@@ -188,7 +188,14 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
     # Preserve station when switching character; otherwise fall back to the
     # app-wide default from Settings so the form opens ready to run.
     prefill_station = station.strip() if station.strip().isdigit() else ""
-    _defaults = app_defaults.get_defaults(conn)
+    # `app_defaults` is converted and this router is not, so it gets a
+    # connection from the engine. Deliberately `connect()` and not the
+    # `connect_to_path(database_path())` used further down for the resolver:
+    # that one names the SQLite file, and the defaults must come from whatever
+    # database the app is actually configured to read.
+    from app.db.conn import connect as _connect
+    with _connect() as _dc:
+        _defaults = app_defaults.get_defaults(_dc)
     if not prefill_station and _defaults.get("build_station_id"):
         prefill_station = str(_defaults["build_station_id"])
     prefill_station_name = ""
@@ -516,9 +523,16 @@ async def plan_result(
         # tree contains, so their per-run times can be turned into per-product
         # job splits. Skipped entirely when splitting is off (the default), so
         # an unconfigured install pays nothing for it.
-        from app.db.conn import connect_to_path
+        from app.db.conn import connect as _connect, connect_to_path
         sde_conn = connect_to_path(database_path())       # for the converted BOMResolver
-        _max_job_days = float(app_defaults.get_defaults(conn).get("max_job_days") or 0)
+        # Read once, into a plain dict, and close. The defaults are wanted as
+        # data in three places further down; holding a pooled connection open
+        # across all of them would leak one per plan run on any path that
+        # raises. Not `sde_conn` either: that one is pinned to the SQLite file
+        # by path, and the defaults belong to the configured database.
+        with _connect() as _dc:
+            _plan_defaults_all = app_defaults.get_defaults(_dc)
+        _max_job_days = float(_plan_defaults_all.get("max_job_days") or 0)
         _job_splits: dict[int, int] = {}
         if _max_job_days > 0:
             probe = BOMResolver(sde_conn, blueprints=blueprints, runs_per_job=rpj_int)
@@ -540,10 +554,10 @@ async def plan_result(
         # product itself, since only the margin tracker ever called that code.
         # Same builder the tracker uses, so the two pages price datacores alike.
         # `margins` is converted; this router is not. It gets the SQLAlchemy
-        # connection already open for the resolver, and the defaults still come
-        # from the raw one. Both are the same database.
+        # connection already open for the resolver, and the defaults come from
+        # the engine connection opened above. All three are the same database.
         inv_params, inv_warnings = build_invention_params(
-            sde_conn, app_defaults.get_defaults(conn), input_basis, database_path())
+            sde_conn, _plan_defaults_all, input_basis, database_path())
 
         # Pass 2 — the real resolve, with the splits applied. ME rounds once per
         # job, so the splits reach the material totals here and in build_plan
@@ -699,7 +713,7 @@ async def plan_result(
         # Slot capacity from the app-wide defaults. All zero (the default) means
         # unlimited, which reproduces the previous longest-job-per-level estimate.
         from app.manufacturing.schedule import SlotLimits as _SlotLimits
-        _plan_defaults = app_defaults.get_defaults(conn)
+        _plan_defaults = _plan_defaults_all
         _slot_limits = _SlotLimits(
             manufacturing=int(_plan_defaults.get("manufacturing_slots") or 0),
             reaction=int(_plan_defaults.get("reaction_slots") or 0),

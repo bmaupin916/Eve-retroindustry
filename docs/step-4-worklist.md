@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.47. **655 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.48. **681 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -72,11 +72,17 @@ process, each sees the other's committed writes
 its own, and what is left at the end is deleting `get_conn()` once nothing
 calls it.
 
-Order — `projects` and `industry` are **done**; `industry` is the better
-worked example, because it hit the cases `projects` did not. Remaining:
+Order — `projects`, `industry` and `app_defaults` are **done**; `industry` is
+the better worked example, because it hit the cases `projects` did not.
+Remaining: `industry_helper`, `app/character/*`, `location_resolver`, then
 `media`, `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`,
-`plan`, then `app_defaults`, `industry_helper`, `app/character/*`,
-`location_resolver`, `deps.py`, `main.py` and `app/db/schema.py` itself.
+`plan`, and finally `deps.py`, `main.py` and `app/db/schema.py` itself.
+
+**`industry_helper` is next**, on the same "convert what is underneath" rule
+that put `app_defaults` before the routers: three of the four remaining
+`dbapi()` boundaries point at it (`get_adjusted_prices_cached` twice and the
+station-context block in `margins.py`). The fourth points at `app/character/*`
+plus `location_resolver`, which go together.
 
 **"Smallest first" was the wrong heuristic and is abandoned.** It ignored
 shared dependencies: `BOMResolver` sat underneath four of the ten and had to be
@@ -86,6 +92,24 @@ smallest.
 **Boundary crossings are marked.** A converted module calling an unconverted one
 passes `dbapi(conn)` — the driver connection from underneath. `grep -rn "dbapi("
 app/` is the list of boundaries still standing, and it should shrink to nothing.
+It stood at 6 before v0.9.48 and stands at **4** after it.
+
+**A converted module called from an unconverted one is the other direction**, and
+it turns up as soon as something low in the stack is converted. `app_defaults`
+is called from `auth.py` and `plan.py`, neither of which is converted. Those
+call sites open their own connection from the engine — `with connect() as c` —
+rather than the whole router being dragged along; `auth.py` was already doing
+exactly that for `invention.list_decryptors`. Two rules learned doing it:
+
+* **Read into a plain dict and close.** `plan_result` wants the defaults in
+  three places. Holding the connection open across all three leaks one per plan
+  run on any path that raises; the defaults are data, so one `with` block at
+  the top and a dict afterwards is both shorter and safe.
+* **Use `connect()`, not the connection that happens to be nearby.**
+  `plan_result` already had a SQLAlchemy connection in scope — `sde_conn` from
+  `connect_to_path(database_path())`. Reusing it would have worked today and
+  read the defaults out of the SQLite *file* rather than the configured
+  database, which is wrong the moment `EVE_DATABASE_URL` is set.
 Passing the SQLAlchemy connection instead fails with
 `'str' object has no attribute '_execute_on_connection'` from deep inside
 SQLAlchemy, which reads like a query bug rather than a boundary crossing.
@@ -248,14 +272,19 @@ work, not a move, and the event model has to be decided before it is written.
 ~~Run `projects` against Postgres~~, ~~sign in~~ and ~~the sync-health page~~ are
 all **done**. What that left is below.
 
-1. **Pick up the conversion.** `app_defaults` next, not the smallest module:
-   it accounts for four of the six remaining `dbapi()` boundaries and has ~16
-   callers, so it unblocks the most. `grep -rn "dbapi(" app/` is the live list.
-   `tests/test_sde_on_postgres.py` is the newest pattern to copy — drive the
-   code directly, parameterised over both backends, then mutate the portability
-   fix and check the *shape* of the failure. Forcing `_upsert` to build a
-   SQLite construct there failed **8 Postgres tests and 0 SQLite ones**; that
-   asymmetry is what proves the test can see a backend difference at all.
+1. **Pick up the conversion.** `industry_helper` next — three of the four
+   remaining `dbapi()` boundaries point at it. `grep -rn "dbapi(" app/` is the
+   live list. `tests/test_app_defaults_on_postgres.py` is the pattern to copy:
+   drive the module directly, parameterised over both backends, then mutate the
+   portability fix and check the *shape* of the failure. Removing the dialect
+   guard from that module's schema shim failed **12 Postgres tests and 0 SQLite
+   ones**; that asymmetry is what proves the test can see a backend difference
+   at all rather than merely running twice.
+
+   Also worth copying from it: **one assertion that opens a second
+   connection.** A converted writer that loses its `commit()` passes every
+   same-connection check and drops the write when the request ends — dropping
+   the commit from `save_defaults` fails exactly one test, and it is that one.
 2. **Cache-only routes**, eight pages left. `/jobs` is the worked example.
 3. **Give the health page a second consumer, or don't.** `/sync-health` reads
    the log; nothing subscribes to it with a cursor. That is fine — `since()`

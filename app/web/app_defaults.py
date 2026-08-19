@@ -14,7 +14,9 @@ not worth it for single-user config.
 """
 from __future__ import annotations
 
-import sqlite3
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+
 from app.db.schema import ensure_schema as ensure_db_schema
 
 # key → (default value, coercer). The coercer also validates: anything that
@@ -115,15 +117,28 @@ DEFAULTS: dict[str, tuple[object, type]] = {
 }
 
 
-def ensure_defaults_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_defaults_table(conn: Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists.
+
+    SQLite only, like every other `ensure_*` in this codebase: lazy creation
+    predates migrations, and `app/db/schema.py` memoises per database by asking
+    `PRAGMA database_list`, which is a syntax error on Postgres. There the
+    schema arrives through Alembic, so this is "nothing to do" rather than
+    "create if missing".
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
-def get_defaults(conn: sqlite3.Connection) -> dict:
+def get_defaults(conn: Connection) -> dict:
     """Every default, with stored values coerced and unset keys filled in."""
     ensure_defaults_table(conn)
-    stored = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM app_defaults")}
+    # `key` is quoted on SQLite and bare on Postgres — SQLAlchemy's reserved
+    # word lists differ — but it is accepted unquoted on both when read back,
+    # which was checked rather than assumed before this statement was written.
+    stored = {r[0]: r[1] for r in
+              conn.execute(text("SELECT key, value FROM app_defaults"))}
     out: dict = {}
     for key, (fallback, cast) in DEFAULTS.items():
         raw = stored.get(key)
@@ -137,7 +152,7 @@ def get_defaults(conn: sqlite3.Connection) -> dict:
     return out
 
 
-def save_defaults(conn: sqlite3.Connection, values: dict) -> dict:
+def save_defaults(conn: Connection, values: dict) -> dict:
     """Writes the recognised keys and returns the resulting full set.
 
     Unknown keys are ignored rather than stored — this table is read back with
@@ -153,9 +168,9 @@ def save_defaults(conn: sqlite3.Connection, values: dict) -> dict:
         except (TypeError, ValueError):
             coerced = fallback
         conn.execute(
-            "INSERT INTO app_defaults (key, value) VALUES (?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(coerced)),
+            text("INSERT INTO app_defaults (key, value) VALUES (:key, :value)"
+                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value"),
+            {"key": key, "value": str(coerced)},
         )
     conn.commit()
     return get_defaults(conn)

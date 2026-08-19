@@ -34,12 +34,6 @@ def db(tmp_path):
     # Needed as soon as a station is configured: the station context resolves
     # the system behind it to read its cost index.
     ensure_location_name_table(conn)
-    # A station is the one default with no sane fallback; without it the board
-    # refuses to show numbers at all.
-    from app.web.app_defaults import ensure_defaults_table, save_defaults
-    ensure_defaults_table(conn)
-    # Still the raw handle here: the SQLAlchemy connection is created below.
-    save_defaults(conn, {"build_station_id": 60003760, "reaction_station_id": 60003760})
     conn.close()
 
     # The module under test is on the portable query layer now, so the fixture
@@ -47,6 +41,15 @@ def db(tmp_path):
     # DBAPI because `app/db/schema.py` has not been converted yet — it is the
     # same file either way.
     engine_conn = connect_to_path(path)
+
+    # A station is the one default with no sane fallback; without it the board
+    # refuses to show numbers at all. Seeded *after* the engine connection
+    # exists, because `app_defaults` is converted now and no longer takes the
+    # raw handle.
+    from app.web.app_defaults import save_defaults
+    save_defaults(engine_conn,
+                  {"build_station_id": 60003760, "reaction_station_id": 60003760})
+
     yield path, engine_conn
     engine_conn.close()
 
@@ -245,7 +248,7 @@ def test_no_station_configured_shows_no_numbers(db):
     from app.web.app_defaults import save_defaults
     from app.web.reactions_helper import build_board
 
-    save_defaults(dbapi(conn), {"build_station_id": ""})
+    save_defaults(conn, {"build_station_id": ""})
     board = build_board(conn, path)
     assert board["configured"] is False
     assert board["rows"] == []
@@ -450,7 +453,7 @@ def test_raw_cost_amortises_a_sub_run_instead_of_charging_a_whole_job(db):
         for mat in mats:
             _price(conn, mat["material_type_id"], 100.0)
 
-        ctx = _station_context(conn, get_defaults(dbapi(conn)))
+        ctx = _station_context(conn, get_defaults(conn))
         prices = _prices(conn, {m["material_type_id"] for m in mats}, "buy")
         per_unit = raw_unit_cost(resolver, NITROGEN_FUEL_BLOCK, prices, ctx, {}, set())
 
@@ -494,7 +497,7 @@ def test_raw_cost_includes_manufacturing_job_fees_not_just_reaction_ones(db):
                      (tid, 100.0, 0))
     conn.commit()
 
-    base_ctx = _station_context(conn, get_defaults(dbapi(conn)))
+    base_ctx = _station_context(conn, get_defaults(conn))
     adjusted = get_adjusted_prices_cached(dbapi(conn))
     ids = {r[0] for r in conn.exec_driver_sql("SELECT type_id FROM market_price_cache")}
     prices = _prices(conn, ids, "buy")
@@ -528,7 +531,7 @@ def test_raw_cost_is_none_when_something_underneath_is_unpriced(db):
 
     resolver = BOMResolver(connect_to_path(path))
     try:
-        ctx = _station_context(conn, get_defaults(dbapi(conn)))
+        ctx = _station_context(conn, get_defaults(conn))
         unpriced = set()
         value = raw_unit_cost(resolver, TUNGSTEN_CARBIDE, {}, ctx, {}, unpriced)
     finally:
@@ -576,7 +579,7 @@ def test_export_is_output_volume_times_the_configured_rate(db):
     from app.web.app_defaults import save_defaults
     from app.web.reactions_helper import build_board
 
-    save_defaults(dbapi(conn), {"freight_export_isk_m3": 1000.0})
+    save_defaults(conn, {"freight_export_isk_m3": 1000.0})
     _price(conn, TUNGSTEN_CARBIDE, 500.0)
     row = next(r for r in build_board(conn, path, group="Composite")["rows"]
                if r["type_id"] == TUNGSTEN_CARBIDE)
@@ -613,7 +616,7 @@ def test_an_unfetched_hub_reports_nothing_rather_than_no_advantage(db):
     from app.web.app_defaults import save_defaults
     from app.web.reactions_helper import build_board
 
-    save_defaults(dbapi(conn), {"sell_hub_region_id": 10000042})    # Hek
+    save_defaults(conn, {"sell_hub_region_id": 10000042})    # Hek
     board = build_board(conn, path, group="Composite")
     assert board["venue"]["name"] == "Hek"
     assert board["venue"]["fetched"] is False
@@ -629,10 +632,10 @@ def test_dumping_to_buy_orders_prices_the_output_at_the_buy_price(db):
 
     _price(conn, TUNGSTEN_CARBIDE, 1000.0, buy=400.0)
 
-    save_defaults(dbapi(conn), {"sales_method": "orders"})
+    save_defaults(conn, {"sales_method": "orders"})
     listed = next(r for r in build_board(conn, path)["rows"]
                   if r["type_id"] == TUNGSTEN_CARBIDE)
-    save_defaults(dbapi(conn), {"sales_method": "immediate"})
+    save_defaults(conn, {"sales_method": "immediate"})
     dumped = next(r for r in build_board(conn, path)["rows"]
                   if r["type_id"] == TUNGSTEN_CARBIDE)
 
@@ -681,8 +684,8 @@ def _tc_row(conn, path, **defaults):
     from app.web.app_defaults import get_defaults, save_defaults
     from app.web.reactions_helper import build_board
     if defaults:
-        save_defaults(dbapi(conn), defaults)
-    get_defaults(dbapi(conn))
+        save_defaults(conn, defaults)
+    get_defaults(conn)
     return next(r for r in build_board(conn, path)["rows"]
                 if r["type_id"] == TUNGSTEN_CARBIDE)
 

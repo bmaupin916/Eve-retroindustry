@@ -415,8 +415,7 @@ def build_board(conn: Connection, db_path: str,
     rather than the current filter. All three are sanitised here rather than
     trusted: they arrive from a query string a user can hand-edit.
     """
-    # app_defaults is not converted yet — hand it the driver connection.
-    defaults = get_defaults(dbapi(conn))
+    defaults = get_defaults(conn)
     view: dict = {
         "configured": is_configured(defaults),
         "defaults": defaults,
