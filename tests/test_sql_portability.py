@@ -179,7 +179,7 @@ def test_no_insert_omits_a_column_that_has_no_default():
                     continue
                 if col.server_default is not None or col.default is not None:
                     continue
-                if col.primary_key and col.autoincrement is True:
+                if col is t.autoincrement_column:
                     continue                       # the database mints it
                 offenders.append(
                     f"{rel}:{_line_of(src, m.start())} {table}.{col.name}")
@@ -255,3 +255,32 @@ def test_no_unaccounted_sqlite_pragmas():
         "new SQLite-only pragmas, each needing a Postgres answer: "
         + ", ".join(f"{n} ({w})" for n, w in sorted(unexpected.items())))
     assert seen, "the scan found no pragmas at all, which cannot be right"
+
+
+def test_the_scan_asks_sqlalchemy_which_column_the_database_fills():
+    """It used to check `col.autoincrement is True`, which is a spelling.
+
+    SQLAlchemy's default for a lone integer primary key is the string `'auto'`,
+    resolved at DDL time — so a table declared the idiomatic way was reported
+    as omitting its own id. Every table in the schema happened to spell it out,
+    which is why the scan looked right. `Table.autoincrement_column` is the
+    answer SQLAlchemy itself uses to emit the DDL.
+    """
+    from sqlalchemy import Column, Integer, MetaData, Table, Text
+
+    probe = MetaData()
+    spelled = Table("spelled", probe,
+                    Column("id", Integer, primary_key=True, autoincrement=True))
+    default = Table("default_", probe, Column("id", Integer, primary_key=True))
+    natural = Table("natural", probe,
+                    Column("id", Integer, primary_key=True, autoincrement=False),
+                    Column("v", Text))
+
+    assert spelled.autoincrement_column is spelled.c.id
+    assert default.autoincrement_column is default.c.id, (
+        "the default spelling is still a column the database fills"
+    )
+    assert natural.autoincrement_column is None, (
+        "a natural key is not filled by the database, and an insert that omits "
+        "it really is broken"
+    )

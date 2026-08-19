@@ -643,6 +643,46 @@ sde_build = Table(
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Sync events
+# ───────────────────────────────────────────────────────────────────────────
+#
+# The background sync worker (Step 4) refreshes caches. That alone is enough
+# for the web UI, which re-reads the cache on every page load — but §9.5 wants
+# a Discord bot that *announces* things, and a bot that polls a cache for
+# changes is a bot that misses them: two changes between polls look like one,
+# and a change that reverts looks like none. The doc is explicit that
+# retrofitting event emission costs more than building it in, so the worker
+# writes what changed as well as the new value.
+#
+# **Why an append-only table rather than a queue or a pub/sub.** The consumers
+# are a second process (the bot) that has to survive restarts without missing
+# anything, and eventually a web view. An in-process signal is lost on restart
+# and invisible across processes; Postgres LISTEN/NOTIFY works for one backend
+# and not the other, and this schema has to emit for both. A table with a
+# monotonic id lets a consumer store a cursor and ask for everything after it —
+# which is exactly "did I miss anything while I was down?". NOTIFY can be
+# layered on later as a wake-up; the log stays the source of truth.
+sync_events = Table(
+    "sync_events", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    # Epoch seconds. BigInteger for the same reason as every other timestamp
+    # here: Postgres INTEGER is four bytes and stops in 2038.
+    Column("created_at", BigInteger, nullable=False),
+    # Dotted, coarse-to-fine: "character.assets.changed", "job.completed".
+    Column("kind", Text, nullable=False),
+    # Whose event it is. Both nullable: a price refresh belongs to neither.
+    Column("character_id", BigInteger),
+    Column("corporation_id", BigInteger),
+    # Small JSON. What changed, never the whole payload — a consumer that needs
+    # the new value reads the cache, which is authoritative.
+    Column("detail_json", Text),
+    # A consumer asks for id > cursor, so this is the read path.
+    Index("idx_sync_events_id_kind", "id", "kind"),
+    Index("idx_sync_events_character", "character_id", "id"),
+)
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Scopes
 # ───────────────────────────────────────────────────────────────────────────
 

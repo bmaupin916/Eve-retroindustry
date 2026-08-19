@@ -103,11 +103,19 @@ Ordered by dependency, not by size.
 * ~~**W9 — async token refresh.**~~ **Done.** 22 call sites across six routers.
   The net is `tests/test_async_token_refresh.py`, which scans for the blocking
   call inside any coroutine — keep it green rather than re-auditing by hand.
-* **Background sync worker** — delay-after-completion plus jitter, so N
-  characters do not stampede ESI in lockstep. **Decide the event model before
-  writing it**: §9.5 needs it to emit events rather than only fill caches,
-  because a bot that polls the database for changes is a bot that misses them.
-  Retrofitting that is more work than building it in.
+* **Background sync worker** — the loop itself. Delay-after-completion plus
+  jitter, so N characters do not stampede ESI in lockstep.
+
+  **The event model is decided and built**: `sync_events` (append-only,
+  monotonic id) and `app/sync/events.py`. The worker emits with `events.emit()`
+  in the same transaction as the cache write it describes, and calls
+  `events.trim()` so the log stays bounded. Add any new kind to
+  `events.KINDS` — a kind that exists only at a call site is a subscriber that
+  silently never fires, and `emit()` refuses one.
+
+  Still to decide when writing the loop: what counts as "changed" for each
+  cache. Comparing whole JSON blobs would emit on every reorder; the cheap
+  honest version is a count and a hash of the sorted ids.
 * **Cache-only routes** — no route fetches from ESI on the request path.
   `margins.py` is the reference, including how it reports what it could not
   price.
