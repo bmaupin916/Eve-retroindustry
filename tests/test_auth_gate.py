@@ -552,3 +552,61 @@ def test_a_known_character_survives_a_refused_reauth(app_module, monkeypatch, co
     assert "is not the owner" in r.text
     assert get_character_row(conn, OTHER_CHARACTER_ID) is not None, \
         "a previously-added character was deleted by a refused re-auth"
+
+
+# --- Telling the sync worker somebody arrived ---------------------------------
+#
+# Found by running the app, not by reading it. The worker starts with the app;
+# if `characters` is empty at that moment it finds nobody, sleeps, and has no
+# way to learn that a login has happened. `/jobs` and the other converted pages
+# read only the cache, so they answer "not synced yet" until the sleep expires.
+# The worker-side fix is tested in `test_sync_worker.py`; what these cover is
+# the wiring, which is the half that rots silently.
+
+def _woke(monkeypatch) -> list:
+    calls: list = []
+    monkeypatch.setattr(auth_router.sync_worker, "wake",
+                        lambda: calls.append(True) or True)
+    return calls
+
+
+def test_a_new_session_wakes_the_sync_worker(app_module, monkeypatch):
+    """The owner signing in. Their caches are the ones about to be looked at."""
+    monkeypatch.setattr(auth_router, "complete_login",
+                        lambda code, state: (OWNER_CHARACTER_ID, "Test Pilot Alpha"))
+    calls = _woke(monkeypatch)
+
+    c = TestClient(app_module.app)
+    r = c.get("/callback?code=x&state=y", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert calls, (
+        "the worker was not told a character arrived, so its caches stay empty "
+        "until the current sleep expires — up to a full interval")
+
+
+def test_adding_an_alt_wakes_the_sync_worker(app_module, monkeypatch, client):
+    """The other keep-path: an owner adding an alt gets no new session, and it
+    is the branch most likely to be missed, because it returns early."""
+    monkeypatch.setattr(auth_router, "complete_login",
+                        lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
+    calls = _woke(monkeypatch)
+
+    r = client.get("/callback?code=x&state=y", follow_redirects=False)
+
+    assert r.status_code == 303, "this is the alt-added path, not a refusal"
+    assert calls, "an added alt never gets synced until the interval expires"
+
+
+def test_a_refused_stranger_does_not_wake_the_worker(app_module, monkeypatch):
+    """Their tokens are deleted on the way out, so a round would find nothing —
+    but asking for one is free work started by an uninvited request."""
+    monkeypatch.setattr(auth_router, "complete_login",
+                        lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
+    calls = _woke(monkeypatch)
+
+    c = TestClient(app_module.app)
+    r = c.get("/callback?code=x&state=y", follow_redirects=False)
+
+    assert r.status_code == 200, "expected the refusal page"
+    assert not calls, "a refused login scheduled sync work"

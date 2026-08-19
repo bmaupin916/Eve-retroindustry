@@ -66,6 +66,14 @@ JITTER = 0.2
 #: fetch at second zero.
 FIRST_ROUND_SPREAD = 30.0
 
+#: How long to wait when there is nobody to sync at all. A full interval here
+#: was a real defect: an instance that starts with no characters — a fresh
+#: deployment, or this one right after the test-data cleanup — found nobody on
+#: its first tick, slept the whole fifteen minutes, and had no way to be told
+#: that somebody had just signed in. `/jobs` reads only the cache, so it
+#: answered "not synced yet" for a quarter of an hour after a successful login.
+IDLE_INTERVAL = 60.0
+
 
 def _fingerprint(items: Iterable, key=None) -> str:
     """Order-independent identity of a collection.
@@ -112,6 +120,10 @@ class SyncWorker:
         self._sleep = sleep
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        #: Set by wake() to cut a sleep short. Adding a character is the case
+        #: this exists for: without it the new character waits out whatever
+        #: remains of the current interval, up to the full fifteen minutes.
+        self._wake = asyncio.Event()
         #: character_id -> when its next round is due (clock units)
         self._due: dict[int, float] = {}
         #: (character_id, what) -> fingerprint, so a round can tell change from
@@ -144,6 +156,15 @@ class SyncWorker:
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    def wake(self) -> None:
+        """Ask for a round now instead of when the current sleep expires.
+
+        Safe to call from anywhere, including when the worker is mid-round or
+        not running: the flag is level-triggered and cleared by the next wait,
+        so a wake that arrives during a round still shortens the sleep after it.
+        """
+        self._wake.set()
+
     # ── the loop ─────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -157,7 +178,27 @@ class SyncWorker:
                 print(f"[sync] worker tick failed: {exc}", flush=True)
                 waited = 60.0
             if waited > 0:
-                await self._sleep(waited)
+                await self._wait(waited)
+
+    async def _wait(self, seconds: float) -> bool:
+        """Sleep for `seconds`, or until wake() is called. True if woken early.
+
+        The nap is the *injected* sleep, so tests keep driving time by hand;
+        only the racing of it against the wake flag is new. Both sides are
+        awaited after cancellation so a cut-short sleep leaves nothing pending.
+        """
+        if seconds <= 0:
+            return False
+        nap = asyncio.ensure_future(self._sleep(seconds))
+        woke = asyncio.ensure_future(self._wake.wait())
+        done, pending = await asyncio.wait(
+            {nap, woke}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._wake.clear()
+        return woke in done
 
     async def tick(self) -> float:
         """Sync every character that is due. Returns how long to wait next.
@@ -171,7 +212,11 @@ class SyncWorker:
             # connection rather than a second opinion about the database.
             chars = list_characters(conn.connection.driver_connection)
         if not chars:
-            return self.interval
+            # Poll rather than sleep the interval. wake() is the fast path when
+            # a login happens in this process; this is the backstop for every
+            # other way a character can appear, and for a wake that races the
+            # round that is already running.
+            return min(self.interval, IDLE_INTERVAL)
 
         now = self._clock()
         for index, (char_id, name) in enumerate(chars):
@@ -366,6 +411,18 @@ async def stop() -> None:
     if _WORKER is not None:
         await _WORKER.stop()
         _WORKER = None
+
+
+def wake() -> bool:
+    """Ask the process-wide worker for a round now. False if there is none.
+
+    Called when a character is added, which is the moment the caches are most
+    obviously wrong and the moment the user is most likely to be looking.
+    """
+    if _WORKER is None or not _WORKER.running:
+        return False
+    _WORKER.wake()
+    return True
 
 
 def status() -> dict:

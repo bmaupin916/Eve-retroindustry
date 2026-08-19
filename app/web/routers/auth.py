@@ -40,6 +40,7 @@ from app.character.skills import fetch_skills
 from app.esi.client import esi_client
 from app.manufacturing import invention
 from app.market.prices import TRADE_HUBS
+from app.sync import worker as sync_worker
 from app.web import app_defaults, security
 from app.web.deps import ACTIVE_COOKIE, _tr, _valid_token_async, get_conn
 from app.web.location_resolver import resolve_station_names_bulk
@@ -240,6 +241,7 @@ async def auth_callback(request: Request, code: str | None = None,
             if security.load_session(conn, request.cookies.get(security.SESSION_COOKIE)):
                 print(f"[auth] added character {character_id} ({character_name}) "
                       f"to the instance owned by {security.get_owner_id(conn)}", flush=True)
+                sync_worker.wake()
                 return RedirectResponse("/auth/sync", status_code=303)
             owner = security.get_owner_id(conn)
             print(f"[auth] refused session for character {character_id}: this "
@@ -260,6 +262,11 @@ async def auth_callback(request: Request, code: str | None = None,
         session_id, _ = security.create_session(conn, character_id)
     finally:
         conn.close()
+
+    # The caches for a character nobody has synced are empty, and the pages
+    # that read them say so rather than fetching. Ask for a round now instead
+    # of letting the new character wait out the current interval.
+    sync_worker.wake()
 
     resp = RedirectResponse("/auth/sync", status_code=303)
     security.set_session_cookie(resp, session_id)

@@ -318,12 +318,20 @@ def test_the_wait_it_asks_for_never_exceeds_the_interval(db_with, stub_esi):
 
 
 def test_no_characters_means_no_work(db_with, stub_esi):
+    """No fetches — but it comes back to look, which is a separate claim.
+
+    This test used to assert `== worker.interval`, which pinned the defect
+    rather than the behaviour: with nobody to sync the worker slept the whole
+    fifteen minutes and could not be told that somebody had signed in. The part
+    worth keeping is that an empty instance spends nothing on ESI.
+    """
     db_with(0)
     clock = _Clock()
     worker = _worker(clock)
 
-    assert asyncio.run(worker.tick()) == worker.interval
-    assert stub_esi["calls"] == []
+    wait = asyncio.run(worker.tick())
+    assert stub_esi["calls"] == [], "it fetched something for nobody"
+    assert wait <= w.IDLE_INTERVAL < worker.interval
 
 
 # ── failure ──────────────────────────────────────────────────────────────────
@@ -537,3 +545,65 @@ def test_a_failed_job_fetch_is_not_an_empty_job_list(db_with, stub_esi, monkeypa
     asyncio.run(worker.tick())
 
     assert [e.kind for e in _events()] == [], "a failed fetch was reported as a change"
+
+
+# ── being told a character arrived ───────────────────────────────────────────
+#
+# The defect these cover, found by running the app rather than by reading it:
+# the worker started while `characters` was empty, `tick()` returned the full
+# fifteen-minute interval, and nothing could tell it that somebody had just
+# signed in. `/jobs` reads only the cache, so it answered "not synced yet" for
+# fifteen minutes after a successful login. Both halves of the fix are here —
+# the short idle poll, and the wake that makes the poll a backstop rather than
+# the mechanism.
+
+def test_an_empty_instance_does_not_sleep_the_whole_interval(db_with, stub_esi):
+    """`characters` empty is exactly the state a login is about to end."""
+    db_with(0)
+    worker = _worker(_Clock())
+
+    waited = asyncio.run(worker.tick())
+
+    assert waited <= w.IDLE_INTERVAL, (
+        f"an instance with no characters sleeps {waited:.0f}s. A character "
+        "added during that window is invisible until it expires.")
+    assert waited < worker.interval, "that is the full interval again"
+
+
+def test_waking_cuts_a_sleep_short(db_with, stub_esi):
+    """The claim in one line: a wake during the wait ends the wait."""
+    worker = _worker(_Clock())
+    slept: list[float] = []
+
+    async def _slow_sleep(seconds):
+        slept.append(seconds)
+        await asyncio.sleep(3600)          # never returns on its own
+
+    worker._sleep = _slow_sleep
+
+    async def scenario():
+        waiter = asyncio.ensure_future(worker._wait(900.0))
+        await asyncio.sleep(0)             # let the wait get as far as sleeping
+        worker.wake()
+        return await asyncio.wait_for(waiter, timeout=5)
+
+    woken = asyncio.run(scenario())
+    assert woken is True, "the wait ended, but not because of the wake"
+    assert slept == [900.0], "the injected sleep was bypassed rather than raced"
+
+
+def test_a_wake_does_not_leak_into_the_next_sleep(db_with, stub_esi):
+    """The flag is cleared by the wait that consumes it. If it were not, every
+    subsequent sleep would return instantly and the worker would spin."""
+    worker = _worker(_Clock())          # its injected sleep returns instantly
+    worker.wake()
+    assert asyncio.run(worker._wait(900.0)) is True, "the wait should consume it"
+    assert worker._wake.is_set() is False
+    assert asyncio.run(worker._wait(900.0)) is False, (
+        "the wake flag survived the wait that consumed it, so every later "
+        "sleep returns instantly and the worker spins")
+
+
+def test_wake_is_safe_when_no_worker_is_running():
+    """The login path calls this unconditionally; EVE_SYNC_WORKER=0 is normal."""
+    assert w.wake() is False

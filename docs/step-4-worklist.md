@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.38. **541 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.39. **548 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -118,9 +118,18 @@ Ordered by dependency, not by size.
   off; `tests/conftest.py` sets that, because otherwise every
   `with TestClient(app)` would start a loop against live ESI.
 
-  It syncs blueprints, assets, skills and corp assets. Jobs, planets,
+  It syncs blueprints, assets, skills, industry jobs and corp assets. Planets,
   contracts, orders and wallet are still fetched on the request path — moving
   those is the cache-only item below, and the worker is where they go.
+
+  **It has to be told when a character is added.** `wake()` cuts the current
+  sleep short, and the login path calls it. Without that, a character added to
+  a running instance waits out the interval — and an instance that started with
+  `characters` empty found nobody on its first tick and slept the full fifteen
+  minutes, so `/jobs` said "not synced yet" for a quarter of an hour after a
+  successful login. Found by running the app, not by reading it; the old
+  `test_no_characters_means_no_work` had asserted the full-interval sleep as
+  correct.
 
 * **Cache-only routes** — no route fetches from ESI on the request path.
   **`/jobs` is done and is the pattern**: a `char_jobs_cache` table filled by
