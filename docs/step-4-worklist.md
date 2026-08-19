@@ -9,8 +9,8 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   Postgres is reachable.
 * **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
-* Step 4 is **7 of 8** items, plus the Postgres groundwork. What is left is
-  cache-only routes, and ten modules of query conversion. The query
+* Step 4 is **7.5 of 8** items, plus the Postgres groundwork. What is left is
+  the rest of the cache-only conversion, and ten modules of query conversion. The query
   conversion has started: `projects` is done, ten modules to go.
 
 To bring the Postgres tests back:
@@ -113,8 +113,16 @@ Ordered by dependency, not by size.
   those is the cache-only item below, and the worker is where they go.
 
 * **Cache-only routes** — no route fetches from ESI on the request path.
-  `margins.py` is the reference, including how it reports what it could not
-  price.
+  **`/jobs` is done and is the pattern**: a `char_jobs_cache` table filled by
+  the worker, `load_cached_jobs()` read by the page, and the page saying how old
+  its answer is. `None` from the cache means "not synced yet" and `[]` means
+  "nothing there" — conflating them makes the page claim a character is idle
+  when it has simply not been looked at.
+
+  `tests/test_cache_only_routes.py` lists what is left, with a reason each.
+  Remove a name from `ALLOWED` when its page stops fetching, never to make the
+  test pass. Note the scan does not cross modules, so moving a fetch into a
+  helper would pass it — that is a known hole, documented in the file.
 * ~~**ETags on every fetch.**~~ **Done.** In the transport alongside the
   quarantine. `etag_stats()` reports hits, misses and bytes held.
 * ~~**4XX quarantine per character.**~~ **Done.** In the transport

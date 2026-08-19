@@ -44,6 +44,7 @@ from typing import Iterable, Optional
 from app.auth.token_store import list_characters, update_corporation_id, update_last_sync
 from app.character.assets import fetch_assets, fetch_corp_assets
 from app.character.blueprints import fetch_blueprints
+from app.character.jobs import fetch_industry_jobs
 from app.character.skills import fetch_skills
 from app.db.conn import connect
 from app.esi.client import esi_client
@@ -116,6 +117,10 @@ class SyncWorker:
         #: (character_id, what) -> fingerprint, so a round can tell change from
         #: repetition without re-reading what it just wrote.
         self._seen: dict[tuple[int, str], str] = {}
+        #: Job ids by status, per character. Jobs are tracked by transition
+        #: rather than by fingerprint — see `_job_events`.
+        self._jobs_active: dict[int, set] = {}
+        self._jobs_finished: dict[int, set] = {}
         self.rounds = 0
         self.failures = 0
 
@@ -223,6 +228,15 @@ class SyncWorker:
                     skills = await fetch_skills(client, char_id, token, raw)
                     changed += self._diff(char_id, "skills", skills)
 
+                    # /jobs reads this cache and never calls ESI itself, so a
+                    # failed fetch here is the difference between a stale page
+                    # and a page that says "not synced yet" — hence None rather
+                    # than [] when the fetch could not run.
+                    jobs = await fetch_industry_jobs(client, char_id, token,
+                                                     conn=raw, force_refresh=True)
+                    if jobs is not None:
+                        changed += self._job_events(char_id, jobs)
+
                     try:
                         corp_id, corp_assets = await fetch_corp_assets(
                             client, char_id, token, raw)
@@ -276,6 +290,38 @@ class SyncWorker:
         kind = ("corporation.assets.changed" if what == "corp_assets"
                 else f"character.{what}.changed")
         return [(kind, {"count": size})]
+
+    def _job_events(self, char_id: int, jobs: list) -> list[tuple[str, dict]]:
+        """Jobs are the one collection where the *transition* is the news.
+
+        "Assets changed" is a fact about a set; "a job finished" is something a
+        person acts on, and it is exactly what a cache cannot tell you after the
+        fact — a delivered job leaves ESI's window and the set simply shrinks.
+        So the ids are tracked per status rather than as one collection.
+        """
+        out: list[tuple[str, dict]] = []
+        active = {j.get("job_id") for j in jobs
+                  if j.get("status") == "active" and j.get("job_id")}
+        finished = {j.get("job_id") for j in jobs
+                    if j.get("status") in ("ready", "delivered") and j.get("job_id")}
+
+        was_active = self._jobs_active.get(char_id)
+        self._jobs_active[char_id] = active
+        was_finished = self._jobs_finished.get(char_id)
+        self._jobs_finished[char_id] = finished
+        if was_active is None:
+            return out                       # first sight is not news
+
+        started = active - was_active
+        if started:
+            out.append(("job.started", {"count": len(started)}))
+        # Newly finished: either it appeared in the finished set, or it left the
+        # active set without appearing anywhere — ESI drops delivered jobs after
+        # a while, and a job that vanishes has finished, not been cancelled.
+        completed = (finished - (was_finished or set())) | (was_active - active - started)
+        if completed:
+            out.append(("job.completed", {"count": len(completed)}))
+        return out
 
     def _record_failure(self, char_id: int, reason: str) -> bool:
         self.failures += 1

@@ -149,6 +149,15 @@ char_blueprints_cache = Table(
     Column("cached_at", Float),
 )
 
+char_jobs_cache = Table(
+    "char_jobs_cache", metadata,
+    # Industry jobs. Cached like assets and blueprints so /jobs renders without
+    # waiting on ESI — the background worker keeps it warm.
+    Column("character_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("data_json", Text, nullable=False),
+    Column("cached_at", Float, nullable=False),
+)
+
 char_skills_cache = Table(
     "char_skills_cache", metadata,
     Column("character_id", Integer, primary_key=True, autoincrement=False),

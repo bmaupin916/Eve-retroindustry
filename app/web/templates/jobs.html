@@ -15,7 +15,11 @@
 {% endif %}
 
 {% if fetch_failed %}
-<div class="alert alert-warning py-2"><i class="bi bi-arrow-repeat me-2"></i>Couldn't load jobs for some characters — a sync may be in progress. Refresh in a moment.</div>
+<div class="alert alert-warning py-2"><i class="bi bi-arrow-repeat me-2"></i>Some characters have not been synced yet — the background sync fills these in. Nothing is missing from the ones shown below.</div>
+{% endif %}
+
+{% if cached_at %}
+<p class="text-muted small mb-3"><i class="bi bi-clock-history me-1"></i>As of {{ cached_at|ts_ago }} — this page reads the local cache and never waits on ESI.</p>
 {% endif %}
 
 {% set ns = namespace(any=false) %}

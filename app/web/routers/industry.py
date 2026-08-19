@@ -61,20 +61,20 @@ async def jobs_page(request: Request):
         return _tr("jobs.html", request, {"groups": [], "error": "You are not signed in.",
                                           "total_active": 0})
 
-    # Fetch all characters' jobs concurrently. _one returns None (not []) when
-    # the fetch could not run — no token or an ESI error — so a transient
-    # failure (e.g. during a background Sync All) isn't shown as "no jobs".
-    async def _one(cid: int):
-        try:
-            tok = await _valid_token_async(cid)
-            if not tok:
-                return cid, None
-            async with esi_client() as client:
-                return cid, await jobs_api.fetch_industry_jobs(client, cid, tok)
-        except Exception:
-            return cid, None
+    # Cache only: this page never calls ESI. It used to fetch every character's
+    # jobs on every load, which made the render time the sum of N round trips
+    # and put a page view on the shared error budget. The background worker
+    # keeps the cache warm; a character it has not reached yet reads as
+    # "not synced yet" rather than as "no jobs", because those are different
+    # answers and only one of them is true.
+    raw_results = []
+    oldest: float | None = None
+    for cid, _name in chars:
+        jobs, cached_at = jobs_api.load_cached_jobs(conn, cid)
+        raw_results.append((cid, jobs))
+        if jobs is not None:
+            oldest = cached_at if oldest is None else min(oldest, cached_at)
 
-    raw_results = await asyncio.gather(*[_one(cid) for cid, _ in chars])
     fetch_failed = any(jl is None for _cid, jl in raw_results)
     results = [(cid, jl or []) for cid, jl in raw_results]
     char_name = {cid: name for cid, name in chars}
@@ -192,6 +192,10 @@ async def jobs_page(request: Request):
     return _tr("jobs.html", request, {
         "groups": groups, "error": None, "total_active": total_active,
         "fetch_failed": fetch_failed,
+        # Say how old the answer is rather than implying it is live. A
+        # cache-only page that shows no age is indistinguishable from a stale
+        # one, which is the complaint cache-only rendering invites.
+        "cached_at": oldest,
     })
 
 

@@ -428,3 +428,112 @@ def test_stopping_twice_is_harmless(db_with, stub_esi):
         await worker.stop()
 
     asyncio.run(scenario())
+
+
+# ── jobs: the one collection where the transition is the news ────────────────
+
+def _job(job_id, status="active"):
+    return {"job_id": job_id, "status": status, "activity_id": 1,
+            "product_type_id": 641, "facility_id": 60003760, "runs": 1}
+
+
+@pytest.fixture
+def stub_jobs(stub_esi, monkeypatch):
+    """Jobs on top of the other fetchers. Returns the list the test mutates."""
+    state = {"jobs": [_job(1)]}
+
+    async def _fetch(client, char_id, token, include_completed=True,
+                     conn=None, force_refresh=False):
+        return state["jobs"]
+
+    monkeypatch.setattr(w, "fetch_industry_jobs", _fetch)
+    return state
+
+
+def test_a_new_job_is_announced(db_with, stub_jobs):
+    db_with(1)
+    clock = _Clock()
+    worker = _worker(clock)
+
+    asyncio.run(worker.tick())                       # baseline
+    stub_jobs["jobs"] = [_job(1), _job(2)]
+    clock.advance(2000)
+    asyncio.run(worker.tick())
+
+    assert [e.kind for e in _events()] == ["job.started"]
+    assert _events()[0].detail == {"count": 1}
+
+
+def test_a_finished_job_is_announced(db_with, stub_jobs):
+    db_with(1)
+    clock = _Clock()
+    worker = _worker(clock)
+
+    asyncio.run(worker.tick())
+    stub_jobs["jobs"] = [_job(1, "ready")]
+    clock.advance(2000)
+    asyncio.run(worker.tick())
+
+    assert [e.kind for e in _events()] == ["job.completed"]
+
+
+def test_a_job_that_vanishes_counts_as_finished(db_with, stub_jobs):
+    """ESI drops delivered jobs from its window. A job that disappears has
+    finished — treating it as nothing is how the bot would miss the one event
+    anybody cares about."""
+    db_with(1)
+    clock = _Clock()
+    worker = _worker(clock)
+
+    stub_jobs["jobs"] = [_job(1), _job(2)]
+    asyncio.run(worker.tick())
+
+    stub_jobs["jobs"] = [_job(1)]
+    clock.advance(2000)
+    asyncio.run(worker.tick())
+
+    assert [e.kind for e in _events()] == ["job.completed"]
+
+
+def test_unchanged_jobs_say_nothing(db_with, stub_jobs):
+    db_with(1)
+    clock = _Clock()
+    worker = _worker(clock)
+
+    asyncio.run(worker.tick())
+    for _ in range(3):
+        clock.advance(2000)
+        asyncio.run(worker.tick())
+
+    assert _events() == []
+
+
+def test_the_first_sight_of_jobs_is_not_news(db_with, stub_jobs):
+    db_with(1)
+    clock = _Clock()
+    worker = _worker(clock)
+
+    stub_jobs["jobs"] = [_job(1), _job(2), _job(3, "ready")]
+    asyncio.run(worker.tick())
+
+    assert _events() == [], "a restart announced every job already running"
+
+
+def test_a_failed_job_fetch_is_not_an_empty_job_list(db_with, stub_esi, monkeypatch):
+    """None means "could not look"; [] means "looked, nothing there". Conflating
+    them makes /jobs claim a character has no jobs when it simply has not been
+    synced."""
+    db_with(1)
+    clock = _Clock()
+    worker = _worker(clock)
+
+    async def _fetch(client, char_id, token, include_completed=True,
+                     conn=None, force_refresh=False):
+        return None
+
+    monkeypatch.setattr(w, "fetch_industry_jobs", _fetch)
+    asyncio.run(worker.tick())
+    clock.advance(2000)
+    asyncio.run(worker.tick())
+
+    assert [e.kind for e in _events()] == [], "a failed fetch was reported as a change"
