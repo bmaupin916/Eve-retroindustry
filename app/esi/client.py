@@ -249,6 +249,32 @@ _QUARANTINE = _EntityQuarantine()
 # history needs the *previous body* recomputed against a moving 7-day window
 # rather than replayed. It sets If-None-Match itself, and a request that already
 # carries one is left alone.
+#: Headers that describe the *encoding of the bytes we were given*, and which
+#: therefore stop being true the moment we hand on a decoded body.
+_ENCODING_HEADERS = ("content-encoding", "content-length")
+
+
+def _decoded_headers(response: httpx.Response) -> list[tuple[str, str]]:
+    """The response's headers, minus the ones that describe its wire encoding.
+
+    `Response.aread()` decodes: it iterates `aiter_bytes()`, which runs the
+    content decoder, so at transport level it returns *decompressed* bytes even
+    though the transport is nominally the raw layer. Handing those bytes back
+    under the original `Content-Encoding: gzip` makes the client layer try to
+    gunzip plain JSON, and httpx raises
+
+        DecodingError: Error -3 while decompressing data: incorrect header check
+
+    which is what the sync worker reported for a real character. No test caught
+    it because no stub had ever set `Content-Encoding` — ESI does, on anything
+    big enough to be worth compressing, which is exactly the assets and
+    blueprints calls the worker makes. `Content-Length` goes too: it counted the
+    compressed bytes, and httpx recomputes it from the content it is given.
+    """
+    return [(name, value) for name, value in response.headers.multi_items()
+            if name.lower() not in _ENCODING_HEADERS]
+
+
 class _ETagCache:
     #: Total body bytes held. Assets for a large character run to a few MB.
     MAX_BYTES = 32 * 1024 * 1024
@@ -499,7 +525,7 @@ class _GovernedTransport(httpx.AsyncHTTPTransport):
                     body = await response.aread()
                     _ETAGS.store(etag_key, response, body)
                     return httpx.Response(200, request=request, content=body,
-                                          headers=response.headers)
+                                          headers=_decoded_headers(response))
                 _ETAGS.drop(etag_key)
             return response
         return last  # exhausted retries — hand it back so raise_for_status fires

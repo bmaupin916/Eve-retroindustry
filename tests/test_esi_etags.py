@@ -236,3 +236,86 @@ def test_eviction_drops_the_oldest_first():
     assert "/a/" not in keys, "eviction kept the oldest entry"
     assert "/d/" in keys, "eviction dropped the newest entry"
     assert cache.stats()["bytes"] <= cache.MAX_BYTES
+
+
+# ── Content-Encoding ─────────────────────────────────────────────────────────
+#
+# The regression that got out. The transport rebuilt its 200 with the body from
+# `response.aread()` and the *original* headers. But `aread()` iterates
+# `aiter_bytes()`, which runs the content decoder — so at transport level it
+# already returns decompressed bytes, and replaying them under
+# `Content-Encoding: gzip` makes the client layer gunzip plain JSON:
+#
+#     DecodingError: Error -3 while decompressing data: incorrect header check
+#
+# Nothing here caught it for two reasons, both worth keeping in mind: no stub
+# had ever set Content-Encoding, and every test above drives
+# `transport.handle_async_request` directly. The bug lives in the layer *above*
+# the transport, so a transport-level test cannot see it however hard it looks.
+# These go through a real AsyncClient for that reason.
+
+import gzip
+import json
+
+
+def _gzip_server(monkeypatch, payload: bytes, etag='"gz"'):
+    """A server that compresses like ESI does, and says so."""
+    seen: list = []
+
+    async def _fake(request):
+        seen.append(request.headers.get("if-none-match"))
+        headers = {"ETag": etag, "Content-Type": "application/json",
+                   "Content-Encoding": "gzip"}
+        if request.headers.get("if-none-match") == etag:
+            return httpx.Response(304, request=request, headers=headers)
+        blob = gzip.compress(payload)
+        return httpx.Response(200, request=request, content=blob,
+                              headers={**headers, "Content-Length": str(len(blob))})
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request",
+                        lambda self, request: _fake(request))
+    return seen
+
+
+def _client_get(url=URL):
+    async def run():
+        async with esi.esi_client() as client:
+            r = await client.get(url)
+            return r.status_code, r.json(), r.headers
+    return asyncio.run(run())
+
+
+def test_a_gzipped_body_is_readable_through_the_client(monkeypatch):
+    """What the sync worker actually does. ESI compresses anything sizeable, so
+    this is the ordinary path for assets and blueprints, not an edge case."""
+    rows = [{"item_id": n, "type_id": 34} for n in range(60)]
+    _gzip_server(monkeypatch, json.dumps(rows).encode())
+
+    status, parsed, _headers = _client_get()
+
+    assert status == 200
+    assert parsed == rows, "the body did not survive the transport"
+
+
+def test_the_rebuilt_response_does_not_claim_to_be_compressed(monkeypatch):
+    """The specific lie that caused it: decoded bytes under a gzip header."""
+    _gzip_server(monkeypatch, json.dumps({"v": 1}).encode())
+
+    _status, _parsed, headers = _client_get()
+
+    assert "content-encoding" not in headers, (
+        "the response still advertises an encoding its body no longer has")
+
+
+def test_a_replayed_hit_is_readable_too(monkeypatch):
+    """The 304 path rebuilds from the cache rather than from the response, so
+    it is a separate chance to get this wrong."""
+    rows = [{"item_id": n} for n in range(40)]
+    seen = _gzip_server(monkeypatch, json.dumps(rows).encode())
+
+    first = _client_get()
+    second = _client_get()
+
+    assert seen[1] == '"gz"', "the second request was not conditional"
+    assert first[1] == second[1] == rows
+    assert second[2].get("x-eve-retroindustry-etag") == "hit", "not served from cache"
