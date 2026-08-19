@@ -154,7 +154,7 @@ def test_db_file_is_owner_only(tmp_path, monkeypatch):
     db = tmp_path / "eve_cache.db"
     db.write_bytes(b"")
     db.chmod(0o644)
-    monkeypatch.setattr(database, "DB_PATH", str(db))
+    monkeypatch.setattr(database, "database_path", lambda: str(db))
 
     database.harden_db_permissions()
 
@@ -166,5 +166,6 @@ def test_harden_db_permissions_survives_a_missing_file(tmp_path, monkeypatch):
     """Called on import, before the DB necessarily exists — must never raise."""
     from app.db import database
 
-    monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "nope.db"))
+    monkeypatch.setattr(database, "database_path",
+                        lambda: str(tmp_path / "nope.db"))
     database.harden_db_permissions()

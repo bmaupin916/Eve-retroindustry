@@ -7,16 +7,22 @@ needs no network.
 **The environment is set up at import, not in a fixture.** ``EVE_APP_DIR`` used
 to be set inside ``app_module``, which runs after collection — and collection
 imports every test module. The moment one of them imported an ``app.web``
-module at module level, ``app.web.deps`` computed ``DB_ABS`` from the unset
-variable, bound it to the developer's real ``eve_cache.db``, and the whole run
-wrote there: ``_seed`` below opens with ``DELETE FROM characters``.
+module at module level, the app computed the database path from the unset
+variable, bound the developer's real ``eve_cache.db``, and the whole run wrote
+there: ``_seed`` below opens with ``DELETE FROM characters``.
 
 That is not a hypothetical. It happened, it took real characters and their
 refresh tokens with it, and nothing failed — the suite went green for a while
 and then started failing in unrelated files, because it was reading somebody's
-actual data. ``pytest_collection_finish`` below is the net; the docstring that
-used to claim "tests never touch the real eve_cache.db" was a claim about the
-world with nothing asserting it.
+actual data. The docstring that used to claim "tests never touch the real
+eve_cache.db" was a claim about the world with nothing asserting it.
+
+The app no longer freezes that path at all (``app/db/location.py``), which
+makes the failure impossible rather than merely guarded. Setting the variable
+early is still right — a subprocess or a module that reads it once should see
+the test value — and ``pytest_collection_finish`` below still checks the
+outcome, because a guard whose premise has been fixed is cheap to keep and
+expensive to have removed on the day the premise comes back.
 """
 from __future__ import annotations
 
@@ -70,18 +76,13 @@ def pytest_collection_finish(session):
     in an app module too early this is where it shows — before a single test
     has had the chance to write.
     """
-    # Every module that freezes a filesystem path at import. `app.db.location`
-    # is on the list because `tests/test_db_conn.py` imports it at module level,
-    # which is how this first went wrong.
-    frozen = [("app.web.deps", "DB_ABS"), ("app.db.location", "DB_PATH")]
+    from app.db.location import app_dir, database_path
+
     wrong = []
-    for mod_name, attr in frozen:
-        mod = sys.modules.get(mod_name)
-        if mod is None:
-            continue                    # nothing imported it; nothing to bind
-        bound = os.path.abspath(getattr(mod, attr))
-        if bound != os.path.abspath(TEST_DB):
-            wrong.append(f"{mod_name}.{attr} = {bound}")
+    if os.path.abspath(database_path()) != os.path.abspath(TEST_DB):
+        wrong.append(f"database_path() = {os.path.abspath(database_path())}")
+    if os.path.abspath(app_dir()) != os.path.abspath(APP_DIR):
+        wrong.append(f"app_dir() = {os.path.abspath(app_dir())}")
     if wrong:
         detail = "\n  ".join(wrong)
         raise pytest.UsageError(
@@ -135,13 +136,12 @@ def _seed(m) -> None:
 @pytest.fixture(scope="session")
 def app_module():
     import app.web.main as m
-    from app.web import deps
+    from app.db.location import database_path
 
-    # Belt and braces with pytest_collection_finish: that hook only fires if
-    # something imported deps during collection, and this one covers the case
-    # where main is imported here for the first time.
-    assert os.path.abspath(deps.DB_ABS) == os.path.abspath(TEST_DB), (
-        f"the app is bound to {deps.DB_ABS}, not {TEST_DB}"
+    # Belt and braces with pytest_collection_finish, which runs before any test
+    # and cannot see a variable something changes afterwards.
+    assert os.path.abspath(database_path()) == os.path.abspath(TEST_DB), (
+        f"the app is bound to {database_path()}, not {TEST_DB}"
     )
     m._SDE_READY[0] = True
     _seed(m)

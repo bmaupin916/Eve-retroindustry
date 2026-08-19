@@ -29,10 +29,16 @@ Two guards now exist and both are mutation-checked: conftest sets the
 environment at import, and `pytest_collection_finish` refuses to run if
 `app.web.deps.DB_ABS` or `app.db.location.DB_PATH` point anywhere else.
 
-**The shape of the bug is still in the code**: those two modules freeze a
-filesystem path at import, while `app/auth/esi_oauth.py` and
-`app/web/bootstrap.py` resolve it per call. Converting the other two would end
-the class rather than guard it — worth doing, ~7 call sites for `DB_ABS`.
+**The class is now closed, not just guarded.** Nothing resolves a writable path
+at import any more: `app/db/location.py` exposes `app_dir()` and
+`database_path()`, and `deps.DB_ABS`, `location.DB_PATH`, `deps._APP_DIR` and
+`token_store.CONFIG_PATH` are all gone. `tests/test_web_deps.py` scans the
+package for module-level assignments that read `EVE_APP_DIR` — that scan is
+what found the `token_store` one, which held the refresh-token config path and
+nobody had thought of.
+
+`EVE_BUNDLE_DIR` is still frozen, deliberately: it points at the code, and
+getting it wrong renders a 500 rather than deleting a database.
 
 ## 1. The query conversion — atomic
 

@@ -374,7 +374,6 @@ def test_a_real_deployment_must_bring_its_own_application(monkeypatch, tmp_path)
 
     monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
     monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
-    monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
 
     monkeypatch.setenv("EVE_CALLBACK_URL", "https://industry.example.com/callback")
     assert token_store.get_client_id() is None
@@ -401,7 +400,6 @@ def test_localhost_no_longer_falls_back_to_the_bundled_application(monkeypatch, 
     monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
     monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
     monkeypatch.delenv("EVE_CALLBACK_URL", raising=False)
-    monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
 
     assert token_store.get_client_id() is None
 
@@ -412,7 +410,6 @@ def test_a_configured_client_id_is_still_used(monkeypatch, tmp_path):
 
     monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
     monkeypatch.delenv("EVE_CALLBACK_URL", raising=False)
-    monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
 
     monkeypatch.setenv("EVE_CLIENT_ID", "from-the-environment")
     assert token_store.get_client_id() == "from-the-environment"
@@ -428,7 +425,6 @@ def test_an_unconfigured_deployment_cannot_start_a_login(monkeypatch, tmp_path):
     monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
     monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
     monkeypatch.setenv("EVE_CALLBACK_URL", "https://industry.example.com/callback")
-    monkeypatch.setattr(token_store, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
 
     assert esi_oauth.begin_login() is None
 

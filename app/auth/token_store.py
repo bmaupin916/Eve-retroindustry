@@ -27,12 +27,20 @@ from urllib.parse import urlparse
 import httpx
 
 from app.version import USER_AGENT
+from app.db.location import app_dir
 from app.db.schema import ensure_schema as ensure_db_schema
 
-_APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.join(
-    os.path.dirname(__file__), "..", ".."
-)
-CONFIG_PATH = os.path.join(_APP_DIR, ".eve_config.json")
+def config_path() -> str:
+    """Where the client ID is stored, resolved per call.
+
+    This was a module constant computed from EVE_APP_DIR at import. Anything
+    importing this module before the variable was set kept the wrong answer —
+    the same defect that had the test suite writing to a real database. Tests
+    had already worked around it by patching the constant *and* setting the
+    variable; setting the variable is now enough.
+    """
+    return os.path.join(app_dir(), ".eve_config.json")
+
 TOKEN_ENDPOINT = "https://login.eveonline.com/v2/oauth/token"
 # The reference deployment's EVE application. Usable for local development only
 # — see get_client_id().
@@ -87,20 +95,20 @@ def clear_refresh_invalid(character_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 def _load_json() -> dict:
-    if not os.path.exists(CONFIG_PATH):
+    if not os.path.exists(config_path()):
         return {}
     try:
-        with open(CONFIG_PATH) as f:
+        with open(config_path()) as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def _save_json(data: dict) -> None:
-    with open(CONFIG_PATH, "w") as f:
+    with open(config_path(), "w") as f:
         json.dump(data, f, indent=2)
     try:
-        os.chmod(CONFIG_PATH, 0o600)
+        os.chmod(config_path(), 0o600)
     except Exception:
         pass
 

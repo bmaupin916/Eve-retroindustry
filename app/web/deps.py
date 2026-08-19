@@ -31,28 +31,22 @@ from app.auth.token_store import (
     get_character_row,
     get_valid_token as _get_valid_token_for,
 )
+from app.db.location import app_dir, database_path
 from app.db.schema import (
     ensure_schema as ensure_db_schema,
     ensure_sde_schema,
 )
 
-# Path resolution. EVE_APP_DIR is the writable data directory and is what a
-# deployment sets; EVE_BUNDLE_DIR is a leftover seam from the retired desktop
-# build, where read-only bundled files lived apart from writable ones. Both
-# default to the project root, which is correct for a server install.
-_APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
+# EVE_BUNDLE_DIR is a leftover seam from the retired desktop build, where
+# read-only bundled files lived apart from writable ones. It defaults to the
+# project root, which is correct for a server install.
+#
+# This one is a constant and the writable path is not, deliberately: this is
+# where the *code* is. Getting it wrong renders a 500, not a deleted database.
 _BUNDLE_DIR = os.environ.get("EVE_BUNDLE_DIR") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..")
 )
 
-# Frozen at import. Every *other* place that needs this path resolves it at
-# call time (app/auth/esi_oauth.py, app/web/bootstrap.py), and the difference
-# matters: a module imported before EVE_APP_DIR is set binds whatever was
-# there, permanently. That is how the test suite spent a day writing to a
-# real database. tests/conftest.py::pytest_collection_finish is the net.
-DB_ABS = os.path.join(_APP_DIR, "eve_cache.db")
 TEMPLATES_DIR = Path(_BUNDLE_DIR) / "app" / "web" / "templates"
 STATIC_DIR = Path(_BUNDLE_DIR) / "app" / "web" / "static"
 
@@ -201,7 +195,7 @@ def get_conn() -> sqlite3.Connection:
     # past the timeout raised, the token came back None, and the dashboard showed
     # no location / skill training for every character. WAL lets readers and one
     # writer run concurrently; the timeout absorbs brief writer-writer waits.
-    conn = sqlite3.connect(DB_ABS, timeout=30.0)
+    conn = sqlite3.connect(database_path(), timeout=30.0)
     try:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")

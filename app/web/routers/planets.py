@@ -23,8 +23,9 @@ from app.auth.token_store import (
 from app.character import planets as planets_api
 from app.esi.client import esi_client
 from app.web import pi_planner_helper
+from app.db.location import database_path
 from app.db.schema import ensure_schema as ensure_db_schema
-from app.web.deps import DB_ABS, _tr, get_conn
+from app.web.deps import _tr, get_conn
 
 router = APIRouter()
 
@@ -300,7 +301,7 @@ async def pi_planner_page(
     half reuses the same PI fetch /planets does, so it costs no extra ESI calls.
     """
     view = pi_planner_helper.build_view_model(
-        DB_ABS,
+        database_path(),
         target=target,
         quantity=pi_planner_helper.parse_quantity(qty),
         period=pi_planner_helper.parse_period(period),

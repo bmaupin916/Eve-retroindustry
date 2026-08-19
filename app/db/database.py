@@ -7,7 +7,7 @@ import os
 # Where the database lives is now answered in one place, because Alembic needs
 # the same answer from outside the application and cannot import this module to
 # get it — `create_all` below runs on import.
-from app.db.location import DB_PATH, database_url
+from app.db.location import database_path, database_url
 
 
 class Base(DeclarativeBase):
@@ -61,7 +61,7 @@ def harden_db_permissions() -> None:
     so it is effectively a no-op in desktop dev. The VPS is the target.
     """
     try:
-        os.chmod(DB_PATH, 0o600)
+        os.chmod(database_path(), 0o600)
     except OSError:
         pass  # missing file or a filesystem without modes; not worth failing startup
 

@@ -383,7 +383,9 @@ def unconfigured(app_module, monkeypatch, tmp_path):
     from app.auth import token_store as ts
 
     monkeypatch.delenv("EVE_CLIENT_ID", raising=False)
-    monkeypatch.setattr(ts, "CONFIG_PATH", str(tmp_path / ".eve_config.json"))
+    # Patch the function, not EVE_APP_DIR: that variable now steers the
+    # database too, and these tests still want the seeded one.
+    monkeypatch.setattr(ts, "config_path", lambda: str(tmp_path / ".eve_config.json"))
     return ts
 
 

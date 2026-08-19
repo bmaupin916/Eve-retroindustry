@@ -132,11 +132,8 @@ from app.db.schema import (
 
 from app.web.deps import (
     ACTIVE_COOKIE,
-    DB_ABS,
     STATIC_DIR,
     TEMPLATES_DIR,
-    _APP_DIR,
-    _BUNDLE_DIR,
     _SDE_READY,
     _age_short,
     _container_display_name,

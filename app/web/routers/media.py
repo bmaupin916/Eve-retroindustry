@@ -19,7 +19,7 @@ import httpx
 from fastapi import APIRouter
 
 from app.esi.client import esi_client
-from app.web.deps import _APP_DIR
+from app.db.location import app_dir
 
 router = APIRouter()
 
@@ -65,7 +65,7 @@ async def entity_portrait(kind: str, entity_id: int, size: int = 32):
                 return FileResponse(hit[0], media_type=hit[1], headers=headers)
             return Response(status_code=404 if 400 <= r.status_code < 500 else 502)
         ext, mime = kind_bytes
-        os.makedirs(_ICON_DIR, exist_ok=True)
+        os.makedirs(_icon_dir(), exist_ok=True)
         path = f"{_icon_base(entity_id, size, variant)}.{ext}"
         tmp = f"{path}.{os.getpid()}.part"
         with open(tmp, "wb") as fh:
@@ -87,7 +87,11 @@ async def entity_portrait(kind: str, entity_id: int, size: int = 32):
 # immutable, so we proxy them once to disk and then answer locally with an
 # immutable Cache-Control — after the first visit the browser stops asking at all.
 
-_ICON_DIR = os.path.join(_APP_DIR, "icon_cache")
+def _icon_dir() -> str:
+    """Resolved per call, like every other writable path."""
+    return os.path.join(app_dir(), "icon_cache")
+
+
 _ICON_SIZES = {32, 64, 128, 256, 512}          # sizes the image server publishes
 _ICON_VARIANTS = {"icon", "render", "bp", "bpc", "relic"}   # type image flavours
 _ICON_SEM = asyncio.Semaphore(8)               # don't open a socket per visible row
@@ -96,7 +100,7 @@ _ICON_MAX_BYTES = 512 * 1024                    # sanity cap per icon
 
 
 def _icon_base(type_id: int, size: int, variant: str) -> str:
-    return os.path.join(_ICON_DIR, f"{type_id}_{variant}_{size}")
+    return os.path.join(_icon_dir(), f"{type_id}_{variant}_{size}")
 
 
 # Icons are PNG but renders are JPEG, so the served content-type has to follow the
@@ -166,7 +170,7 @@ async def type_icon(type_id: int, size: int = 32, v: str = "icon"):
         if 400 <= r.status_code < 500:
             _ICON_MISSING.add((type_id, size, variant))
             try:
-                os.makedirs(_ICON_DIR, exist_ok=True)
+                os.makedirs(_icon_dir(), exist_ok=True)
                 open(_icon_missing_marker(type_id, size, variant), "wb").close()
             except Exception:
                 pass
@@ -178,7 +182,7 @@ async def type_icon(type_id: int, size: int = 32, v: str = "icon"):
             print(f"[icon] {type_id}@{size}/{variant}: non-image body, not cached", flush=True)
             return Response(status_code=502)
         ext, mime = kind
-        os.makedirs(_ICON_DIR, exist_ok=True)
+        os.makedirs(_icon_dir(), exist_ok=True)
         path = f"{_icon_base(type_id, size, variant)}.{ext}"
         tmp = f"{path}.{os.getpid()}.part"   # atomic: never serve a half-written file
         with open(tmp, "wb") as fh:

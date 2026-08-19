@@ -23,7 +23,8 @@ from app.character import jobs as jobs_api
 from app.character.skills import get_cached_skills
 from app.esi.client import esi_client
 from app.web import margins_helper, reactions_helper
-from app.web.deps import DB_ABS, _tr, get_conn
+from app.db.location import database_path
+from app.web.deps import _tr, get_conn
 from app.web.location_resolver import (
     load_location_names_from_db,
     resolve_station_names_bulk,
@@ -207,7 +208,7 @@ async def reactions_page(request: Request, sort: str = "", dir: str = "",
     conn = get_conn()
     try:
         view = reactions_helper.build_board(
-            conn, DB_ABS,
+            conn, database_path(),
             sort=sort or reactions_helper.DEFAULT_SORT,
             direction=dir or reactions_helper.DEFAULT_DIR,
             group=group,
@@ -227,7 +228,7 @@ async def margins_page(request: Request, msg: str = ""):
     """
     conn = get_conn()
     try:
-        view = margins_helper.build_view_model(conn, DB_ABS, message=msg or None)
+        view = margins_helper.build_view_model(conn, database_path(), message=msg or None)
     finally:
         conn.close()
     return _tr("margins.html", request, view)

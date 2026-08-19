@@ -42,8 +42,8 @@ from app.manufacturing.planner import (
 from app.market.prices import get_cached_station_volumes
 from app.market.taxes import selling_costs
 from app.web import app_defaults
+from app.db.location import database_path
 from app.web.deps import (
-    DB_ABS,
     _load_assets_from_cache,
     _tr,
     get_active_character_id,
@@ -521,7 +521,7 @@ async def plan_result(
         _max_job_days = float(app_defaults.get_defaults(conn).get("max_job_days") or 0)
         _job_splits: dict[int, int] = {}
         if _max_job_days > 0:
-            probe = BOMResolver(DB_ABS, blueprints=blueprints, runs_per_job=rpj_int)
+            probe = BOMResolver(database_path(), blueprints=blueprints, runs_per_job=rpj_int)
             try:
                 _job_splits = _derive_job_splits(
                     conn,
@@ -547,7 +547,7 @@ async def plan_result(
         # below; both resolutions must use them or the two views disagree.
         # The resolver gets all of the character's blueprints → per-product ME is
         # looked up for each intermediate step (Capital Armor Plates ME may differ from root ME).
-        resolver = BOMResolver(DB_ABS, blueprints=blueprints, runs_per_job=rpj_int,
+        resolver = BOMResolver(database_path(), blueprints=blueprints, runs_per_job=rpj_int,
                                adjusted_prices=adj_prices, rate_mfg=rate_mfg, rate_rxn=rate_rxn,
                                runs_per_job_by_product=_job_splits,
                                invention=inv_params)
@@ -565,7 +565,7 @@ async def plan_result(
             location_id=station,
             available_assets=available,
             blueprints=blueprints,
-            db_path=DB_ABS,
+            db_path=database_path(),
             mode=mode,
             prices=prices,
             mfg_facility=mfg_facility,

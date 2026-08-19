@@ -8,29 +8,41 @@ outside the application, and importing `database.py` to get it would run
 `EVE_DATABASE_URL` is the seam the Postgres cutover goes through: nothing
 else in the tree names a driver, so pointing this at a Postgres instance is
 the whole of the switch as far as *addressing* is concerned.
+
+**Everything here resolves per call. Nothing is frozen at import.** This module
+and `app/web/deps.py` used to compute the path once, at import, from
+`EVE_APP_DIR`. Any module imported before that variable was set therefore bound
+whatever was there — and that is not hypothetical: the test suite spent a
+session writing to a developer's real database, opening with `DELETE FROM
+characters`, because `conftest` set the variable in a fixture and fixtures run
+after collection has already imported every test module.
+
+A function cannot be bound early. That is the entire reason these are functions
+and not constants.
 """
 
 from __future__ import annotations
 
 import os
 
-# The deployment sets EVE_APP_DIR to a writable location; dev falls back to the
-# project root.
-APP_DIR = os.environ.get("EVE_APP_DIR") or os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# Frozen at import. Every *other* place that needs this path resolves it at
-# call time (app/auth/esi_oauth.py, app/web/bootstrap.py), and the difference
-# matters: a module imported before EVE_APP_DIR is set binds whatever was
-# there, permanently. That is how the test suite spent a day writing to a
-# real database. tests/conftest.py::pytest_collection_finish is the net.
-DB_PATH = os.path.join(APP_DIR, "eve_cache.db")
+
+def app_dir() -> str:
+    """The writable data directory. A deployment sets EVE_APP_DIR; dev falls
+    back to the project root."""
+    return os.environ.get("EVE_APP_DIR") or _PROJECT_ROOT
+
+
+def database_path() -> str:
+    """Absolute path to the SQLite file. Reads the environment every time."""
+    return os.path.join(app_dir(), "eve_cache.db")
 
 
 def database_url() -> str:
     """SQLAlchemy URL for the database this deployment uses."""
-    return os.environ.get("EVE_DATABASE_URL") or f"sqlite:///{os.path.abspath(DB_PATH)}"
+    return (os.environ.get("EVE_DATABASE_URL")
+            or f"sqlite:///{os.path.abspath(database_path())}")
 
 
 def is_sqlite() -> bool:
