@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.31. **433 tests green**, 8 skip unless a
+* Branch `docs/hosted-v2-design`, v0.9.31. **436 tests green**, 8 skip unless a
   Postgres is reachable.
 * **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
@@ -25,9 +25,9 @@ after collection — by which time a test module with a module-level app import
 had already bound the path. It cost the three real characters and their refresh
 tokens.
 
-Two guards now exist and both are mutation-checked: conftest sets the
-environment at import, and `pytest_collection_finish` refuses to run if
-`app.web.deps.DB_ABS` or `app.db.location.DB_PATH` point anywhere else.
+Two guards exist and both are mutation-checked: conftest sets the environment
+at import, and `pytest_collection_finish` refuses to run if `database_path()`
+or `app_dir()` answer anything but the test directory.
 
 **The class is now closed, not just guarded.** Nothing resolves a writable path
 at import any more: `app/db/location.py` exposes `app_dir()` and
