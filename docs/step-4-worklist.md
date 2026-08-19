@@ -9,7 +9,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   Postgres is reachable.
 * **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
-* Step 4 is **4 of 8** items, plus the Postgres groundwork. The query
+* Step 4 is **5 of 8** items, plus the Postgres groundwork. The query
   conversion has started: `projects` is done, ten modules to go.
 
 To bring the Postgres tests back:
@@ -111,8 +111,9 @@ Ordered by dependency, not by size.
   `margins.py` is the reference, including how it reports what it could not
   price.
 * **ETags on every fetch.**
-* **4XX quarantine per character** — one revoked token must not burn the shared
-  error budget for everyone.
+* ~~**4XX quarantine per character.**~~ **Done.** In the transport
+  (`app/esi/client.py`), keyed on the entity in the URL. `quarantine_state()`
+  reports what is currently held, which is what a sync-health view would show.
 
 ## What W6 taught that applies to the rest
 

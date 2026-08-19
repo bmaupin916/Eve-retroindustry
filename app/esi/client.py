@@ -142,6 +142,102 @@ class _TokenBucketGovernor:
 _TOKEN_LIMIT = _TokenBucketGovernor()
 
 
+# --- per-entity 4XX quarantine -----------------------------------------------
+# A revoked or de-scoped token answers 401/403 to every authenticated call for
+# that character, forever, and each one costs 5 tokens out of the error budget
+# that CCP keeps for the whole client. One pilot who removed the app in-game can
+# therefore error-limit everybody else's requests — the shared-budget failure the
+# error-limit governor above can only react to after the fact.
+#
+# So: count 4XXs per entity, and once an entity looks broken, stop putting its
+# requests on the wire at all. The transport answers them locally with the last
+# refusal it actually saw. Nothing is spent, and the rest of the app is
+# unaffected.
+#
+# Keyed on the entity in the URL rather than on the token, because a request
+# does not carry an identity the transport can read — the bearer token is opaque
+# and /corporations/ calls are made with some member's token.
+class _EntityQuarantine:
+    #: Consecutive 401/403s before an entity is held back.
+    STRIKES = 3
+    #: Backoff after each quarantine, in seconds. The last value repeats.
+    BACKOFF = (60.0, 300.0, 1800.0, 3600.0)
+
+    def __init__(self) -> None:
+        self._strikes: dict[str, int] = {}
+        self._held_until: dict[str, float] = {}
+        self._rounds: dict[str, int] = {}
+        self._last_status: dict[str, int] = {}
+
+    @staticmethod
+    def key(url: httpx.URL) -> Optional[str]:
+        """`characters/95123456` or `corporations/98000001`, else None.
+
+        Only the authenticated per-entity families are tracked. A 403 on a
+        public route is about the route, not about anybody's token.
+        """
+        parts = [p for p in url.path.split("/") if p]
+        for i, seg in enumerate(parts[:-1]):
+            if seg in ("characters", "corporations") and parts[i + 1].isdigit():
+                return f"{seg}/{parts[i + 1]}"
+        return None
+
+    def held(self, key: Optional[str]) -> bool:
+        if key is None:
+            return False
+        if time.monotonic() < self._held_until.get(key, 0.0):
+            return True
+        # Window passed: let exactly one request through to see if it is fixed.
+        if key in self._held_until:
+            del self._held_until[key]
+            self._strikes[key] = self.STRIKES - 1
+        return False
+
+    def last_status(self, key: str) -> int:
+        return self._last_status.get(key, 403)
+
+    def refused(self, key: Optional[str], status: int) -> None:
+        if key is None:
+            return
+        self._last_status[key] = status
+        self._strikes[key] = self._strikes.get(key, 0) + 1
+        if self._strikes[key] < self.STRIKES:
+            return
+        round_ = self._rounds.get(key, 0)
+        delay = self.BACKOFF[min(round_, len(self.BACKOFF) - 1)]
+        self._rounds[key] = round_ + 1
+        self._held_until[key] = time.monotonic() + delay
+        print(f"[esi] {key} answered {status} {self._strikes[key]}x — holding its "
+              f"requests for {delay:.0f}s so they stop spending the shared error budget",
+              flush=True)
+
+    def succeeded(self, key: Optional[str]) -> None:
+        """Any 2xx clears the entity: the token was replaced, or the scope came back."""
+        if key is None:
+            return
+        self._strikes.pop(key, None)
+        self._held_until.pop(key, None)
+        self._rounds.pop(key, None)
+        self._last_status.pop(key, None)
+
+    def reset(self) -> None:
+        self._strikes.clear()
+        self._held_until.clear()
+        self._rounds.clear()
+        self._last_status.clear()
+
+
+_QUARANTINE = _EntityQuarantine()
+
+
+def quarantine_state() -> dict[str, float]:
+    """Entities currently held back, and for how many more seconds. For tests
+    and for whatever ends up reporting sync health."""
+    now = time.monotonic()
+    return {k: round(v - now, 1) for k, v in _QUARANTINE._held_until.items()
+            if v > now}
+
+
 def _limit_header_total(value: Optional[str]) -> Optional[int]:
     """X-Ratelimit-Limit is "<tokens>/<window>", e.g. "12000/15m" — take the tokens."""
     if not value:
@@ -207,6 +303,20 @@ class _GovernedTransport(httpx.AsyncHTTPTransport):
             return await super().handle_async_request(request)
 
         sig = _TokenBucketGovernor.signature(request.url)
+
+        # Answer for a held-back entity without touching the network. Its last
+        # real refusal is replayed, so callers see the same status they would
+        # have got — they already handle it — but it costs nothing.
+        entity = _EntityQuarantine.key(request.url)
+        if _QUARANTINE.held(entity):
+            return httpx.Response(
+                _QUARANTINE.last_status(entity),
+                request=request,
+                headers={"X-Eve-Retroindustry-Quarantined": entity or ""},
+                json={"error": "token rejected repeatedly; requests for this "
+                               "entity are paused"},
+            )
+
         added_auth = False
         auth = _market_auth_header(request)
         if auth:
@@ -250,6 +360,15 @@ class _GovernedTransport(httpx.AsyncHTTPTransport):
 
             _ERROR_LIMIT.observe(_int_header(response, "x-esi-error-limit-remain"), reset)
             _TOKEN_LIMIT.observe(sig, response)
+
+            # 401/403 on a per-entity route means that entity's token, not a
+            # transient failure — counted so a permanently broken character
+            # stops spending the budget everyone shares. A 404 is not counted:
+            # "this character has no jobs" is an ordinary answer.
+            if response.status_code in (401, 403):
+                _QUARANTINE.refused(entity, response.status_code)
+            elif response.is_success:
+                _QUARANTINE.succeeded(entity)
             return response
         return last  # exhausted retries — hand it back so raise_for_status fires
 

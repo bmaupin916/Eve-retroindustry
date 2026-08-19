@@ -1465,7 +1465,7 @@ worker~~; split `main.py` into routers while every route is being touched anyway
 | **Background sync worker** | ⬜ not started. Must emit events, not just fill caches — §9.5 depends on it. |
 | **Cache-only routes** | ⬜ not started |
 | **ETags on every fetch** | ⬜ not started |
-| **4XX quarantine per character** | ⬜ not started |
+| **4XX quarantine per character** | ✅ **done.** ESI keeps one error budget for the whole client and a 4xx costs 5 tokens of it, so a character who removed the app in-game answers 401/403 forever and quietly spends the budget everyone else needs. After three consecutive refusals the transport answers that entity locally and stops putting its requests on the wire; any 2xx clears it, backoff lengthens 60s → 1h. Keyed on the entity in the URL rather than the token, because a bearer token is opaque to the transport and `/corporations/` calls are made with some member's. |
 | **Split `main.py`** (W6) | ✅ **done.** 7,112 → 822 lines. Eleven routers, one commit each, route table checked after every one. `app/web/deps.py` holds what more than one router needs — `get_conn`, `_tr`, the template filters, the active character — and may never import `main`, which is what makes the split possible. |
 
 Compatibility dates are struck through because that question was answered on 2026-08-18
