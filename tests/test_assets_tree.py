@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import re
 
+from app.web.routers import assets as assets_router
+
 MEGATHRON, ANTIMATTER, TRIT = 641, 238, 34   # Megathron, Antimatter Charge L, Tritanium
 OWNER = 900000001
 
@@ -75,7 +77,7 @@ def test_label_keeps_both_custom_name_and_type(app_module):
 
 def test_hull_is_folded_into_its_ship_container(app_module):
     node, ship_cid = _node()
-    app_module._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
+    assets_router._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
 
     hull = node["containers"][ship_cid][("_hull", ship_cid)]
     assert hull["type_id"] == MEGATHRON and hull["quantity"] == 1
@@ -94,7 +96,7 @@ def test_last_hull_leaves_no_empty_hangar_row(app_module):
     node, ship_cid = _node()
     node["hangar"][(MEGATHRON, OWNER, False)] = _hangar_row(
         MEGATHRON, "Megathron", 1, 100_000_000.0)
-    app_module._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
+    assets_router._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
     assert (MEGATHRON, OWNER, False) not in node["hangar"]
 
 
@@ -108,7 +110,7 @@ def test_fold_survives_a_changed_bucket_key(app_module):
     node, ship_cid = _node()
     # Re-key the hangar with an extra element the fold knows nothing about.
     node["hangar"] = {(k[0], k[1], k[2], "extra"): v for k, v in node["hangar"].items()}
-    app_module._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
+    assets_router._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
     assert ("_hull", ship_cid) in node["containers"][ship_cid]
 
 
@@ -118,7 +120,7 @@ def test_fold_never_consumes_a_blueprint_copy(app_module):
         (MEGATHRON, OWNER, True): _hangar_row(
             MEGATHRON, "Megathron Blueprint", 1, None, is_copy=True),
     }
-    app_module._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
+    assets_router._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
     assert ("_hull", ship_cid) not in node["containers"][ship_cid]
     assert node["hangar"][(MEGATHRON, OWNER, True)]["quantity"] == 1
 
@@ -129,7 +131,7 @@ def test_fold_matches_the_right_owner(app_module):
     node["hangar"] = {
         (MEGATHRON, other, False): _hangar_row(MEGATHRON, "Megathron", 1, 1.0, owner=other),
     }
-    app_module._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
+    assets_router._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
     assert ("_hull", ship_cid) not in node["containers"][ship_cid]   # not this pilot's ship
     assert node["hangar"][(MEGATHRON, other, False)]["quantity"] == 1
 
@@ -138,7 +140,7 @@ def test_corp_fold_without_an_owner_map(app_module):
     node, ship_cid = _node()
     for row in node["hangar"].values():
         row.pop("character_id", None)
-    app_module._fold_ship_hulls(node, {ship_cid: MEGATHRON})
+    assets_router._fold_ship_hulls(node, {ship_cid: MEGATHRON})
     hull = node["containers"][ship_cid][("_hull", ship_cid)]
     assert hull["quantity"] == 1
     assert "character_id" not in hull
@@ -148,15 +150,14 @@ def test_corp_fold_without_an_owner_map(app_module):
 
 def _folded():
     node, ship_cid = _node()
-    from app.web import main as m
-    m._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
+    assets_router._fold_ship_hulls(node, {ship_cid: MEGATHRON}, {ship_cid: (OWNER, "Pilot")})
     return node, ship_cid, {ship_cid: "Blue Thunder (Megathron)"}
 
 
 def test_searching_a_ship_type_keeps_its_whole_fit(app_module):
     """The reported bug: this used to leave a hull row and nothing to expand."""
     node, ship_cid, labels = _folded()
-    app_module._prune_by_search(node, labels, "megathron")
+    assets_router._prune_by_search(node, labels, "megathron")
     assert ship_cid in node["containers"]
     items = node["containers"][ship_cid]
     assert ("_hull", ship_cid) in items                     # hull kept
@@ -166,29 +167,29 @@ def test_searching_a_ship_type_keeps_its_whole_fit(app_module):
 
 def test_searching_a_custom_ship_name_keeps_its_whole_fit(app_module):
     node, ship_cid, labels = _folded()
-    app_module._prune_by_search(node, labels, "blue thunder")
+    assets_router._prune_by_search(node, labels, "blue thunder")
     assert node["containers"][ship_cid].keys() == _folded()[0]["containers"][ship_cid].keys()
     assert not node["hangar"]                                # nothing else matches
 
 
 def test_searching_cargo_keeps_the_container_expandable(app_module):
     node, ship_cid, labels = _folded()
-    app_module._prune_by_search(node, labels, "antimatter")
+    assets_router._prune_by_search(node, labels, "antimatter")
     assert list(node["containers"][ship_cid]) == [(ANTIMATTER, OWNER, False)]
     assert not node["hangar"]
 
 
 def test_search_dropping_everything_leaves_nothing(app_module):
     node, ship_cid, labels = _folded()
-    app_module._prune_by_search(node, labels, "zzz-no-such-item")
+    assets_router._prune_by_search(node, labels, "zzz-no-such-item")
     assert node["hangar"] == {} and node["containers"] == {}
 
 
 def test_empty_search_is_a_no_op(app_module):
     node, ship_cid, labels = _folded()
     before_h, before_c = dict(node["hangar"]), dict(node["containers"])
-    app_module._prune_by_search(node, labels, "")
-    app_module._prune_by_search(node, labels, "   ")
+    assets_router._prune_by_search(node, labels, "")
+    assets_router._prune_by_search(node, labels, "   ")
     assert node["hangar"] == before_h and node["containers"] == before_c
 
 
@@ -241,15 +242,15 @@ def assembled_ship(app_module):
     conn.close()
 
     # Keep the test hermetic: the real resolver POSTs to ESI /assets/names/.
-    real = app_module._resolve_container_names
+    real = assets_router._resolve_container_names
 
     async def _fake(char_id, token, container_ids, assets_raw):
         return {cid: (app_module._container_display_name("Blue Thunder", "Megathron", cid),
                       60003760) for cid in container_ids}
 
-    app_module._resolve_container_names = _fake
+    assets_router._resolve_container_names = _fake
     yield CHAR, SHIP_ITEM
-    app_module._resolve_container_names = real
+    assets_router._resolve_container_names = real
     conn = app_module.get_conn()
     conn.execute("DELETE FROM char_assets_cache WHERE character_id=?", (CHAR,))
     if original:
@@ -304,7 +305,7 @@ def test_route_search_with_no_match_shows_nothing(client, assembled_ship):
 
 def test_slot_labels_cover_every_flag_esi_actually_sends(app_module):
     """Flags taken from real character data, not from the docs."""
-    f = app_module._slot_info
+    f = assets_router._slot_info
     assert f("HiSlot0") == ("High power", 1) and f("HiSlot7") == ("High power", 1)
     assert f("MedSlot3") == ("Medium power", 2)
     assert f("LoSlot5") == ("Low power", 3)
@@ -326,14 +327,14 @@ def test_slot_labels_cover_every_flag_esi_actually_sends(app_module):
 
 def test_container_and_hangar_flags_get_no_slot(app_module):
     """No label → no Slot column, which is how a plain container stays plain."""
-    f = app_module._slot_info
+    f = assets_router._slot_info
     for flag in ("Hangar", "AutoFit", "Unlocked", "Locked", "OfficeFolder",
                  "CorpSAG3", "", None):
         assert f(flag) == ("", 0), flag
 
 
 def test_fitting_order_is_the_in_game_order(app_module):
-    f = app_module._slot_info
+    f = assets_router._slot_info
     order = [f(x)[1] for x in ("HiSlot0", "MedSlot0", "LoSlot0", "RigSlot0",
                                "SubSystemSlot0", "DroneBay", "Cargo")]
     assert order == sorted(order), "high → mid → low → rig → subsystem → drones → cargo"
@@ -373,7 +374,7 @@ def test_fitted_and_spare_copies_of_one_module_stay_apart(app_module, client, mo
 
     async def _fake(char_id, token, container_ids, assets_raw):
         return {cid: ("Fit Test (Megathron)", 60003760) for cid in container_ids}
-    monkeypatch.setattr(app_module, "_resolve_container_names", _fake)
+    monkeypatch.setattr(assets_router, "_resolve_container_names", _fake)
     try:
         html = _text(client, f"/assets?view={CHAR}")
         # One row for the two fitted, a separate row for the spare.
@@ -424,7 +425,7 @@ def test_plain_container_renders_no_slot_column(app_module, client, monkeypatch)
 
     async def _fake(char_id, token, container_ids, assets_raw):
         return {cid: ("Minerals (Small Secure Container)", 60003760) for cid in container_ids}
-    monkeypatch.setattr(app_module, "_resolve_container_names", _fake)
+    monkeypatch.setattr(assets_router, "_resolve_container_names", _fake)
     try:
         html = _text(client, f"/assets?view={CHAR}")
         assert "Minerals (Small Secure Container)" in html
@@ -489,15 +490,14 @@ def test_resolver_asks_only_about_ids_the_character_owns(app_module):
             posted.append(_j.loads(kw["content"]))
             return _Resp()
 
-    from app.web import main as m
-    orig = m.esi_client
-    m.esi_client = lambda *a, **k: _Client()
+    orig = assets_router.esi_client
+    assets_router.esi_client = lambda *a, **k: _Client()
     try:
         mine = [{"item_id": 111, "type_id": MEGATHRON, "location_id": 60003760}]
-        got = asyncio.run(m._resolve_container_names(
+        got = asyncio.run(assets_router._resolve_container_names(
             1, "tok", [111, 222, 333], assets=mine))          # 222/333 belong to others
     finally:
-        m.esi_client = orig
+        assets_router.esi_client = orig
 
     assert posted == [[111]], posted            # only our own id went out
     assert got == {111: ("Mine (Megathron)", 60003760)}
@@ -514,14 +514,13 @@ def test_resolver_skips_esi_entirely_when_it_owns_nothing(app_module):
         async def __aexit__(self, *a): return False
         async def post(self, *a, **k): called.append(1); raise AssertionError("should not post")
 
-    from app.web import main as m
-    orig = m.esi_client
-    m.esi_client = lambda *a, **k: _Client()
+    orig = assets_router.esi_client
+    assets_router.esi_client = lambda *a, **k: _Client()
     try:
-        got = asyncio.run(m._resolve_container_names(1, "tok", [111, 222], assets=[]))
+        got = asyncio.run(assets_router._resolve_container_names(1, "tok", [111, 222], assets=[]))
         assert got == {} and not called
     finally:
-        m.esi_client = orig
+        assets_router.esi_client = orig
 
 
 def test_all_characters_view_shows_every_pilots_ship_name(app_module, client, monkeypatch):
@@ -558,7 +557,7 @@ def test_all_characters_view_shows_every_pilots_ship_name(app_module, client, mo
         return {mine: (app_module._container_display_name(names[mine], "Megathron", mine),
                        60003760)}
 
-    monkeypatch.setattr(app_module, "_resolve_container_names", _fake)
+    monkeypatch.setattr(assets_router, "_resolve_container_names", _fake)
     try:
         html = _text(client, "/assets?view=all")
         assert "Alpha Ship (Megathron)" in html
@@ -599,15 +598,14 @@ def test_corp_resolver_asks_only_about_ids_the_corp_owns(app_module):
             posted.append(_j.loads(kw["content"]))
             return _Resp()
 
-    from app.web import main as m
     ours = [{"item_id": 5001, "type_id": MEGATHRON, "location_id": 60003760}]
-    orig = m.esi_client
-    m.esi_client = lambda *a, **k: _Client()
+    orig = assets_router.esi_client
+    assets_router.esi_client = lambda *a, **k: _Client()
     try:                                          # 7777 belongs to someone else
-        got = asyncio.run(m._resolve_corp_container_names(
+        got = asyncio.run(assets_router._resolve_corp_container_names(
             98000001, "tok", [5001, 7777], ours))
     finally:
-        m.esi_client = orig
+        assets_router.esi_client = orig
 
     assert posted == [[5001]], posted             # only our own id went out
     assert got == {5001: ("Ore Bin (Megathron)", 60003760)}
@@ -622,11 +620,10 @@ def test_corp_resolver_skips_esi_entirely_when_it_owns_nothing(app_module):
         async def __aexit__(self, *a): return False
         async def post(self, *a, **k): raise AssertionError("should not post")
 
-    from app.web import main as m
-    orig = m.esi_client
-    m.esi_client = lambda *a, **k: _Client()
+    orig = assets_router.esi_client
+    assets_router.esi_client = lambda *a, **k: _Client()
     try:
-        assert asyncio.run(m._resolve_corp_container_names(
+        assert asyncio.run(assets_router._resolve_corp_container_names(
             98000001, "tok", [5001, 7777], [])) == {}
     finally:
-        m.esi_client = orig
+        assets_router.esi_client = orig

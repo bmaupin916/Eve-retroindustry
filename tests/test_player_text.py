@@ -12,6 +12,8 @@ import json
 import re
 import time
 
+from app.web.routers import assets as assets_router
+
 NAMES = {
     "czech":      "Žluťoučký kůň",
     "cyrillic":   "Корабль Смерти",
@@ -53,7 +55,7 @@ def test_every_character_class_survives_to_the_page(client, app_module, monkeypa
     async def _fake(char_id, token, container_ids, assets_raw):
         return {cid: (app_module._container_display_name(labels.get(cid, ""), "Megathron", cid),
                       60003760) for cid in container_ids}
-    monkeypatch.setattr(app_module, "_resolve_container_names", _fake)
+    monkeypatch.setattr(assets_router, "_resolve_container_names", _fake)
     try:
         page = client.get(f"/assets?view={CHAR}").text
         # Unescape first: Jinja escapes & < > ' correctly, and the browser turns

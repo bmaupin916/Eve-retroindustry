@@ -398,3 +398,33 @@ async def _resolve_party_names(ids: set[int]) -> dict[int, str]:
             except Exception:
                 pass
     return out
+
+
+def _container_display_name(custom_name: str, type_name: str, container_id: int) -> str:
+    """Label for a container or an assembled ship: "custom name (Type)".
+
+    The bracket is a SIGNAL, not decoration: only assembled ships and in-use
+    containers reach this function, because a row here exists solely for
+    something holding other items. Repacked hulls are ordinary stack rows
+    elsewhere showing the plain type name. So bracket = assembled, no bracket =
+    repacked, readable at a glance.
+
+    That is why the type is appended unconditionally — even for a ship named
+    exactly "Hulk", which becomes "Hulk (Hulk)". Every attempt to suppress the
+    "redundant" case has been wrong: a substring test hid the hull from every
+    ship named Hulk1/Hulk2/…, and a whole-word test would do the same to
+    "Hulk 1". No inspection of the name's content, no guessing.
+
+    The one row without a bracket is an item nobody named, where the label is the
+    bare type and there is nothing to disambiguate it from. ESI reports the
+    literal string "None" for such an item, which is treated as no name.
+    """
+    custom = (custom_name or "").strip()
+    if custom.lower() == "none":
+        custom = ""
+    type_name = (type_name or "").strip()
+    if not type_name:
+        return custom or f"Container {container_id}"
+    if not custom:
+        return type_name
+    return f"{custom} ({type_name})"
