@@ -5,13 +5,14 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.31. **436 tests green**, 8 skip unless a
-  Postgres is reachable.
+* Branch `docs/hosted-v2-design`, v0.9.37. **525 tests green**, 8 skip unless a
+  Postgres is reachable — and they have skipped through every commit of this
+  work, so nothing here is verified against Postgres yet.
 * **W6 is done.** `main.py` 7,112 → 822 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
-* Step 4 is **7.5 of 8** items, plus the Postgres groundwork. What is left is
-  the rest of the cache-only conversion, and ten modules of query conversion. The query
-  conversion has started: `projects` is done, ten modules to go.
+* Step 4 is **7.5 of 8** items. What is left is the rest of the cache-only
+  conversion (`/jobs` done, eight pages to go) and the query conversion
+  (`projects` done, ten modules to go).
 
 To bring the Postgres tests back:
 
@@ -154,6 +155,44 @@ that estimate, which is where it was always likely to land.
 
 The conversion and the worker are each a session. The worker is new design
 work, not a move, and the event model has to be decided before it is written.
+
+## Start here next session
+
+In order. The first is ten minutes and is the only one that can invalidate work
+already committed.
+
+1. **Start Postgres and run the suite against it.** Eight tests have skipped
+   through every commit of this work. The schema, both new migrations and the
+   one converted query module are unverified against the backend the whole
+   conversion exists for.
+2. **Sign in.** `characters` and `app_owner` are empty after the test-data
+   cleanup, so the worker has nothing to sync and every page is blank. The
+   cached assets, blueprints, wallet and skills for all three real characters
+   are still there and come back on login.
+3. **Then pick up the conversion** — `industry` is next by size, and it is a
+   router plus two helpers (`margins_helper`, `reactions_helper`).
+
+## How to work on this without wasting an afternoon
+
+Measured from the session that built most of Step 4: **1,166 tool calls, of
+which 65 were full-suite runs at three minutes each — over three hours of
+wall-clock spent re-running tests.** Most of those runs told us nothing.
+
+* **Run the targeted file while working; run the full suite once, before the
+  commit.** Not after every edit. `pytest tests/test_x.py` is two seconds.
+* **Mutation-test against the targeted file too.** A mutation batch is 5–8
+  runs; at three minutes each that is half an hour to learn something a
+  two-second run tells you.
+* **Never build Python source in a bash heredoc.** The tool collapses
+  backslashes, so a string containing `
+` arrives as a real newline and the
+  file no longer parses. This cost four separate repair cycles before the
+  lesson stuck. Use the Write or Edit tool for anything with escapes in it.
+* **Never `git add -A`.** It swept unrelated files into a commit twice, each
+  needing a reset and a re-commit. Name the paths.
+* **When a test is flaky, probe the state — do not re-run the suite.** The
+  database-contamination bug took eight full runs to corner and would have
+  taken one query: "what is in this table before the failing test?"
 
 ## Still unresolved
 

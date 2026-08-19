@@ -1449,7 +1449,7 @@ assertion noticing. Same shape as the `esi_client()` docstring in Step 2 — twi
 so it is worth stating as a rule: **a name that claims something about the world needs an
 assertion about the world.**
 
-**Step 4 — Platform foundations. 🟡 STARTED, v0.9.30 — 2 of 8 items.** Postgres + Alembic
+**Step 4 — Platform foundations. 🟡 STARTED, v0.9.37 — 7 of 8 items, the eighth begun.** Postgres + Alembic
 (decide once, not hedged); async token refresh done properly; background sync worker with
 delay-after-completion + jitter; cache-only routes; ETags on every fetch; 4XX quarantine
 per character; ~~verify the OpenAPI/compatibility-date situation before writing the

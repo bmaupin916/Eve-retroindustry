@@ -137,10 +137,11 @@ git tag v0.x.y && git push origin v0.x.y
 
 | Layer | Library |
 |---|---|
-| Web framework | FastAPI + Uvicorn |
+| Web framework | FastAPI + Uvicorn; routes in `app/web/routers/`, shared plumbing in `app/web/deps.py` |
 | Templates | Jinja2 + Bootstrap 5 (dark) |
 | Database | SQLite via sqlite3; schema declared once as SQLAlchemy Core metadata |
 | Migrations | Alembic (`app/db/schema.py` is the single source of truth) |
+| Background sync | `app/sync/worker.py` keeps caches warm and writes an event log; `EVE_SYNC_WORKER=0` disables it |
 | EVE API | ESI (esi.evetech.net) |
 | HTTP client | httpx (async) |
 | Auth | EVE SSO (OAuth2 PKCE), JWKS-verified tokens, DB-backed sessions |

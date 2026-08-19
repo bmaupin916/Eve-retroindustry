@@ -173,6 +173,15 @@ EVE_OWNER_CHARACTER_ID=
 
 # Writable data directory: database, config, caches.
 EVE_APP_DIR=/opt/eve-retroindustry
+
+# Background sync worker. Default on, and it should stay on here — it is what
+# keeps the caches warm so pages render without waiting on ESI. Set it to 0
+# only to debug, or on a second process that must not also sync.
+EVE_SYNC_WORKER=1
+
+# Postgres, when the query conversion finishes. Unset means SQLite at
+# $EVE_APP_DIR/eve_cache.db, which is what this deployment uses today.
+# EVE_DATABASE_URL=postgresql+psycopg://user:pass@host:5432/eve_retroindustry
 ```
 
 ## 6. systemd unit
