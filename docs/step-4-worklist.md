@@ -308,8 +308,14 @@ work, not a move, and the event model has to be decided before it is written.
 all **done**. What that left is below.
 
 1. **Pick up the conversion.** `industry_helper` next — three of the four
-   remaining `dbapi()` boundaries point at it. `grep -rn "dbapi(" app/` is the
-   live list. `tests/test_app_defaults_on_postgres.py` is the pattern to copy:
+   remaining `dbapi()` boundaries point at it; the fourth is `app/character/*`
+   plus `location_resolver`, which go together. `grep -rn "dbapi(" app/` is the
+   live list and stands at **4**.
+
+   **Nothing is blocked any more.** `industry_helper` was deferred through
+   v0.9.49–0.9.53 only because it has ~26 call sites inside
+   `app/web/routers/plan.py`, which a parallel session was editing. That work
+   merged at v0.9.54 and the worktree is gone, so `plan.py` is free. `tests/test_app_defaults_on_postgres.py` is the pattern to copy:
    drive the module directly, parameterised over both backends, then mutate the
    portability fix and check the *shape* of the failure. Removing the dialect
    guard from that module's schema shim failed **12 Postgres tests and 0 SQLite
