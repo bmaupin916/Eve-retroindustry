@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.55. **739 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.55. **758 tests green, 1 skipped** — and
   the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
@@ -24,9 +24,13 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   view that can act is one you cannot trust about the thing it acts on.
 * **W6 is done.** `main.py` 7,112 → 835 lines; eleven routers under
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
-* Step 4 is **7.5 of 8** items. What is left is the rest of the cache-only
-  conversion (`/jobs` done, eight pages to go) and the query conversion
-  (`projects` done, ten modules to go).
+* Step 4 is **8 of 8 items in outline**, with one of them part-finished. The
+  cache-only conversion is **done** (v0.9.55). What is left is the query
+  conversion: `projects`, `industry` and `app_defaults` are converted, and
+  `industry_helper`, `app/character/*`, `location_resolver`, `media`,
+  `contracts`, `characters`, `planets`, `locations`, `prices`, `assets` and
+  `plan` are not, plus `deps.py`, `main.py` and `app/db/schema.py` at the end.
+  `grep -rn "dbapi(" app/` is the live measure and stands at **4**.
 
 To bring the Postgres tests back:
 
@@ -83,6 +87,44 @@ that put `app_defaults` before the routers: three of the four remaining
 `dbapi()` boundaries point at it (`get_adjusted_prices_cached` twice and the
 station-context block in `margins.py`). The fourth points at `app/character/*`
 plus `location_resolver`, which go together.
+
+**Checked rather than assumed, because the obvious alternative looks better
+than it is.** `location_resolver` sits *underneath* `industry_helper` — three
+functions call into it — and it is the smaller file, so both heuristics appear
+to point there first. They are wrong here: it has **40 call sites across seven
+routers that are not converted**, and converting it first makes every one of
+them open its own `connect()`, in code that gets re-touched the moment those
+routers convert. `industry_helper` first costs three `dbapi()` markers instead
+of forty adaptations.
+
+**Expect the boundary count to stay at 4 through this slice, not fall to 1.**
+Converting `industry_helper` removes three boundaries (`margins.py` twice,
+`reactions_helper.py` once) and creates three, because its own calls to
+`get_station_security_multiplier` then cross into the unconverted
+`location_resolver`. The boundary *moves down a level*; it does not disappear
+until `location_resolver` goes. Worth writing down because
+`grep -rn "dbapi(" app/` is the progress metric everywhere else in this file,
+and this is the one slice where a flat number is the expected result rather
+than a sign that nothing happened.
+
+**Seven of its nineteen functions had no test at all**, found before converting
+anything by wrapping every function in the module and running the whole suite
+(the grep for each name in `tests/` said twelve were uncovered, and undercounts
+in both directions — it misses everything reached through a route). The seven:
+`populate_rig_bonuses`, `get_rig_types`, `save_station_rigs_full`,
+`get_station_rigs_full`, `get_station_me_bonus`, `get_station_me_bonus_pct`,
+`save_station_me_bonus` — the whole station-rig cluster, including **both
+writers**. `tests/test_industry_helper_rigs.py` covers them, written against
+the `sqlite3` version deliberately, so the conversion has assertions to
+*preserve* rather than assertions invented afterwards to fit whatever it did.
+Thirteen mutations, each caught by the test that names it.
+
+**The probe is worth repeating on the next module.** It is twenty lines: wrap
+every function the module defines, count calls, print the zeroes at the end of
+the run. One caveat that decides whether it tells the truth — it has to rebind
+the wrappers into any module that already did `from … import X`, or it silently
+reports "never called" for exactly the callers that matter. That is the same
+from-import trap that has now made four guards in this project guard nothing.
 
 **"Smallest first" was the wrong heuristic and is abandoned.** It ignored
 shared dependencies: `BOMResolver` sat underneath four of the ten and had to be
@@ -295,9 +337,12 @@ Ordered by dependency, not by size.
 ## Honest scope note
 
 The design doc estimates 3–5 sessions for all of Step 4, at **low confidence**,
-and calls it the item most likely to double. Two long sessions have produced 3
-of 8 items plus the Postgres groundwork — roughly on the pessimistic end of
-that estimate, which is where it was always likely to land.
+and calls it the item most likely to double. Three long sessions have produced
+7 of 8 items plus the Postgres groundwork, with only the query conversion still
+open — roughly on the pessimistic end of that estimate, which is where it was
+always likely to land. The conversion is the one item that has consistently
+taken longer than its size suggests, because each module needs test coverage
+written before it can be moved.
 
 The conversion and the worker are each a session. The worker is new design
 work, not a move, and the event model has to be decided before it is written.
@@ -364,17 +409,14 @@ session cost 25 minutes between them. Most of the 71 told us nothing.
 
 * **Step 3 is still not deployed.** All of this plumbing is being built ahead of
   the hosted tool it is plumbing for, which inverts the order §11 argues for.
-* **`app/manufacturing/planner.py` still leaks the same way `plan_result` did.**
-  `build_plan` opens two connections at lines 210–212 — `connect_to_path(db_path)`
-  and a raw `sqlite3.connect(db_path)` — and closes both twenty lines later with
-  no `try`/`finally`. `find_blueprint_for_product()` and `resolver.resolve()`
-  both sit in that span and both raise on bad input, and `build_plan` is called
-  from the same `except Exception` handler, so it leaks **two** handles per
-  failed plan with no symptom. Left alone deliberately in v0.9.54 to keep that
-  commit to one file. The trap when fixing it: `sqlite3.Connection` as a context
-  manager commits or rolls back and does **not** close, so it needs
-  `contextlib.closing(...)`, not a bare `with`. `pi_planner_helper.py` was
-  checked at the same time and is already correct — it has a real `try`/`finally`.
+* ~~**`app/manufacturing/planner.py` leaks two connections.**~~ **Fixed in
+  v0.9.55.** `build_plan` now scopes both with a single `with` — the SQLAlchemy
+  one directly, the raw `sqlite3` one through `contextlib.closing`. Keeping the
+  lesson, because it is the reason the fix is not obvious: a
+  `sqlite3.Connection` used as a context manager commits or rolls back and does
+  **not** close, so a bare `with` looks like the fix and leaks exactly as much
+  as before. The mutation that swaps `closing(...)` back for a bare `with` is
+  what proves the test can tell them apart.
 * **Open question 8** — verify sales tax and broker's fee in game against the
   wallet journal. Only you can do this one.
 * **The characters were not restored.** `eve_cache.db.bak-before-character-reset`
