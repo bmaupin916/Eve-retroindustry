@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.58. **893 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.58. **925 tests green, 1 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -34,7 +34,10 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   `planets`, `locations`, `prices`, `assets` and `plan`, plus `deps.py`,
   `main.py` and `app/db/schema.py` at the end.
   `grep -rn "dbapi(" app/` is the live measure and stands at **1** — a single
-  crossing in `routers/industry.py`, pointing at `app/character/*`.
+  crossing in `routers/industry.py`. It serves **three** unconverted modules,
+  not one: `token_store.list_characters`, `jobs.load_cached_jobs` and
+  `skills.get_cached_skills`. All three have tests as of the commit after
+  v0.9.58; converting them closes the count at zero.
 
 To bring the Postgres tests back:
 
@@ -365,10 +368,16 @@ work, not a move, and the event model has to be decided before it is written.
 ~~Run `projects` against Postgres~~, ~~sign in~~ and ~~the sync-health page~~ are
 all **done**. What that left is below.
 
-1. **Pick up the conversion.** `app/character/*` next — the **one** remaining
-   `dbapi()` boundary points at it, in `routers/industry.py:64`, where
-   `list_characters(raw)` is the only thing still needing the driver handle.
-   `grep -rn "dbapi(" app/` is the live list and it is down to that single line.
+1. **Pick up the conversion.** `token_store`, `character/jobs` and
+   `character/skills` — the **one** remaining `dbapi()` boundary, in
+   `routers/industry.py:64`, feeds all three: `list_characters(raw)`,
+   `jobs_api.load_cached_jobs(raw, cid)` and `get_cached_skills(raw, cid)`. The
+   worklist used to say it pointed at `app/character/*` alone, which was wrong —
+   `list_characters` lives in `app/auth/token_store.py`.
+
+   **The tests are already written.** `tests/test_character_caches.py`, thirty-two
+   of them, mutation-checked sixteen ways, against the `sqlite3` versions so the
+   conversion has assertions to preserve. Do the conversion, not the tests.
 
    `app/character/*` is also what `token_store` sits behind, so read
    `tests/conftest.py` first: this is the area where a test writing to the real
@@ -796,3 +805,64 @@ mentioning it is not.
 **The general form:** when a check produces a false positive for the third time,
 the fix is to make the check understand the distinction, not to add a third
 exemption. And an exemption scoped to a whole file is a hole, not a tuning.
+
+
+## app/character/* is a third untested, and the probe says which third
+
+Run over all eight `app/character` modules plus `app/auth/token_store.py`:
+**35 of 102 functions are never executed by the suite.** Not "lightly covered" —
+never called at all. The dead set is weighted towards writers and fetchers:
+
+* `assets`: `fetch_assets`, `fetch_corp_assets`, `_save_cache`,
+  `_save_corp_cache`, `_load_corp_cache`, `assets_at_location(s)`, both
+  `ensure_*_table`
+* `blueprints`: `fetch_blueprints`, `_save_cache`, `ensure_bp_table`
+* `skills`: `fetch_skills`, `fetch_skill_queue`, `fetch_location`, `_save_cache`,
+  `_load_cache_fresh`, `_parse_blob`, `get_mfg_skill_ids`, `ensure_skills_table`
+* `contracts`: `fetch_public_contracts`, `fetch_public_contract_items`,
+  `fetch_corp_contract_items`, `_fetch_public_page`, `status_label`, `type_label`
+* `wallet`: `fetch_corp_journal`, `fetch_corp_transactions`
+* `jobs`: `save_cached_jobs`, `activity_label`
+* `token_store`: `ensure_characters_table`, `update_corporation_id`,
+  `update_last_sync`, `_migrate_legacy_json`, `_strip_token_fields`
+
+**The probe is not lying about the fetchers, and it is worth understanding why
+before dismissing the number.** `tests/test_sync_worker.py` monkeypatches
+`fetch_assets`, `fetch_blueprints` and friends *onto the worker module*, so the
+worker's orchestration is well tested and the real fetchers never run. That is a
+reasonable way to test a worker and it leaves the fetchers uncovered; both things
+are true at once.
+
+**So this is several slices, not one.** The first — `token_store`,
+`character/jobs`, `character/skills` — is the one the last `dbapi()` boundary
+needs, and its tests are in `tests/test_character_caches.py`. The rest
+(`assets`, `blueprints`, `contracts`, `wallet`, `orders`, `planets`) can follow
+one at a time; none of them holds a boundary open, so there is no pressure to
+bundle them.
+
+**Two things in that first slice are riskier than anything so far:**
+
+* `token_store` owns the `characters` table, which holds refresh tokens — the
+  table a test once wrote to for real. `config_path()` resolves per call from
+  `EVE_APP_DIR`, and that plus the `pytest_collection_finish` guard is what makes
+  the JSON-migration tests safe to write. The tests also save and restore
+  `.eve_config.json`, because it lives in the shared test app dir rather than in
+  `tmp_path` and `get_client_id()` reads it.
+* **`save_cached_jobs` does not commit** — its only caller,
+  `fetch_industry_jobs`, commits for it. Pinned by
+  `test_the_commit_for_a_job_save_lives_in_the_fetcher`, because both halves are
+  easy to get wrong: adding a commit inside the writer moves the transaction
+  boundary, and dropping the caller's loses the write with no symptom.
+
+## Mutation scripts: write bytes, or they rewrite line endings
+
+The mutation harness restores its target with `pathlib.write_text`, which uses
+`os.linesep` — so on Windows it hands back CRLF whatever it read. For a file
+already stored CRLF that is invisible. For `token_store.py` and
+`character/jobs.py`, which were LF on disk, it flipped them, and `git status`
+showed both as modified while `git diff` showed nothing at all, because git
+normalises on the way to the index.
+
+Harmless, but confusing at exactly the wrong moment — it looks like a mutation
+that failed to restore. `git checkout --` on the paths clears it. Better: have
+the harness read and write bytes, or pass `newline=""`.
