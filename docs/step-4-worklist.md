@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.58. **925 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.59. **965 tests green, 1 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -28,16 +28,17 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   `app/web/routers/`, plus `app/web/deps.py` for what they share.
 * Step 4 is **8 of 8 items in outline**, with one of them part-finished. The
   cache-only conversion is **done** (v0.9.55). What is left is the query
-  conversion: `projects`, `industry` and `app_defaults` are converted, and
-  `industry_helper` (v0.9.56) and `location_resolver` (v0.9.58) are converted
-  too. Still to go: `app/character/*`, `media`, `contracts`, `characters`,
-  `planets`, `locations`, `prices`, `assets` and `plan`, plus `deps.py`,
-  `main.py` and `app/db/schema.py` at the end.
-  `grep -rn "dbapi(" app/` is the live measure and stands at **1** — a single
-  crossing in `routers/industry.py`. It serves **three** unconverted modules,
-  not one: `token_store.list_characters`, `jobs.load_cached_jobs` and
-  `skills.get_cached_skills`. All three have tests as of the commit after
-  v0.9.58; converting them closes the count at zero.
+  conversion. Converted so far: `projects`, `industry`, `app_defaults`,
+  `industry_helper` (v0.9.56), `location_resolver` (v0.9.58), and
+  `token_store`, `character/jobs`, `character/skills` (v0.9.59).
+
+  `grep -rn "dbapi(" app/` is the live measure and stands at **0** as of
+  v0.9.59 — there are no boundaries left to cross. What remains is not
+  crossings but modules still holding a raw `get_conn()` handle of their own:
+  the rest of `app/character/*` (`assets`, `blueprints`, `contracts`, `wallet`,
+  `orders`, `planets`), then `media`, `contracts`, `characters`, `planets`,
+  `locations`, `prices`, `assets`, `plan`, and finally `deps.py`, `main.py` and
+  `app/db/schema.py`.
 
 To bring the Postgres tests back:
 
@@ -83,12 +84,18 @@ process, each sees the other's committed writes
 its own, and what is left at the end is deleting `get_conn()` once nothing
 calls it.
 
-Order — `projects`, `industry`, `app_defaults`, `industry_helper` and
-`location_resolver` are **done**; `industry` is the better worked example,
-because it hit the cases `projects` did not. Remaining: **`app/character/*`
-next** — the one remaining `dbapi()` boundary points at it — then `media`,
+Order — `projects`, `industry`, `app_defaults`, `industry_helper`,
+`location_resolver`, `token_store`, `character/jobs` and `character/skills` are
+**done**; `industry` is the better worked example, because it hit the cases
+`projects` did not.
+
+**The `dbapi()` count is zero from v0.9.59**, so the metric that drove the order
+so far has retired. What is left is the rest of `app/character/*` (`assets`,
+`blueprints`, `contracts`, `wallet`, `orders`, `planets`), then `media`,
 `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`, `plan`,
-and finally `deps.py`, `main.py` and `app/db/schema.py` itself.
+and finally `deps.py`, `main.py` and `app/db/schema.py` itself. None of them
+blocks another, so take them one at a time and let the coverage probe pick the
+order — the untested ones are the ones that bite.
 
 ~~**`industry_helper` is next**~~ — **done in v0.9.56**, on the same "convert
 what is underneath" rule that put `app_defaults` before the routers. Three of
@@ -368,16 +375,28 @@ work, not a move, and the event model has to be decided before it is written.
 ~~Run `projects` against Postgres~~, ~~sign in~~ and ~~the sync-health page~~ are
 all **done**. What that left is below.
 
-1. **Pick up the conversion.** `token_store`, `character/jobs` and
-   `character/skills` — the **one** remaining `dbapi()` boundary, in
-   `routers/industry.py:64`, feeds all three: `list_characters(raw)`,
-   `jobs_api.load_cached_jobs(raw, cid)` and `get_cached_skills(raw, cid)`. The
-   worklist used to say it pointed at `app/character/*` alone, which was wrong —
-   `list_characters` lives in `app/auth/token_store.py`.
+1. **Pick up the conversion.** No boundary is forcing the order any more —
+   `grep -rn "dbapi(" app/` is zero from v0.9.59. Take the rest of
+   `app/character/*` one module at a time: `assets`, `blueprints`, `contracts`,
+   `wallet`, `orders`, `planets`.
 
-   **The tests are already written.** `tests/test_character_caches.py`, thirty-two
-   of them, mutation-checked sixteen ways, against the `sqlite3` versions so the
-   conversion has assertions to preserve. Do the conversion, not the tests.
+   **Run the coverage probe first and let it choose.** Of the 35 functions it
+   found untested across this area, most of the remaining ones are in `assets`
+   (nine, including both cache writers and both fetchers) and `contracts` (six).
+   Those are the ones that bite; `orders` and `planets` are already well covered
+   by `tests/test_orders_cache.py`.
+
+   The probe is twenty lines and it has to rebind wrappers into modules that
+   already did `from … import X` — see the note further down. It also has a
+   known blind spot worth remembering: it reports a function as never-called
+   when the tests monkeypatch it onto the *caller's* module, which is exactly
+   why every `fetch_*` shows as dead.
+
+   **Also worth doing, and measured:** four cross-backend test files still use a
+   function-scoped `engine` fixture, which rebuilds a Postgres schema per test.
+   Module scope plus clearing tables is ~18x faster and worth about 38 seconds
+   of the 4m42s suite. See "The cross-backend fixtures are why the suite got
+   slow".
 
    `app/character/*` is also what `token_store` sits behind, so read
    `tests/conftest.py` first: this is the area where a test writing to the real
@@ -835,7 +854,8 @@ are true at once.
 
 **So this is several slices, not one.** The first — `token_store`,
 `character/jobs`, `character/skills` — is the one the last `dbapi()` boundary
-needs, and its tests are in `tests/test_character_caches.py`. The rest
+needs, and its tests are in `tests/test_character_caches_on_postgres.py`
+(named `test_character_caches.py` until the modules converted). The rest
 (`assets`, `blueprints`, `contracts`, `wallet`, `orders`, `planets`) can follow
 one at a time; none of them holds a boundary open, so there is no pressure to
 bundle them.
@@ -866,3 +886,88 @@ normalises on the way to the index.
 Harmless, but confusing at exactly the wrong moment — it looks like a mutation
 that failed to restore. `git checkout --` on the paths clears it. Better: have
 the harness read and write bytes, or pass `newline=""`.
+
+
+## The boundary count reached zero (v0.9.59)
+
+`token_store`, `character/jobs` and `character/skills` converted together,
+because the single remaining `dbapi()` fed all three. The last line of it turned
+out to be a **dead assignment**: `raw = dbapi(conn)` in `jobs_page`, whose three
+uses had already moved. Deleting a variable took the metric to zero, which is a
+fittingly undramatic ending for something that has been tracked since v0.9.43.
+
+**Two portability bugs came out of it**, both hidden the same way — a
+driver-specific `except sqlite3.OperationalError` around a statement that is
+allowed to fail:
+
+* `delete_character` cascades into three per-character cache tables, any of
+  which can be absent on an older database. On SQLite swallowing that was
+  correct. On Postgres a failed statement aborts the whole transaction, so the
+  two remaining DELETEs *and the commit* would fail — leaving the character, and
+  its refresh token, in place. It uses `recover_from_missing_table` now, and
+  re-issues the character DELETE that the rollback discards.
+* `get_mfg_skill_ids` tolerates an SDE that has not been imported yet. Same
+  shape, and the damage would have surfaced in whatever query ran next rather
+  than here.
+
+Both are pinned, and both mutations fail **Postgres only** — which is the whole
+point: the code they replace was correct on the backend anyone was running.
+
+The second of those needed the test strengthening before it could catch
+anything. Asserting only the return value passes with the rollback removed,
+because the return value is right either way; the test has to make *another*
+query on the same connection, which is exactly the failure mode
+`recover_from_missing_table` exists to prevent.
+
+**`deps.py` was the leverage point.** Three connection-owning read helpers
+there — `all_characters()`, `character_row()`, `any_character()` — turned about
+forty router call sites into a mechanical substitution instead of forty hand
+edits. The five active-character helpers now always open their own engine
+connection and their `conn` parameter is accepted and ignored, documented as
+such; removing it is forty more edits in files this change had no reason to
+open, and it goes when those routers convert.
+
+**`_valid_token_async` needed its connection opened inside the worker thread.**
+The comment already said why for sqlite3 — objects belong to the thread that
+made them — and a SQLAlchemy Connection is no more shareable.
+
+## Two tests that were passing for the wrong reason
+
+**`assert all(results)` is vacuously true on an empty list.** In
+`test_token_refresh_is_serialized`, six worker threads each died with a
+`TypeError`, `results` stayed empty, `all([])` returned True, and the test
+reported "expected 1 real refresh, got 0" — which reads as a serialization
+problem rather than as six crashes. It asserts `len(results) == len(threads)`
+first now. Any test that collects results from threads or a gather needs that
+guard; the aggregate assertion cannot distinguish "all fine" from "none ran".
+
+**A fast suite is not the same as a passing suite.** With Docker down, every
+Postgres parameterisation *skips*, so the run gets much faster while testing
+half of what it claims. A 15-second reading that looked like a fixture
+optimisation was really the backend being absent. Look for a block of `s` before
+believing a quick run.
+
+## The cross-backend fixtures are why the suite got slow
+
+Each `engine` fixture is parameterised over both backends, and a function-scoped
+one drops and rebuilds a Postgres schema — all ten migrations — **for every
+test**. The 63 tests added in v0.9.59 nearly doubled that and pushed the suite
+past ten minutes.
+
+Module scope, plus emptying the tables between tests, is the same isolation for
+far less: measured **0.31 s/test** function-scoped against **0.017 s/test**
+module-scoped, an 18x difference. These tests only ever assert on rows they
+insert themselves, so clearing is enough — and clearing *before* each test, not
+after, so a test that dies half-way cannot feed the next one its rows.
+
+Done for `test_character_caches_on_postgres.py` and
+`test_location_resolver_on_postgres.py`. **Still function-scoped, worth about
+38 seconds between them:** `test_app_defaults_on_postgres`,
+`test_industry_helper_on_postgres`, `test_int64_columns_on_postgres`,
+`test_industry_on_postgres`, `test_projects_on_postgres`,
+`test_sde_on_postgres`. Note `test_industry_helper` seeds `sde_types` per module
+and `test_sde_on_postgres` runs the importer, so those two need their cleared-
+table lists chosen with more care than the others.
+
+Full suite as of v0.9.59: **4m42s** with Postgres up, against roughly three
+minutes before any cross-backend file existed.

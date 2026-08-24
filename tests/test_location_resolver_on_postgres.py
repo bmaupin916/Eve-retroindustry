@@ -94,8 +94,8 @@ def _stub_esi(monkeypatch, client: _Client) -> _Client:
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
-@pytest.fixture(params=["sqlite", "postgres"])
-def engine(request, tmp_path):
+@pytest.fixture(scope="module", params=["sqlite", "postgres"])
+def engine(request, tmp_path_factory):
     """An engine per backend, with the app tables present and empty.
 
     A file rather than `:memory:` on SQLite, because the commit assertions open
@@ -105,7 +105,7 @@ def engine(request, tmp_path):
     from app.db.migrate import upgrade_to_head
 
     if request.param == "sqlite":
-        url = f"sqlite:///{tmp_path / 'eve_cache.db'}"
+        url = f"sqlite:///{tmp_path_factory.mktemp("db") / "eve_cache.db"}"
         upgrade_to_head(url)
         eng = create_engine(url)
         yield eng
@@ -130,6 +130,28 @@ def engine(request, tmp_path):
     yield eng
     eng.dispose()
 
+
+
+#: Emptied before every test, so one module-scoped schema can serve them all.
+_CLEARED = ("location_name_cache", "solar_system_cache",)
+
+
+@pytest.fixture(autouse=True)
+def _empty_tables(engine):
+    """Per-test isolation without a per-test schema rebuild.
+
+    The engine is module-scoped now — building it runs every migration, which
+    at function scope cost more than the tests themselves. These tests only ever
+    assert on rows they insert, so emptying the tables gives the same isolation.
+
+    Before, not after: a test that dies half-way must not leave its rows for the
+    next one to read.
+    """
+    with engine.connect() as c:
+        for table in _CLEARED:
+            c.execute(text(f"DELETE FROM {table}"))
+        c.commit()
+    yield
 
 @pytest.fixture
 def conn(engine):

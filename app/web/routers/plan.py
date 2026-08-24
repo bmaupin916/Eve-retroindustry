@@ -40,6 +40,9 @@ from app.market.taxes import selling_costs
 from app.web import app_defaults
 from app.db.location import database_path
 from app.web.deps import (
+    all_characters,
+    any_character,
+    character_row,
     _load_assets_from_cache,
     _valid_token_async,
     _tr,
@@ -163,11 +166,11 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
     plan_char_id: int | None = None
     if char.isdigit():
         plan_char_id = int(char)
-        if not get_character_row(conn, plan_char_id):
+        if not character_row(plan_char_id):
             plan_char_id = None
     if plan_char_id is None:
         plan_char_id = get_active_character_id(request, conn)
-    char_row = get_character_row(conn, plan_char_id) if plan_char_id else None
+    char_row = character_row(plan_char_id) if plan_char_id else None
     token = await _valid_token_async(plan_char_id) if plan_char_id else None
 
     location_ids = []
@@ -179,7 +182,8 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
         # character got a live fetch and a token-less one got the cache — which
         # meant the page was fast exactly when the data was least likely to
         # matter, and slow on every normal load. The worker keeps this warm.
-        char_skills = get_cached_skills(conn, char_row["character_id"])
+        with _connect() as _sc:
+            char_skills = get_cached_skills(_sc, char_row["character_id"])
     product_param = request.query_params.get("product", "")
     if product_param.strip().isdigit():
         row = conn.execute("SELECT name FROM sde_types WHERE type_id=?", (int(product_param),)).fetchone()
@@ -359,7 +363,7 @@ async def plan_result(
     plan_char_id_int: int | None = None
     if plan_char_id.strip().isdigit():
         candidate = int(plan_char_id.strip())
-        if get_character_row(conn, candidate):
+        if character_row(candidate):
             plan_char_id_int = candidate
     if plan_char_id_int is None:
         plan_char_id_int = get_active_character_id(request, conn)
@@ -400,7 +404,7 @@ async def plan_result(
         if plan_char_id_int is None:
             raise ValueError("You are not signed in.")
         token = await _valid_token_async(plan_char_id_int)
-        row = get_character_row(conn, plan_char_id_int)
+        row = character_row(plan_char_id_int)
         if not token or not row:
             raise ValueError("You are not signed in.")
         if not station:
@@ -447,7 +451,8 @@ async def plan_result(
         # from identical inputs.
         blueprints, _bp_at = load_cached_blueprints(conn, char_id)
         all_assets, _as_at = load_cached_assets(conn, char_id)
-        char_skills = get_cached_skills(conn, char_id)
+        with _connect() as _sc:
+            char_skills = get_cached_skills(_sc, char_id)
         if blueprints is None or all_assets is None:
             raise ValueError(
                 "This character has not been synced yet — the background worker "

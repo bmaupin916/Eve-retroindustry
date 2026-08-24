@@ -24,6 +24,9 @@ from app.market.prices import (
     get_station_volumes_any_age,
 )
 from app.web.deps import (
+    all_characters,
+    any_character,
+    character_row,
     _ensure_groups_populated,
     _load_assets_from_cache,
     _load_blueprints_from_cache,
@@ -74,7 +77,7 @@ def _refresh_type_ids(conn) -> list[int]:
     # Aggregate type IDs across ALL characters
     asset_type_ids: set[int] = set()
     bp_type_ids: set[int] = set()
-    for char_id, _name in list_characters(conn):
+    for char_id, _name in all_characters():
         asset_type_ids |= {a["type_id"] for a in _load_assets_from_cache(conn, char_id)}
         bp_type_ids |= {bp["type_id"] for bp in _load_blueprints_from_cache(conn, char_id)}
     mat_ids = {r[0] for r in conn.execute(
@@ -603,7 +606,7 @@ async def prices_page(request: Request):
     # is loaded on demand via /api/prices/search.
     # Aggregate user type-IDs across ALL characters so prices page reflects every alt.
     relevant: set[int] = set()
-    for char_id, _name in list_characters(conn):
+    for char_id, _name in all_characters():
         relevant |= {a["type_id"] for a in _load_assets_from_cache(conn, char_id)}
         relevant |= {bp["type_id"] for bp in _load_blueprints_from_cache(conn, char_id)}
     if relevant:

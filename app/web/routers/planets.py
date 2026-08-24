@@ -20,7 +20,7 @@ from app.sync import worker as sync_worker
 from app.web import pi_planner_helper
 from app.db.location import database_path
 from app.db.schema import ensure_schema as ensure_db_schema
-from app.web.deps import _tr, get_conn
+from app.web.deps import _tr, all_characters, get_conn
 
 router = APIRouter()
 
@@ -61,7 +61,7 @@ async def planets_page(request: Request):
     """Planetary Interaction — colonies per character with extractor expiry
     countdowns (à la RIFT: the point is knowing when to go reset PI)."""
     conn = get_conn()
-    chars = list_characters(conn)
+    chars = all_characters()
     if not chars:
         conn.close()
         return _tr("planets.html", request, {
@@ -307,7 +307,7 @@ async def pi_planner_page(
     if view["result"]:
         conn = get_conn()
         try:
-            chars = list_characters(conn)
+            chars = all_characters()
             results = _load_pi_colonies(conn, chars) if chars else []
             # Shared name cache — the same resolver /planets uses, so a planet
             # either page has seen costs nothing here.
@@ -496,7 +496,7 @@ async def api_pi_alerts(force: int = 0):
     current time anyway. `force=1` refreshes regardless."""
     conn = get_conn()
     try:
-        chars = list_characters(conn)
+        chars = all_characters()
         summary = _pi_alert_summary(conn)
         age = summary.get("age")
         fresh = (age is not None and age < _PI_CACHE_TTL)

@@ -31,6 +31,9 @@ from app.db.schema import ensure_schema as ensure_db_schema
 from app.db.type_resolver import resolve_names_bulk
 from app.esi.client import esi_client
 from app.web.deps import (
+    all_characters,
+    any_character,
+    character_row,
     _container_display_name,
     _valid_token_async,
     _load_assets_from_cache,
@@ -68,7 +71,7 @@ _CORP_DIV_ORDER = list(_CORP_DIV_LABEL.keys())
 @router.get("/assets", response_class=HTMLResponse)
 async def assets_page(request: Request, search: str = "", view: str = ""):
     conn = get_conn()
-    all_chars = list_characters(conn)
+    all_chars = all_characters()
     stations: list[dict] = []
     corp_stations: list[dict] = []
 
@@ -126,7 +129,7 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
             # worker writes. `fetch_corp_assets` used to be the only way to get
             # it — and it asked ESI for it *before* consulting its own cache, so
             # even a cache hit cost a round trip on every page view.
-            corp_id = (get_character_row(conn, cid) or {}).get("corporation_id") or 0
+            corp_id = (character_row(cid) or {}).get("corporation_id") or 0
             corp_list, corp_at = (load_cached_corp_assets(conn, corp_id)
                                   if corp_id else (None, 0.0))
             corp_data[cid] = (corp_id, corp_list or [])
@@ -936,7 +939,7 @@ async def _resolve_container_names(
 @router.get("/blueprints", response_class=HTMLResponse)
 async def blueprints_page(request: Request, search: str = "", view: str = ""):
     conn = get_conn()
-    all_chars = list_characters(conn)
+    all_chars = all_characters()
 
     # Resolve selected character(s) — same toggle pattern as /assets
     selected_chars: list[tuple[int, str]] = []

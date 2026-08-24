@@ -36,12 +36,12 @@ def test_token_refresh_is_serialized(app_module, monkeypatch):
     # that fallback existed; removing it was what surfaced the dependency.
     monkeypatch.setenv("EVE_CLIENT_ID", "test-client-id")
 
-    c = m.get_conn()
-    try:
-        c.execute("UPDATE characters SET token_expires_at=0 WHERE character_id=?", (cid,))
+    from sqlalchemy import text as _text
+    from app.db.conn import connect as _connect
+    with _connect() as c:
+        c.execute(_text("UPDATE characters SET token_expires_at=0"
+                        " WHERE character_id=:cid"), {"cid": cid})
         c.commit()
-    finally:
-        c.close()
 
     calls = {"n": 0}
     used: set[str] = set()
@@ -69,11 +69,10 @@ def test_token_refresh_is_serialized(app_module, monkeypatch):
     rlock = threading.Lock()
 
     def worker():
-        cc = m.get_conn()
-        try:
+        # A connection per thread, opened inside it: neither a sqlite3 handle
+        # nor a SQLAlchemy Connection may cross threads.
+        with _connect() as cc:
             tok = ts.get_valid_token(cc, cid)
-        finally:
-            cc.close()
         with rlock:
             results.append(tok)
 
@@ -84,16 +83,21 @@ def test_token_refresh_is_serialized(app_module, monkeypatch):
         t.join()
 
     try:
+        # Count first. `all([])` is True, so a run where every thread died
+        # reported itself as "0 refreshes" rather than as six crashes — which
+        # is exactly what it did when token_store moved to the query layer.
+        assert len(results) == len(threads), (
+            f"only {len(results)} of {len(threads)} workers returned; "
+            f"the rest raised")
         assert all(results), results          # nobody got None
         assert calls["n"] == 1, f"expected 1 real refresh, got {calls['n']}"
     finally:
-        c = m.get_conn()
-        try:
-            c.execute("UPDATE characters SET access_token='test', refresh_token='test', "
-                      "token_expires_at=? WHERE character_id=?", (2**31, cid))
+        with _connect() as c:
+            c.execute(_text(
+                "UPDATE characters SET access_token='test',"
+                " refresh_token='test', token_expires_at=:exp"
+                " WHERE character_id=:cid"), {"exp": 2**31, "cid": cid})
             c.commit()
-        finally:
-            c.close()
 
 
 def test_blueprint_badges_bpo_bpc_rxn(app_module, client):

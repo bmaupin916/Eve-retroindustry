@@ -26,6 +26,9 @@ from app.web.location_resolver import (
     resolve_station_names_bulk,
 )
 from app.web.deps import (
+    all_characters,
+    any_character,
+    character_row,
     _resolve_party_names,
     _valid_token_async,
     _tr,
@@ -50,7 +53,7 @@ async def wallet_page(request: Request, char: str = "", scope: str = "personal",
     conn = get_conn()
     # Which character drives the page (?char= overrides the active cookie)
     plan_char_id: int | None = None
-    if char.isdigit() and get_character_row(conn, int(char)):
+    if char.isdigit() and character_row(int(char)):
         plan_char_id = int(char)
     if plan_char_id is None:
         plan_char_id = get_active_character_id(request, conn)
@@ -70,7 +73,7 @@ async def wallet_page(request: Request, char: str = "", scope: str = "personal",
         return _tr("wallet.html", request, ctx)
 
     token = await _valid_token_async(plan_char_id)
-    row = get_character_row(conn, plan_char_id)
+    row = character_row(plan_char_id)
     if not token or not row:
         ctx["error"] = "The character token expired — sign in again."
         conn.close()
@@ -347,7 +350,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
             "cached_at": 0.0, "unsynced": [],
             "market_hubs": _market_hubs_list(),
         }
-        chars = list_characters(conn)
+        chars = all_characters()
         if not chars:
             ctx["error"] = "You are not signed in."
             conn.close()
@@ -400,7 +403,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
                     tok = await _valid_token_async(cid)
                     if not tok:
                         continue
-                    crow = get_character_row(conn, cid) or {}
+                    crow = character_row(cid) or {}
                     corp_id = crow.get("corporation_id")
                     if not corp_id:
                         unsynced.append(cn or str(cid))
@@ -425,7 +428,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
         return _tr("orders.html", request, ctx)
 
     plan_char_id: int | None = None
-    if char.isdigit() and get_character_row(conn, int(char)):
+    if char.isdigit() and character_row(int(char)):
         plan_char_id = int(char)
     if plan_char_id is None:
         plan_char_id = get_active_character_id(request, conn)
@@ -442,7 +445,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
         conn.close()
         return _tr("orders.html", request, ctx)
     token = await _valid_token_async(plan_char_id)
-    row = get_character_row(conn, plan_char_id)
+    row = character_row(plan_char_id)
     if not token or not row:
         ctx["error"] = "The character token expired — sign in again."
         conn.close()

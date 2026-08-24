@@ -26,7 +26,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app.esi.client import esi_client
+from app.db.conn import connect as _connect
 from app.auth.token_store import (
+    has_any_character,
     list_characters,
     get_character_row,
     get_valid_token as _get_valid_token_for,
@@ -213,80 +215,97 @@ def get_conn() -> sqlite3.Connection:
 ACTIVE_COOKIE = "active_char"
 
 
-def get_active_character_id(request: Request, conn: sqlite3.Connection | None = None) -> int | None:
-    """Return the active character id from cookie, or fall back to first char in DB."""
+# ---------------------------------------------------------------------------
+# Character reads, on their own engine connection
+# ---------------------------------------------------------------------------
+# `token_store` is on the portable query layer; most routers are not, and hold a
+# raw `get_conn()` handle. These three exist so a router can ask the question
+# without caring — they own a connection for the length of one read and hand
+# back plain data. They replace `list_characters(conn)` and friends at forty-odd
+# call sites, which is why they are worth having rather than a `with` block at
+# each one.
+
+
+def all_characters() -> list[tuple[int, str]]:
+    with _connect() as c:
+        return list_characters(c)
+
+
+def character_row(character_id: int) -> dict | None:
+    with _connect() as c:
+        return get_character_row(c, character_id)
+
+
+def any_character() -> bool:
+    with _connect() as c:
+        return has_any_character(c)
+
+
+
+def get_active_character_id(request: Request, conn=None) -> int | None:
+    """Return the active character id from cookie, or fall back to first char in DB.
+
+    `conn` is accepted and ignored. `token_store` is on the portable query layer
+    now and needs an engine connection, so this opens its own; the callers pass
+    a raw `get_conn()` handle, which is the same database either way. The
+    parameter stays in the signature because removing it is forty edits across
+    files this change has no other reason to touch — it goes when those routers
+    convert.
+    """
     cookie = request.cookies.get(ACTIVE_COOKIE) if request else None
-    own_conn = conn is None
-    if own_conn:
-        conn = get_conn()
-    try:
+    with _connect() as c:
         if cookie:
             try:
                 cid = int(cookie)
             except ValueError:
                 cid = None
-            if cid and get_character_row(conn, cid):
+            if cid and get_character_row(c, cid):
                 return cid
-        chars = list_characters(conn)
+        chars = list_characters(c)
         return chars[0][0] if chars else None
-    finally:
-        if own_conn:
-            conn.close()
 
 
-def get_active_character(request: Request, conn: sqlite3.Connection | None = None) -> tuple[int, str] | None:
-    """Return (char_id, char_name) for the active character, or None."""
-    own_conn = conn is None
-    if own_conn:
-        conn = get_conn()
-    try:
-        cid = get_active_character_id(request, conn)
-        if cid is None:
-            return None
-        row = get_character_row(conn, cid)
-        if row:
-            return (row["character_id"], row["character_name"])
+def get_active_character(request: Request, conn=None) -> tuple[int, str] | None:
+    """Return (char_id, char_name) for the active character, or None.
+
+    `conn` is accepted and ignored — see `get_active_character_id`.
+    """
+    cid = get_active_character_id(request)
+    if cid is None:
         return None
-    finally:
-        if own_conn:
-            conn.close()
+    with _connect() as c:
+        row = get_character_row(c, cid)
+    if row:
+        return (row["character_id"], row["character_name"])
+    return None
 
 
-def get_active_token(request: Request, conn: sqlite3.Connection | None = None) -> str | None:
-    """Return a fresh access token for the active character."""
-    own_conn = conn is None
-    if own_conn:
-        conn = get_conn()
-    try:
-        cid = get_active_character_id(request, conn)
-        if cid is None:
-            return None
-        return _get_valid_token_for(conn, cid)
-    finally:
-        if own_conn:
-            conn.close()
+def get_active_token(request: Request, conn=None) -> str | None:
+    """Return a fresh access token for the active character.
+
+    `conn` is accepted and ignored — see `get_active_character_id`.
+    """
+    cid = get_active_character_id(request)
+    if cid is None:
+        return None
+    with _connect() as c:
+        return _get_valid_token_for(c, cid)
 
 
-def get_token_for(character_id: int, conn: sqlite3.Connection | None = None) -> str | None:
-    """Return a fresh access token for a specific character."""
-    own_conn = conn is None
-    if own_conn:
-        conn = get_conn()
-    try:
-        return _get_valid_token_for(conn, character_id)
-    finally:
-        if own_conn:
-            conn.close()
+def get_token_for(character_id: int, conn=None) -> str | None:
+    """Return a fresh access token for a specific character.
+
+    `conn` is accepted and ignored — see `get_active_character_id`.
+    """
+    with _connect() as c:
+        return _get_valid_token_for(c, character_id)
 
 
 def _tr(name: str, request: Request, context: dict) -> HTMLResponse:
     """Starlette's new API: request as the first argument."""
-    conn = get_conn()
-    try:
-        active = get_active_character(request, conn)
-        all_chars = list_characters(conn)
-    finally:
-        conn.close()
+    active = get_active_character(request)
+    with _connect() as c:
+        all_chars = list_characters(c)
     context.setdefault("character", active)
     context.setdefault("all_characters", all_chars)
     context.setdefault("active_char_id", active[0] if active else None)
@@ -428,14 +447,10 @@ async def _valid_token_async(char_id: int) -> str | None:
     """Fetch (refreshing if expired) a character's access token WITHOUT blocking
     the event loop. get_valid_token() does a synchronous httpx.post on expiry;
     calling it inline on the async loop froze the whole app. Run it in a worker
-    thread with its own SQLite connection (sqlite objects are single-thread)."""
+    thread with its own connection — opened *inside* the thread, because
+    sqlite3 objects belong to the thread that created them and a SQLAlchemy
+    Connection is no more shareable than the DBAPI handle underneath it."""
     def _work() -> str | None:
-        c = get_conn()
-        try:
+        with _connect() as c:
             return _get_valid_token_for(c, char_id)
-        finally:
-            try:
-                c.close()
-            except Exception:
-                pass
     return await asyncio.to_thread(_work)

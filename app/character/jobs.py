@@ -7,10 +7,11 @@ Scope: esi-industry.read_character_jobs.v1
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 
 import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 ESI_BASE = "https://esi.evetech.net/latest"
 
@@ -36,15 +37,16 @@ def activity_label(activity_id: int) -> str:
     return ACTIVITY_LABELS.get(activity_id, f"Activity {activity_id}")
 
 
-def load_cached_jobs(conn: sqlite3.Connection, char_id: int) -> tuple[list[dict] | None, float]:
+def load_cached_jobs(conn: Connection, char_id: int) -> tuple[list[dict] | None, float]:
     """(jobs, cached_at) from the local cache, or (None, 0) if there is none.
 
     Returns None rather than [] for "never fetched", because a page that shows
     "no jobs" when it simply has not looked yet is a page that lies.
     """
     row = conn.execute(
-        "SELECT data_json, cached_at FROM char_jobs_cache WHERE character_id=?",
-        (char_id,),
+        text("SELECT data_json, cached_at FROM char_jobs_cache"
+             " WHERE character_id=:cid"),
+        {"cid": char_id},
     ).fetchone()
     if not row:
         return None, 0.0
@@ -54,18 +56,21 @@ def load_cached_jobs(conn: sqlite3.Connection, char_id: int) -> tuple[list[dict]
         return None, 0.0
 
 
-def save_cached_jobs(conn: sqlite3.Connection, char_id: int, jobs: list[dict]) -> None:
+def save_cached_jobs(conn: Connection, char_id: int, jobs: list[dict]) -> None:
+    # No commit here, deliberately: `fetch_industry_jobs` owns the
+    # transaction boundary and commits after calling this.
     conn.execute(
-        "INSERT INTO char_jobs_cache (character_id, data_json, cached_at)"
-        " VALUES (?,?,?) ON CONFLICT (character_id) DO UPDATE SET"
-        " data_json=excluded.data_json, cached_at=excluded.cached_at",
-        (char_id, json.dumps(jobs), time.time()),
+        text("INSERT INTO char_jobs_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :cached_at)"
+             " ON CONFLICT (character_id) DO UPDATE SET"
+             " data_json=excluded.data_json, cached_at=excluded.cached_at"),
+        {"cid": char_id, "data": json.dumps(jobs), "cached_at": time.time()},
     )
 
 
 async def fetch_industry_jobs(client: httpx.AsyncClient, char_id: int, token: str,
                               include_completed: bool = True,
-                              conn: sqlite3.Connection | None = None,
+                              conn: Connection | None = None,
                               force_refresh: bool = False) -> list[dict] | None:
     """Return a character's industry jobs, or None if the fetch failed (so the
     caller can tell a real "no jobs" apart from a transient ESI error — e.g.

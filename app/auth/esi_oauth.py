@@ -263,16 +263,17 @@ def complete_login(code: str | None, state: str | None) -> tuple[int, str]:
     except (KeyError, ValueError) as exc:
         raise LoginError("EVE's response did not contain the expected tokens.") from exc
 
-    conn = _open_conn()
-    try:
+    # `token_store` is on the portable query layer, so this takes an engine
+    # connection rather than the module's own sqlite3 one. `_open_conn` still
+    # exists for the rest of this module.
+    from app.db.conn import connect as _connect
+    with _connect() as conn:
         ensure_characters_table(conn)
         save_tokens(
             conn,
             data["access_token"], data["refresh_token"],
             data.get("expires_in", 1200), character_id, character_name,
         )
-    finally:
-        conn.close()
 
     print(f"[auth] login OK: {character_name} (ID {character_id})", flush=True)
     return character_id, character_name

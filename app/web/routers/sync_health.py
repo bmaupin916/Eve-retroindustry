@@ -60,7 +60,7 @@ _BAD_KINDS = {"sync.character.failed"}
 
 def _character_rows(conn, now: float, stale_after: float) -> list[dict]:
     """One row per character: when it last synced, and how fresh each cache is."""
-    chars = list_characters(conn.connection.driver_connection)
+    chars = list_characters(conn)
     last_sync = dict(conn.exec_driver_sql(
         "SELECT character_id, last_sync_at FROM characters").fetchall())
 

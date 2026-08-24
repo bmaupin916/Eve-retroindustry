@@ -127,6 +127,9 @@ from app.db.schema import (
 )
 
 from app.web.deps import (
+    all_characters,
+    any_character,
+    character_row,
     ACTIVE_COOKIE,
     STATIC_DIR,
     TEMPLATES_DIR,
@@ -448,7 +451,7 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
     Splitting it this way means a slow or rate-limited ESI can never make the
     dashboard (or the whole app) appear frozen.
     """
-    logged_in = has_any_character(conn)
+    logged_in = any_character()
     price_stats: dict = {}
     char_cards: list[dict] = []
     corp_names: dict[int, str] = {}
@@ -463,9 +466,9 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
             "price_stats": price_stats, "live_pending": False,
         }
 
-    chars = list_characters(conn)
+    chars = all_characters()
     active_char_id = get_active_character_id(request, conn)
-    char_rows: dict[int, dict] = {cid: (get_character_row(conn, cid) or {}) for cid, _ in chars}
+    char_rows: dict[int, dict] = {cid: (character_row(cid) or {}) for cid, _ in chars}
 
     # Access tokens — fetched once per char, OFF the event loop (live only).
     # return_exceptions so one char's refresh error can't blow up the endpoint.

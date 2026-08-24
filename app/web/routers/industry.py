@@ -23,7 +23,7 @@ from app.character import jobs as jobs_api
 from app.character.skills import get_cached_skills
 from app.web import margins_helper, reactions_helper
 from app.db.location import database_path
-from app.db.conn import connect, dbapi
+from app.db.conn import connect
 from app.web.deps import _tr, _valid_token_async
 from app.web.location_resolver import (
     load_location_names_from_db,
@@ -58,11 +58,7 @@ _SLOT_ORDER = (
 @router.get("/jobs", response_class=HTMLResponse)
 async def jobs_page(request: Request):
     conn = connect()
-    # `app/character/*` is not converted yet, so it gets the driver connection
-    # from underneath this one — same connection, same transaction. Every `raw`
-    # here is a boundary that disappears when that module is converted.
-    raw = dbapi(conn)
-    chars = list_characters(raw)
+    chars = list_characters(conn)
     if not chars:
         conn.close()
         return _tr("jobs.html", request, {"groups": [], "error": "You are not signed in.",
@@ -77,7 +73,7 @@ async def jobs_page(request: Request):
     raw_results = []
     oldest: float | None = None
     for cid, _name in chars:
-        jobs, cached_at = jobs_api.load_cached_jobs(raw, cid)
+        jobs, cached_at = jobs_api.load_cached_jobs(conn, cid)
         raw_results.append((cid, jobs))
         if jobs is not None:
             oldest = cached_at if oldest is None else min(oldest, cached_at)
@@ -176,7 +172,7 @@ async def jobs_page(request: Request):
 
         # Slot occupancy by category (how many of how many). Max = base 1 +
         # both skill levels; None if the skills aren't synced yet.
-        skills = get_cached_skills(raw, cid)
+        skills = get_cached_skills(conn, cid)
         used = {"manufacturing": 0, "science": 0, "reactions": 0}
         for j in active:
             cat = _SLOT_CATEGORY.get(j.get("activity_id", 0))

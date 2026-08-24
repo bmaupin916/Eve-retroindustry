@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import threading
 import time
 from urllib.parse import urlparse
@@ -28,6 +27,9 @@ import httpx
 
 from app.version import USER_AGENT
 from app.db.location import app_dir
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+from app.db.conn import NO_SUCH_TABLE, recover_from_missing_table
 from app.db.schema import ensure_schema as ensure_db_schema
 
 def config_path() -> str:
@@ -153,12 +155,20 @@ def save_client_id(client_id: str) -> None:
 # DB schema + migration from legacy .eve_config.json
 # ---------------------------------------------------------------------------
 
-def ensure_characters_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_characters_table(conn: Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees
+    it exists, and only on SQLite.
+
+    The lazy create predates migrations and is SQLite-only by construction:
+    `app/db/schema.py` memoises by asking `PRAGMA database_list`, which is a
+    syntax error on Postgres. There the schema arrives through Alembic.
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
-def _migrate_legacy_json(conn: sqlite3.Connection) -> None:
+def _migrate_legacy_json(conn: Connection) -> None:
     """One-time migration of single-character .eve_config.json to characters table."""
     data = _load_json()
     char_id = data.get("character_id")
@@ -168,25 +178,26 @@ def _migrate_legacy_json(conn: sqlite3.Connection) -> None:
 
     # Migrate only if this char isn't already in DB
     existing = conn.execute(
-        "SELECT 1 FROM characters WHERE character_id=?", (int(char_id),)
+        text("SELECT 1 FROM characters WHERE character_id=:cid"),
+        {"cid": int(char_id)},
     ).fetchone()
     if existing:
         _strip_token_fields(data)
         return
 
     conn.execute(
-        """INSERT INTO characters
+        text("""INSERT INTO characters
            (character_id, character_name, refresh_token, access_token,
             token_expires_at, added_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (
-            int(char_id),
-            data.get("character_name", "Unknown"),
-            refresh,
-            data.get("access_token"),
-            data.get("token_expires_at"),
-            time.time(),
-        ),
+           VALUES (:cid, :name, :refresh, :access, :expires, :added)"""),
+        {
+            "cid": int(char_id),
+            "name": data.get("character_name", "Unknown"),
+            "refresh": refresh,
+            "access": data.get("access_token"),
+            "expires": data.get("token_expires_at"),
+            "added": time.time(),
+        },
     )
     conn.commit()
     _strip_token_fields(data)
@@ -208,24 +219,24 @@ def _strip_token_fields(data: dict) -> None:
 # Character CRUD
 # ---------------------------------------------------------------------------
 
-def list_characters(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+def list_characters(conn: Connection) -> list[tuple[int, str]]:
     rows = conn.execute(
-        "SELECT character_id, character_name FROM characters ORDER BY added_at ASC"
-    ).fetchall()
+        text("SELECT character_id, character_name FROM characters"
+             " ORDER BY added_at ASC")).fetchall()
     return [(int(r[0]), r[1]) for r in rows]
 
 
-def has_any_character(conn: sqlite3.Connection) -> bool:
-    row = conn.execute("SELECT 1 FROM characters LIMIT 1").fetchone()
+def has_any_character(conn: Connection) -> bool:
+    row = conn.execute(text("SELECT 1 FROM characters LIMIT 1")).fetchone()
     return row is not None
 
 
-def get_character_row(conn: sqlite3.Connection, character_id: int) -> dict | None:
+def get_character_row(conn: Connection, character_id: int) -> dict | None:
     row = conn.execute(
-        """SELECT character_id, character_name, refresh_token, access_token,
+        text("""SELECT character_id, character_name, refresh_token, access_token,
                   token_expires_at, corporation_id, last_sync_at, added_at
-           FROM characters WHERE character_id=?""",
-        (int(character_id),),
+           FROM characters WHERE character_id=:cid"""),
+        {"cid": int(character_id)},
     ).fetchone()
     if not row:
         return None
@@ -242,7 +253,7 @@ def get_character_row(conn: sqlite3.Connection, character_id: int) -> dict | Non
 
 
 def save_tokens(
-    conn: sqlite3.Connection,
+    conn: Connection,
     access_token: str,
     refresh_token: str,
     expires_in: int,
@@ -252,52 +263,63 @@ def save_tokens(
     """Upsert character + tokens."""
     expires_at = time.time() + expires_in - 60
     conn.execute(
-        """INSERT INTO characters
+        text("""INSERT INTO characters
            (character_id, character_name, refresh_token, access_token,
             token_expires_at, added_at)
-           VALUES (?, ?, ?, ?, ?, ?)
+           VALUES (:cid, :name, :refresh, :access, :expires, :added)
            ON CONFLICT(character_id) DO UPDATE SET
              character_name   = excluded.character_name,
              refresh_token    = excluded.refresh_token,
              access_token     = excluded.access_token,
-             token_expires_at = excluded.token_expires_at""",
-        (
-            int(character_id), character_name, refresh_token, access_token,
-            expires_at, time.time(),
-        ),
+             token_expires_at = excluded.token_expires_at"""),
+        {
+            "cid": int(character_id), "name": character_name,
+            "refresh": refresh_token, "access": access_token,
+            "expires": expires_at, "added": time.time(),
+        },
     )
     conn.commit()
 
 
-def delete_character(conn: sqlite3.Connection, character_id: int) -> None:
-    conn.execute("DELETE FROM characters WHERE character_id=?", (int(character_id),))
-    # Cascade-clean per-char cache rows
+def delete_character(conn: Connection, character_id: int) -> None:
+    conn.execute(text("DELETE FROM characters WHERE character_id=:cid"),
+                 {"cid": int(character_id)})
+    # Cascade-clean per-char cache rows. A cache table can legitimately be
+    # absent on an older database, and swallowing that is only safe with the
+    # rollback: Postgres aborts the whole transaction on any failed statement
+    # and refuses every later one — including the two remaining DELETEs and the
+    # commit — until it is rolled back. On SQLite the bare `except` worked and
+    # the damage would have appeared here first.
     for tbl, col in (
         ("char_blueprints_cache", "character_id"),
         ("char_assets_cache",     "character_id"),
         ("char_skills_cache",     "character_id"),
     ):
         try:
-            conn.execute(f"DELETE FROM {tbl} WHERE {col}=?", (int(character_id),))
-        except sqlite3.OperationalError:
-            pass
+            conn.execute(text(f"DELETE FROM {tbl} WHERE {col}=:cid"),
+                         {"cid": int(character_id)})
+        except NO_SUCH_TABLE:
+            recover_from_missing_table(conn)
+            conn.execute(text("DELETE FROM characters WHERE character_id=:cid"),
+                         {"cid": int(character_id)})
     conn.commit()
 
 
 def update_corporation_id(
-    conn: sqlite3.Connection, character_id: int, corp_id: int
+    conn: Connection, character_id: int, corp_id: int
 ) -> None:
     conn.execute(
-        "UPDATE characters SET corporation_id=? WHERE character_id=?",
-        (int(corp_id), int(character_id)),
+        text("UPDATE characters SET corporation_id=:corp"
+             " WHERE character_id=:cid"),
+        {"corp": int(corp_id), "cid": int(character_id)},
     )
     conn.commit()
 
 
-def update_last_sync(conn: sqlite3.Connection, character_id: int) -> None:
+def update_last_sync(conn: Connection, character_id: int) -> None:
     conn.execute(
-        "UPDATE characters SET last_sync_at=? WHERE character_id=?",
-        (time.time(), int(character_id)),
+        text("UPDATE characters SET last_sync_at=:now WHERE character_id=:cid"),
+        {"now": time.time(), "cid": int(character_id)},
     )
     conn.commit()
 
@@ -306,7 +328,7 @@ def update_last_sync(conn: sqlite3.Connection, character_id: int) -> None:
 # Token retrieval / refresh
 # ---------------------------------------------------------------------------
 
-def get_valid_token(conn: sqlite3.Connection, character_id: int) -> str | None:
+def get_valid_token(conn: Connection, character_id: int) -> str | None:
     """Return a valid access_token for the given char — auto-refresh on expiry.
 
     Refreshes are serialized per character (see _refresh_locks) so concurrent
@@ -379,14 +401,25 @@ def get_valid_token(conn: sqlite3.Connection, character_id: int) -> str | None:
         for _attempt in range(3):
             try:
                 conn.execute(
-                    """UPDATE characters
-                       SET access_token=?, refresh_token=?, token_expires_at=?
-                       WHERE character_id=?""",
-                    (new_access, new_refresh, new_expires_at, int(character_id)),
+                    text("""UPDATE characters
+                       SET access_token=:access, refresh_token=:refresh,
+                           token_expires_at=:expires
+                       WHERE character_id=:cid"""),
+                    {"access": new_access, "refresh": new_refresh,
+                     "expires": new_expires_at, "cid": int(character_id)},
                 )
                 conn.commit()
                 break
-            except sqlite3.OperationalError as exc:
+            except NO_SUCH_TABLE as exc:
+                # "database is locked" is SQLite's, and it arrives wrapped in
+                # SQLAlchemy's OperationalError now rather than the driver's.
+                # The rollback matters on the other backend: without it a
+                # retry would hit InFailedSqlTransaction instead of the real
+                # error.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 if "locked" in str(exc).lower() and _attempt < 2:
                     time.sleep(0.5)
                     continue

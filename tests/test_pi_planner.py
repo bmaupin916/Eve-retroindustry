@@ -499,7 +499,13 @@ def stub_pi(app_module, monkeypatch):
 
             # The other seeded character has no PI — synced, and empty, which is
             # a different thing from never synced and has to be said so.
-            for cid, _name in app_module.list_characters(conn):
+            # `token_store` is on the portable query layer now, so this asks
+            # through the engine rather than handing it the raw handle the rest
+            # of this fixture uses.
+            from app.db.conn import connect as _connect
+            with _connect() as _tc:
+                _seeded = app_module.list_characters(_tc)
+            for cid, _name in _seeded:
                 if cid != PI_CHAR:
                     planets_api.save_cached_colonies(conn, cid, [], [])
             conn.commit()

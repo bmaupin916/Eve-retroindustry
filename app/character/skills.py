@@ -1,9 +1,11 @@
 """Loading and caching character skills from ESI."""
 from __future__ import annotations
 import json
-import sqlite3
 import time
 import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+from app.db.conn import NO_SUCH_TABLE, recover_from_missing_table
 from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE  = "https://esi.evetech.net/latest"
@@ -78,19 +80,28 @@ async def fetch_ship(client: httpx.AsyncClient, character_id: int, access_token:
     return {}
 
 
-def get_mfg_skill_ids(conn: sqlite3.Connection) -> set[int]:
+def get_mfg_skill_ids(conn: Connection) -> set[int]:
     """Returns the set of type_ids of all skills relevant to manufacturing (science + Industry/AdvIndustry)."""
     try:
-        rows = conn.execute("SELECT skill_type_id FROM sde_skill_time_bonus").fetchall()
+        rows = conn.execute(
+            text("SELECT skill_type_id FROM sde_skill_time_bonus")).fetchall()
         science_ids = {r[0] for r in rows}
-    except sqlite3.OperationalError:
-        science_ids = set()
+    except NO_SUCH_TABLE:
+        # The SDE tables are absent until `import_sde.py` has run, and this is
+        # called while rendering. The rollback is what makes the fallback safe
+        # on Postgres, where a failed statement poisons the transaction for
+        # every later one.
+        science_ids = set(recover_from_missing_table(conn))
     return science_ids | _GENERAL_SKILL_IDS
 
 
-def ensure_skills_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_skills_table(conn: Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees
+    it exists, and only on SQLite — on Postgres the schema comes from Alembic
+    and `PRAGMA database_list` is a syntax error."""
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
 def _parse_blob(raw: str) -> tuple[int, dict[int, int]]:
@@ -107,11 +118,12 @@ def _parse_blob(raw: str) -> tuple[int, dict[int, int]]:
     return 0, {}
 
 
-def _load_cache_fresh(conn: sqlite3.Connection, character_id: int) -> dict[int, int] | None:
+def _load_cache_fresh(conn: Connection, character_id: int) -> dict[int, int] | None:
     """Returns cached skills if the cache is fresh AND in the current schema version."""
     row = conn.execute(
-        "SELECT data_json, cached_at FROM char_skills_cache WHERE character_id=?",
-        (character_id,)
+        text("SELECT data_json, cached_at FROM char_skills_cache"
+             " WHERE character_id=:cid"),
+        {"cid": character_id},
     ).fetchone()
     if not row:
         return None
@@ -123,14 +135,17 @@ def _load_cache_fresh(conn: sqlite3.Connection, character_id: int) -> dict[int, 
     return skills
 
 
-def _save_cache(conn: sqlite3.Connection, character_id: int, skills: dict[int, int]):
+def _save_cache(conn: Connection, character_id: int, skills: dict[int, int]):
     blob = json.dumps({
         "__v": _CACHE_VERSION,
         "skills": {str(k): int(v) for k, v in skills.items()},
     })
     conn.execute(
-        "INSERT INTO char_skills_cache (character_id, data_json, cached_at) VALUES (?,?,?) ON CONFLICT (character_id) DO UPDATE SET data_json=excluded.data_json, cached_at=excluded.cached_at",
-        (character_id, blob, time.time())
+        text("INSERT INTO char_skills_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :cached_at)"
+             " ON CONFLICT (character_id) DO UPDATE SET"
+             " data_json=excluded.data_json, cached_at=excluded.cached_at"),
+        {"cid": character_id, "data": blob, "cached_at": time.time()},
     )
     conn.commit()
 
@@ -139,7 +154,7 @@ async def fetch_skills(
     client: httpx.AsyncClient,
     character_id: int,
     access_token: str,
-    conn: sqlite3.Connection,
+    conn: Connection,
     force_refresh: bool = False,
 ) -> dict[int, int]:
     """Returns {skill_type_id: trained_level} for all of the character's trained skills."""
@@ -166,10 +181,11 @@ async def fetch_skills(
         return get_cached_skills(conn, character_id)
 
 
-def get_cached_skills(conn: sqlite3.Connection, character_id: int) -> dict[int, int]:
+def get_cached_skills(conn: Connection, character_id: int) -> dict[int, int]:
     """Loads skills from the DB without an ESI call. Returns an empty dict if the cache doesn't exist."""
     row = conn.execute(
-        "SELECT data_json FROM char_skills_cache WHERE character_id=?", (character_id,)
+        text("SELECT data_json FROM char_skills_cache WHERE character_id=:cid"),
+        {"cid": character_id},
     ).fetchone()
     if not row:
         return {}

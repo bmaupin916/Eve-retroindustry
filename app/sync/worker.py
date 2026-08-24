@@ -230,11 +230,7 @@ class SyncWorker:
         Split out from `run` so a test can drive one round without a clock.
         """
         with connect() as conn:
-            # token_store speaks sqlite3, not SQLAlchemy — it is one of the ten
-            # modules the query conversion has not reached yet. The driver
-            # connection underneath is the same one, so this stays a single
-            # connection rather than a second opinion about the database.
-            chars = list_characters(conn.connection.driver_connection)
+            chars = list_characters(conn)
         if not chars:
             # Poll rather than sleep the interval. wake() is the fast path when
             # a login happens in this process; this is the backstop for every
@@ -312,7 +308,7 @@ class SyncWorker:
                         client, char_id, token, container_item_ids(assets or []),
                         conn=raw)
 
-                    skills = await fetch_skills(client, char_id, token, raw)
+                    skills = await fetch_skills(client, char_id, token, conn)
                     changed += self._diff(char_id, "skills", skills)
 
                     # /jobs reads this cache and never calls ESI itself, so a
@@ -320,7 +316,7 @@ class SyncWorker:
                     # and a page that says "not synced yet" — hence None rather
                     # than [] when the fetch could not run.
                     jobs = await fetch_industry_jobs(client, char_id, token,
-                                                     conn=raw, force_refresh=True)
+                                                     conn=conn, force_refresh=True)
                     if jobs is not None:
                         changed += self._job_events(char_id, jobs)
 
@@ -370,7 +366,7 @@ class SyncWorker:
                         corp_id, corp_assets = await fetch_corp_assets(
                             client, char_id, token, raw, force_refresh=True)
                         if corp_id:
-                            update_corporation_id(raw, char_id, corp_id)
+                            update_corporation_id(conn, char_id, corp_id)
                             changed += self._diff(
                                 char_id, "corp_assets", corp_assets,
                                 corporation_id=corp_id)
@@ -418,7 +414,7 @@ class SyncWorker:
                         print(f"[sync] corp assets skipped for {char_id}: {exc}",
                               flush=True)
 
-                update_last_sync(raw, char_id)
+                update_last_sync(conn, char_id)
 
                 # The events go in the same transaction as the caches they
                 # describe, so a consumer is never told about a change it

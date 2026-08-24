@@ -17,6 +17,9 @@ from app.character import contracts as contracts_api
 from app.esi.client import esi_client
 from app.web import contracts_helper
 from app.web.deps import (
+    all_characters,
+    any_character,
+    character_row,
     _resolve_party_names,
     _valid_token_async,
     _tr,
@@ -106,7 +109,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
         "cached_at": 0.0, "unsynced": [],
     }
 
-    chars = list_characters(conn)
+    chars = all_characters()
     if not chars:
         ctx["error"] = "You are not signed in."
         conn.close()
@@ -125,7 +128,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
                     tok = await _valid_token_async(cid)
                     if not tok:
                         continue
-                    corp_id = (get_character_row(conn, cid) or {}).get("corporation_id")
+                    corp_id = (character_row(cid) or {}).get("corporation_id")
                     if corp_id and corp_id not in corp_token:
                         corp_token[corp_id] = tok
                 corp_names = await _resolve_party_names(set(corp_token)) if corp_token else {}
@@ -162,12 +165,12 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
             return _tr("contracts.html", request, ctx)
 
         # single character
-        plan_char_id = int(char) if char.isdigit() and get_character_row(conn, int(char)) else None
+        plan_char_id = int(char) if char.isdigit() and character_row(int(char)) else None
         if plan_char_id is None:
             plan_char_id = get_active_character_id(request, conn)
         ctx["contracts_char_id"] = plan_char_id
         token = await _valid_token_async(plan_char_id) if plan_char_id else None
-        row = get_character_row(conn, plan_char_id) if plan_char_id else None
+        row = character_row(plan_char_id) if plan_char_id else None
         if not token or not row:
             ctx["error"] = "The character token expired — sign in again."
             conn.close()
@@ -223,8 +226,8 @@ async def api_contract_items(request: Request, contract_id: int,
             async with esi_client() as client:
                 if corp_id:
                     tok = None
-                    for cid, _ in list_characters(conn):
-                        if (get_character_row(conn, cid) or {}).get("corporation_id") == corp_id:
+                    for cid, _ in all_characters():
+                        if (character_row(cid) or {}).get("corporation_id") == corp_id:
                             tok = await _valid_token_async(cid)
                             if tok:
                                 break
@@ -337,7 +340,7 @@ async def public_contracts_page(request: Request, region: str = "", item: str = 
             loc_names: dict[int, str] = {}
             if loc_ids:
                 tokens = await asyncio.gather(
-                    *[_valid_token_async(cid) for cid, _ in list_characters(conn)])
+                    *[_valid_token_async(cid) for cid, _ in all_characters()])
                 any_tok = next((t for t in tokens if t), None)
                 with _connect() as _lc:
                     try:

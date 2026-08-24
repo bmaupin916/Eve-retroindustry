@@ -42,7 +42,10 @@ from app.manufacturing import invention
 from app.market.prices import TRADE_HUBS
 from app.sync import worker as sync_worker
 from app.web import app_defaults, security
-from app.web.deps import ACTIVE_COOKIE, _tr, _valid_token_async, get_conn
+from app.db.conn import connect as _connect
+from app.web.deps import (ACTIVE_COOKIE, _tr, _valid_token_async,
+                          all_characters, any_character, character_row,
+                          get_conn)
 from app.web.location_resolver import resolve_station_names_bulk
 
 router = APIRouter()
@@ -218,7 +221,7 @@ async def auth_callback(request: Request, code: str | None = None,
     # session merely expired during the round trip to EVE.
     conn = get_conn()
     try:
-        known_before = {cid for cid, _name in list_characters(conn)}
+        known_before = {cid for cid, _name in all_characters()}
     finally:
         conn.close()
 
@@ -253,7 +256,8 @@ async def auth_callback(request: Request, code: str | None = None,
             # login created is removed: one that was already known is a re-auth by
             # someone previously added, and deleting it would lose real data.
             if character_id not in known_before:
-                delete_character(conn, character_id)
+                with _connect() as _tc:
+                    delete_character(_tc, character_id)
                 print(f"[auth] discarded the tokens just stored for uninvited "
                       f"character {character_id}", flush=True)
             return _tr("auth_failed.html", request, {
@@ -278,7 +282,7 @@ async def _bg_initial_sync():
     conn = None
     try:
         conn = get_conn()
-        chars = list_characters(conn)
+        chars = all_characters()
         if not chars:
             return
 
@@ -312,18 +316,21 @@ async def _bg_initial_sync():
                     _sync_state["step"] = "assets"
                     personal = await fetch_assets(client, char_id, token, conn)
                     _sync_state["step"] = "skills"
-                    await fetch_skills(client, char_id, token, conn)
+                    with _connect() as _sc:
+                        await fetch_skills(client, char_id, token, _sc)
                     _sync_state["step"] = "corp assets"
                     try:
                         corp_id, corp = await fetch_corp_assets(client, char_id, token, conn)
                         if corp_id:
-                            update_corporation_id(conn, char_id, corp_id)
+                            with _connect() as _tc:
+                                update_corporation_id(_tc, char_id, corp_id)
                     except Exception as exc:
                         print(f"[sync] corp_assets failed for {char_id}: {exc}", flush=True)
                         corp = []
                     all_loc_ids |= {a.location_id for a in personal}
                     all_loc_ids |= {a.location_id for a in corp}
-                    update_last_sync(conn, char_id)
+                    with _connect() as _tc:
+                        update_last_sync(_tc, char_id)
                 except Exception as exc:
                     print(f"[sync] character {char_id} sync failed: {exc}", flush=True)
                     _sync_state["failed"] += 1
@@ -360,7 +367,7 @@ async def auth_sync(request: Request):
     """
     conn = get_conn()
     try:
-        if not has_any_character(conn):
+        if not any_character():
             return RedirectResponse("/")
     finally:
         conn.close()
@@ -443,7 +450,7 @@ async def api_activate_character(char_id: int):
     from fastapi.responses import JSONResponse
     conn = get_conn()
     try:
-        if not get_character_row(conn, char_id):
+        if not character_row(char_id):
             return JSONResponse({"ok": False, "error": "Unknown character"}, status_code=404)
     finally:
         conn.close()
@@ -458,7 +465,8 @@ async def api_delete_character(request: Request, char_id: int):
     from fastapi.responses import JSONResponse
     conn = get_conn()
     try:
-        delete_character(conn, char_id)
+        with _connect() as _tc:
+            delete_character(_tc, char_id)
     finally:
         conn.close()
     resp = JSONResponse({"ok": True})

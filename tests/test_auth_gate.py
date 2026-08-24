@@ -511,19 +511,18 @@ def test_an_uninvited_character_is_not_left_stored(app_module, monkeypatch, conn
     stranger who merely found the URL was having their ESI refresh token written
     into someone else's database. Custody without consent — §13 R4."""
     from app.auth.token_store import delete_character, get_character_row
+    from app.db.conn import connect as _connect
 
     stranger_id = 900000777
-    delete_character(conn, stranger_id)          # start clean
+    with _connect() as c0:                       # start clean
+        delete_character(c0, stranger_id)
 
     def _stores_then_returns(code, state):
         # Stand in for the real complete_login: it saves, then returns.
-        conn2 = app_module.get_conn()
-        try:
-            from app.auth.token_store import save_tokens
-            save_tokens(conn2, "access-tok", "refresh-tok", 1200,
+        from app.auth.token_store import save_tokens
+        with _connect() as c2:
+            save_tokens(c2, "access-tok", "refresh-tok", 1200,
                         stranger_id, "Passing Stranger")
-        finally:
-            conn2.close()
         return stranger_id, "Passing Stranger"
 
     monkeypatch.setattr(auth_router, "complete_login", _stores_then_returns)
@@ -532,8 +531,9 @@ def test_an_uninvited_character_is_not_left_stored(app_module, monkeypatch, conn
     r = c.get("/callback?code=x&state=y", follow_redirects=False)
     assert r.status_code == 200
     assert "is not the owner" in r.text
-    assert get_character_row(conn, stranger_id) is None, \
-        "the refused character's refresh token is still stored"
+    with _connect() as c3:
+        assert get_character_row(c3, stranger_id) is None, \
+            "the refused character's refresh token is still stored"
 
 
 def test_a_known_character_survives_a_refused_reauth(app_module, monkeypatch, conn):
@@ -541,9 +541,11 @@ def test_a_known_character_survives_a_refused_reauth(app_module, monkeypatch, co
     refuse the session without destroying a character already added — the
     difference between 'uninvited' and 'known' is the whole safety margin."""
     from app.auth.token_store import save_tokens, get_character_row
+    from app.db.conn import connect as _connect
 
-    save_tokens(conn, "access-tok", "refresh-tok", 1200,
-                OTHER_CHARACTER_ID, "Test Pilot Beta")
+    with _connect() as c0:
+        save_tokens(c0, "access-tok", "refresh-tok", 1200,
+                    OTHER_CHARACTER_ID, "Test Pilot Beta")
 
     monkeypatch.setattr(auth_router, "complete_login",
                         lambda code, state: (OTHER_CHARACTER_ID, "Test Pilot Beta"))
@@ -552,8 +554,9 @@ def test_a_known_character_survives_a_refused_reauth(app_module, monkeypatch, co
     r = c.get("/callback?code=x&state=y", follow_redirects=False)
     assert r.status_code == 200
     assert "is not the owner" in r.text
-    assert get_character_row(conn, OTHER_CHARACTER_ID) is not None, \
-        "a previously-added character was deleted by a refused re-auth"
+    with _connect() as c1:
+        assert get_character_row(c1, OTHER_CHARACTER_ID) is not None, \
+            "a previously-added character was deleted by a refused re-auth"
 
 
 # --- Telling the sync worker somebody arrived ---------------------------------
