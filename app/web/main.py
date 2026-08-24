@@ -297,7 +297,11 @@ async def _startup_populate_groups():
 
         _SDE_READY[0] = count > 0
         if _SDE_READY[0]:
-            populate_rig_bonuses(conn)
+            # industry_helper is on the portable query layer now, so it gets an
+            # engine connection rather than this startup's raw handle.
+            from app.db.conn import connect as _connect
+            with _connect() as _ic:
+                populate_rig_bonuses(_ic)
             await _ensure_groups_populated(conn)
         else:
             # Nothing here copies a database into place any more. Static data

@@ -1,8 +1,10 @@
 """Helpers for computing EVE Online manufacturing fees."""
 from __future__ import annotations
-import sqlite3
 import time
 import httpx
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
+from app.db.conn import dbapi
 from app.esi.client import esi_client
 # Authoritative rig group_id → affected product group_ids, generated from EVE Ref
 # reference-data (see scripts/build_rig_affected_groups.py). Replaces the old
@@ -16,13 +18,22 @@ ESI_BASE = "https://esi.evetech.net/latest"
 _SCC = 0.04
 
 
-def ensure_industry_tables(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_industry_tables(conn: Connection) -> None:
+    """Schema shim. The tables live in app/db/schema.py; this only guarantees
+    they exist, and only on SQLite.
+
+    The lazy create predates migrations and is SQLite-only by construction:
+    `app/db/schema.py` memoises by asking `PRAGMA database_list`, which is a
+    syntax error on Postgres. There the schema arrives through Alembic, so this
+    is "nothing to do" rather than "create if missing".
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
 def rig_applies_to_product(
-    conn: sqlite3.Connection,
+    conn: Connection,
     rig_type_id: int,
     product_type_id: int,
 ) -> bool:
@@ -33,10 +44,12 @@ def rig_applies_to_product(
     (safe: a slight underestimate of savings beats a false overestimate).
     """
     rig_group_row = conn.execute(
-        "SELECT group_id FROM sde_types WHERE type_id=?", (rig_type_id,)
+        text("SELECT group_id FROM sde_types WHERE type_id=:type_id"),
+        {"type_id": rig_type_id},
     ).fetchone()
     prod_row = conn.execute(
-        "SELECT group_id FROM sde_types WHERE type_id=?", (product_type_id,)
+        text("SELECT group_id FROM sde_types WHERE type_id=:type_id"),
+        {"type_id": product_type_id},
     ).fetchone()
     if not rig_group_row or not prod_row:
         return False
@@ -104,28 +117,29 @@ STRUCTURE_COST_BONUS: dict[str, float] = {
 }
 
 
-def get_station_cost_bonus(conn: sqlite3.Connection, location_id: int) -> float:
+def get_station_cost_bonus(conn: Connection, location_id: int) -> float:
     """Return SCI cost reduction fraction (e.g. 0.03 for Raitaru, 0.0 for NPC)."""
     ensure_industry_tables(conn)
     row = conn.execute(
-        "SELECT structure_type FROM station_rigs WHERE location_id=?",
-        (location_id,),
+        text("SELECT structure_type FROM station_rigs WHERE location_id=:loc"),
+        {"loc": location_id},
     ).fetchone()
     if not row or not row[0]:
         return 0.0
     return STRUCTURE_COST_BONUS.get(row[0], 0.0)
 
 
-def populate_rig_bonuses(conn: sqlite3.Connection) -> None:
+def populate_rig_bonuses(conn: Connection) -> None:
     """Populate rig_bonuses from local SDE. No-op if already populated."""
-    if conn.execute("SELECT COUNT(*) FROM rig_bonuses").fetchone()[0] > 0:
+    if conn.execute(text("SELECT COUNT(*) FROM rig_bonuses")).fetchone()[0] > 0:
         return
 
     group_ids = list(_RIG_GROUP_MAP.keys())
-    ph = ",".join("?" * len(group_ids))
     rows = conn.execute(
-        f"SELECT type_id, name, group_id FROM sde_types WHERE group_id IN ({ph}) AND published=1",
-        group_ids,
+        text("SELECT type_id, name, group_id FROM sde_types"
+             " WHERE group_id IN :group_ids AND published=1").bindparams(
+                 bindparam("group_ids", expanding=True)),
+        {"group_ids": group_ids},
     ).fetchall()
 
     entries = []
@@ -149,30 +163,42 @@ def populate_rig_bonuses(conn: sqlite3.Connection) -> None:
         me_bonus = me_base if (has_mat or has_both) else 0.0
         te_bonus = te_base if (has_time or has_both) else 0.0
 
-        entries.append((type_id, name, set_size, category, me_bonus, te_bonus))
+        entries.append({"type_id": type_id, "name": name, "set_size": set_size,
+                        "category": category, "me_bonus": me_bonus,
+                        "te_bonus": te_bonus})
 
-    conn.executemany(
-        "INSERT INTO rig_bonuses (type_id, name, set_size, category, me_bonus, te_bonus) VALUES (?,?,?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET name=excluded.name, set_size=excluded.set_size, category=excluded.category, me_bonus=excluded.me_bonus, te_bonus=excluded.te_bonus",
-        entries,
-    )
+    # Guarded because an empty list is not a no-op here the way it was for
+    # `executemany`: SQLAlchemy has no rows to infer the statement's parameter
+    # shape from and raises instead of doing nothing.
+    if entries:
+        conn.execute(
+            text("INSERT INTO rig_bonuses"
+                 " (type_id, name, set_size, category, me_bonus, te_bonus)"
+                 " VALUES (:type_id, :name, :set_size, :category, :me_bonus, :te_bonus)"
+                 " ON CONFLICT (type_id) DO UPDATE SET name=excluded.name,"
+                 " set_size=excluded.set_size, category=excluded.category,"
+                 " me_bonus=excluded.me_bonus, te_bonus=excluded.te_bonus"),
+            entries,
+        )
     conn.commit()
 
 
-def get_rig_types(conn: sqlite3.Connection, structure_type: str) -> list[dict]:
+def get_rig_types(conn: Connection, structure_type: str) -> list[dict]:
     """Return available rigs for the given structure type (raitaru/azbel/etc)."""
     mapping = STRUCTURE_TYPE_MAP.get(structure_type)
     if not mapping:
         return []
     set_size, category = mapping
     rows = conn.execute(
-        "SELECT type_id, name, me_bonus, te_bonus FROM rig_bonuses WHERE set_size=? AND category=? ORDER BY name",
-        (set_size, category),
+        text("SELECT type_id, name, me_bonus, te_bonus FROM rig_bonuses"
+             " WHERE set_size=:set_size AND category=:category ORDER BY name"),
+        {"set_size": set_size, "category": category},
     ).fetchall()
     return [{"type_id": r[0], "name": r[1], "me_bonus": r[2], "te_bonus": r[3]} for r in rows]
 
 
 def save_station_rigs_full(
-    conn: sqlite3.Connection,
+    conn: Connection,
     location_id: int,
     structure_type: str | None,
     rig1_type_id: int | None,
@@ -183,31 +209,40 @@ def save_station_rigs_full(
     rig_ids = [r for r in [rig1_type_id, rig2_type_id, rig3_type_id] if r]
     me_bonus = STRUCTURE_ME_BONUS.get(structure_type or "", 0.0)
     if rig_ids:
-        # Query each unique rig type once, then sum counting duplicates
+        # Look each distinct rig up once, then sum over the slots. Nobody fits
+        # the same rig twice, so the two are the same total in practice; the
+        # distinct lookup is just one query instead of three.
         unique_ids = list(set(rig_ids))
-        ph = ",".join("?" * len(unique_ids))
         bonus_map = {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, me_bonus FROM rig_bonuses WHERE type_id IN ({ph})", unique_ids
+            text("SELECT type_id, me_bonus FROM rig_bonuses"
+                 " WHERE type_id IN :ids").bindparams(
+                     bindparam("ids", expanding=True)),
+            {"ids": unique_ids},
         ).fetchall()}
         me_bonus += sum(bonus_map.get(rid, 0.0) for rid in rig_ids)
 
     conn.execute(
-        """INSERT INTO station_rigs
+        text("""INSERT INTO station_rigs
            (location_id, me_bonus_pct, updated_at, structure_type, rig1_type_id, rig2_type_id, rig3_type_id)
-           VALUES (?,?,?,?,?,?,?) ON CONFLICT (location_id) DO UPDATE SET me_bonus_pct=excluded.me_bonus_pct, updated_at=excluded.updated_at, structure_type=excluded.structure_type, rig1_type_id=excluded.rig1_type_id, rig2_type_id=excluded.rig2_type_id, rig3_type_id=excluded.rig3_type_id""",
-        (location_id, me_bonus, int(time.time()), structure_type or None,
-         rig1_type_id or None, rig2_type_id or None, rig3_type_id or None),
+           VALUES (:loc, :me_bonus, :updated_at, :structure_type, :rig1, :rig2, :rig3)
+           ON CONFLICT (location_id) DO UPDATE SET me_bonus_pct=excluded.me_bonus_pct,
+           updated_at=excluded.updated_at, structure_type=excluded.structure_type,
+           rig1_type_id=excluded.rig1_type_id, rig2_type_id=excluded.rig2_type_id,
+           rig3_type_id=excluded.rig3_type_id"""),
+        {"loc": location_id, "me_bonus": me_bonus, "updated_at": int(time.time()),
+         "structure_type": structure_type or None, "rig1": rig1_type_id or None,
+         "rig2": rig2_type_id or None, "rig3": rig3_type_id or None},
     )
     conn.commit()
     return me_bonus
 
 
-def get_station_rigs_full(conn: sqlite3.Connection, location_id: int) -> dict:
+def get_station_rigs_full(conn: Connection, location_id: int) -> dict:
     """Return rig configuration for a station."""
     row = conn.execute(
-        "SELECT me_bonus_pct, structure_type, rig1_type_id, rig2_type_id, rig3_type_id"
-        " FROM station_rigs WHERE location_id=?",
-        (location_id,),
+        text("SELECT me_bonus_pct, structure_type, rig1_type_id, rig2_type_id,"
+             " rig3_type_id FROM station_rigs WHERE location_id=:loc"),
+        {"loc": location_id},
     ).fetchone()
     if not row:
         return {"me_bonus_pct": 0.0, "structure_type": None, "rigs": [None, None, None]}
@@ -218,7 +253,7 @@ def get_station_rigs_full(conn: sqlite3.Connection, location_id: int) -> dict:
     }
 
 
-def get_station_te_multiplier(conn: sqlite3.Connection, location_id: int) -> float:
+def get_station_te_multiplier(conn: Connection, location_id: int) -> float:
     """[DEPRECATED for calculation] Return the station's "global" TE multiplier — applies
     all rigs regardless of product category. Used only for the summary
     display % in the header (where we don't have a specific product anyway). For per-job
@@ -228,9 +263,9 @@ def get_station_te_multiplier(conn: sqlite3.Connection, location_id: int) -> flo
 
     ensure_industry_tables(conn)
     row = conn.execute(
-        "SELECT structure_type, rig1_type_id, rig2_type_id, rig3_type_id"
-        " FROM station_rigs WHERE location_id=?",
-        (location_id,),
+        text("SELECT structure_type, rig1_type_id, rig2_type_id, rig3_type_id"
+             " FROM station_rigs WHERE location_id=:loc"),
+        {"loc": location_id},
     ).fetchone()
     if not row:
         return 1.0
@@ -241,14 +276,17 @@ def get_station_te_multiplier(conn: sqlite3.Connection, location_id: int) -> flo
 
     rig_ids = [r for r in [row[1], row[2], row[3]] if r]
     if rig_ids:
+        # location_resolver is not converted yet, so it gets the driver
+        # connection. This marker disappears when it moves.
         sec_mult = get_station_security_multiplier(
-            conn, location_id, structure_type in _RXN_STRUCTURE_TYPES
+            dbapi(conn), location_id, structure_type in _RXN_STRUCTURE_TYPES
         )
         unique_ids = list(set(rig_ids))
-        ph = ",".join("?" * len(unique_ids))
         rig_te_map = {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, te_bonus FROM rig_bonuses WHERE type_id IN ({ph})",
-            unique_ids,
+            text("SELECT type_id, te_bonus FROM rig_bonuses"
+                 " WHERE type_id IN :ids").bindparams(
+                     bindparam("ids", expanding=True)),
+            {"ids": unique_ids},
         ).fetchall()}
         for rid in rig_ids:
             te_b = rig_te_map.get(rid, 0.0) * sec_mult / 100
@@ -257,7 +295,7 @@ def get_station_te_multiplier(conn: sqlite3.Connection, location_id: int) -> flo
     return max(0.01, multiplier)  # never negative
 
 
-def get_product_te_multiplier(conn: sqlite3.Connection, facility, product_type_id: int) -> float:
+def get_product_te_multiplier(conn: Connection, facility, product_type_id: int) -> float:
     """Per-product TE multiplier — applies only rigs relevant to the product's
     category (an Equipment TE rig does not speed up ship construction, etc.).
 
@@ -272,7 +310,7 @@ def get_product_te_multiplier(conn: sqlite3.Connection, facility, product_type_i
     return max(0.01, multiplier)
 
 
-def get_station_facility(conn: sqlite3.Connection, location_id: int):
+def get_station_facility(conn: Connection, location_id: int):
     """Return the StationFacility for the given location_id — structure role bonus,
     rig list (with ME/TE bonuses), and security multiplier.
     For NPC stations / unknown structures it returns an empty facility (1.0 multiplier).
@@ -282,9 +320,9 @@ def get_station_facility(conn: sqlite3.Connection, location_id: int):
 
     ensure_industry_tables(conn)
     row = conn.execute(
-        "SELECT structure_type, rig1_type_id, rig2_type_id, rig3_type_id"
-        " FROM station_rigs WHERE location_id=?",
-        (location_id,),
+        text("SELECT structure_type, rig1_type_id, rig2_type_id, rig3_type_id"
+             " FROM station_rigs WHERE location_id=:loc"),
+        {"loc": location_id},
     ).fetchone()
     if not row:
         return StationFacility()
@@ -296,17 +334,19 @@ def get_station_facility(conn: sqlite3.Connection, location_id: int):
     rigs: list[tuple[int, float, float]] = []
     if rig_ids:
         unique_ids = list(set(rig_ids))
-        ph = ",".join("?" * len(unique_ids))
         rig_map = {r[0]: (r[1], r[2]) for r in conn.execute(
-            f"SELECT type_id, me_bonus, te_bonus FROM rig_bonuses WHERE type_id IN ({ph})",
-            unique_ids,
+            text("SELECT type_id, me_bonus, te_bonus FROM rig_bonuses"
+                 " WHERE type_id IN :ids").bindparams(
+                     bindparam("ids", expanding=True)),
+            {"ids": unique_ids},
         ).fetchall()}
         for rid in rig_ids:
             me_b, te_b = rig_map.get(rid, (0.0, 0.0))
             rigs.append((rid, me_b, te_b))
 
+    # location_resolver is not converted yet, so it gets the driver connection.
     sec_mult = get_station_security_multiplier(
-        conn, location_id, structure_type in _RXN_STRUCTURE_TYPES
+        dbapi(conn), location_id, structure_type in _RXN_STRUCTURE_TYPES
     )
     return StationFacility(
         structure_pct=structure_pct,
@@ -316,7 +356,7 @@ def get_station_facility(conn: sqlite3.Connection, location_id: int):
     )
 
 
-def get_station_me_multiplier(conn: sqlite3.Connection, location_id: int) -> float:
+def get_station_me_multiplier(conn: Connection, location_id: int) -> float:
     """Return the station's combined ME multiplier (e.g. 0.87 = 13 % savings).
 
     Bonuses stack multiplicatively (per Fenris Creations):
@@ -328,9 +368,9 @@ def get_station_me_multiplier(conn: sqlite3.Connection, location_id: int) -> flo
 
     ensure_industry_tables(conn)
     row = conn.execute(
-        "SELECT structure_type, rig1_type_id, rig2_type_id, rig3_type_id"
-        " FROM station_rigs WHERE location_id=?",
-        (location_id,),
+        text("SELECT structure_type, rig1_type_id, rig2_type_id, rig3_type_id"
+             " FROM station_rigs WHERE location_id=:loc"),
+        {"loc": location_id},
     ).fetchone()
     if not row:
         return 1.0
@@ -341,14 +381,17 @@ def get_station_me_multiplier(conn: sqlite3.Connection, location_id: int) -> flo
 
     rig_ids = [r for r in [row[1], row[2], row[3]] if r]
     if rig_ids:
+        # location_resolver is not converted yet, so it gets the driver
+        # connection. This marker disappears when it moves.
         sec_mult = get_station_security_multiplier(
-            conn, location_id, structure_type in _RXN_STRUCTURE_TYPES
+            dbapi(conn), location_id, structure_type in _RXN_STRUCTURE_TYPES
         )
         unique_ids = list(set(rig_ids))
-        ph = ",".join("?" * len(unique_ids))
         rig_me_map = {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, me_bonus FROM rig_bonuses WHERE type_id IN ({ph})",
-            unique_ids,
+            text("SELECT type_id, me_bonus FROM rig_bonuses"
+                 " WHERE type_id IN :ids").bindparams(
+                     bindparam("ids", expanding=True)),
+            {"ids": unique_ids},
         ).fetchall()}
         for rid in rig_ids:
             me_b = rig_me_map.get(rid, 0.0) * sec_mult / 100
@@ -357,7 +400,7 @@ def get_station_me_multiplier(conn: sqlite3.Connection, location_id: int) -> flo
     return max(0.01, multiplier)
 
 
-def get_station_me_bonus_pct(conn: sqlite3.Connection, location_id: int) -> float:
+def get_station_me_bonus_pct(conn: Connection, location_id: int) -> float:
     """Effective ME savings as a percentage for the UI: (1 - multiplier) × 100.
 
     I.e. the multiplicatively combined savings, not the arithmetic sum of bonuses.
@@ -365,42 +408,49 @@ def get_station_me_bonus_pct(conn: sqlite3.Connection, location_id: int) -> floa
     return round((1.0 - get_station_me_multiplier(conn, location_id)) * 100, 4)
 
 
-def get_station_me_bonus(conn: sqlite3.Connection, location_id: int) -> float:
+def get_station_me_bonus(conn: Connection, location_id: int) -> float:
     """Return the stored ME bonus (%) for the given station/structure, or 0.0."""
     ensure_industry_tables(conn)
     row = conn.execute(
-        "SELECT me_bonus_pct FROM station_rigs WHERE location_id=?", (location_id,)
+        text("SELECT me_bonus_pct FROM station_rigs WHERE location_id=:loc"),
+        {"loc": location_id},
     ).fetchone()
     return float(row[0]) if row else 0.0
 
 
-def save_station_me_bonus(conn: sqlite3.Connection, location_id: int, me_bonus_pct: float):
+def save_station_me_bonus(conn: Connection, location_id: int, me_bonus_pct: float):
     ensure_industry_tables(conn)
     conn.execute(
-        "INSERT INTO station_rigs (location_id, me_bonus_pct, updated_at) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET me_bonus_pct=excluded.me_bonus_pct, updated_at=excluded.updated_at",
-        (location_id, max(0.0, min(25.0, me_bonus_pct)), int(time.time()))
+        text("INSERT INTO station_rigs (location_id, me_bonus_pct, updated_at)"
+             " VALUES (:loc, :me_bonus_pct, :updated_at)"
+             " ON CONFLICT (location_id) DO UPDATE SET"
+             " me_bonus_pct=excluded.me_bonus_pct, updated_at=excluded.updated_at"),
+        {"loc": location_id, "me_bonus_pct": max(0.0, min(25.0, me_bonus_pct)),
+         "updated_at": int(time.time())},
     )
     conn.commit()
 
 
-def _adj_is_fresh(conn: sqlite3.Connection) -> bool:
-    row = conn.execute("SELECT MIN(cached_at) FROM adjusted_price_cache").fetchone()
+def _adj_is_fresh(conn: Connection) -> bool:
+    row = conn.execute(
+        text("SELECT MIN(cached_at) FROM adjusted_price_cache")).fetchone()
     if not row or row[0] is None:
         return False
     return (time.time() - row[0]) < 86400  # 24 h
 
 
-def _sci_is_fresh(conn: sqlite3.Connection, solar_system_id: int, activity: str) -> bool:
+def _sci_is_fresh(conn: Connection, solar_system_id: int, activity: str) -> bool:
     row = conn.execute(
-        "SELECT cached_at FROM sci_cache WHERE solar_system_id=? AND activity=?",
-        (solar_system_id, activity),
+        text("SELECT cached_at FROM sci_cache"
+             " WHERE solar_system_id=:sys AND activity=:activity"),
+        {"sys": solar_system_id, "activity": activity},
     ).fetchone()
     if not row:
         return False
     return (time.time() - row[0]) < 3600  # 1 h
 
 
-def get_adjusted_prices_cached(conn: sqlite3.Connection) -> dict[int, float]:
+def get_adjusted_prices_cached(conn: Connection) -> dict[int, float]:
     """Cache-only sibling of `get_adjusted_prices` — never fetches.
 
     The margin tracker prices a whole watchlist on every page load; going to
@@ -409,15 +459,16 @@ def get_adjusted_prices_cached(conn: sqlite3.Connection) -> dict[int, float]:
     caller decide what to say about it.
     """
     ensure_industry_tables(conn)
-    return {r[0]: r[1] for r in
-            conn.execute("SELECT type_id, adjusted FROM adjusted_price_cache").fetchall()}
+    return {r[0]: r[1] for r in conn.execute(
+        text("SELECT type_id, adjusted FROM adjusted_price_cache")).fetchall()}
 
 
-async def get_adjusted_prices(conn: sqlite3.Connection) -> dict[int, float]:
+async def get_adjusted_prices(conn: Connection) -> dict[int, float]:
     """Return {type_id: adjusted_price} from cache or ESI (GET /markets/prices/)."""
     ensure_industry_tables(conn)
     if _adj_is_fresh(conn):
-        rows = conn.execute("SELECT type_id, adjusted FROM adjusted_price_cache").fetchall()
+        rows = conn.execute(
+            text("SELECT type_id, adjusted FROM adjusted_price_cache")).fetchall()
         return {r[0]: r[1] for r in rows}
     try:
         async with esi_client() as client:
@@ -429,25 +480,32 @@ async def get_adjusted_prices(conn: sqlite3.Connection) -> dict[int, float]:
         if r.status_code == 200:
             now = int(time.time())
             entries = [
-                (item["type_id"], item["adjusted_price"], now)
+                {"type_id": item["type_id"], "adjusted": item["adjusted_price"],
+                 "cached_at": now}
                 for item in r.json()
                 if item.get("adjusted_price") is not None
             ]
-            conn.executemany(
-                "INSERT INTO adjusted_price_cache (type_id, adjusted, cached_at) VALUES (?,?,?) ON CONFLICT (type_id) DO UPDATE SET adjusted=excluded.adjusted, cached_at=excluded.cached_at",
-                entries,
-            )
+            if entries:
+                conn.execute(
+                    text("INSERT INTO adjusted_price_cache"
+                         " (type_id, adjusted, cached_at)"
+                         " VALUES (:type_id, :adjusted, :cached_at)"
+                         " ON CONFLICT (type_id) DO UPDATE SET"
+                         " adjusted=excluded.adjusted, cached_at=excluded.cached_at"),
+                    entries,
+                )
             conn.commit()
-            return {e[0]: e[1] for e in entries}
+            return {e["type_id"]: e["adjusted"] for e in entries}
     except Exception:
         pass
     # Return stale cache if ESI fails
-    rows = conn.execute("SELECT type_id, adjusted FROM adjusted_price_cache").fetchall()
+    rows = conn.execute(
+        text("SELECT type_id, adjusted FROM adjusted_price_cache")).fetchall()
     return {r[0]: r[1] for r in rows}
 
 
 async def get_sci_for_system(
-    conn: sqlite3.Connection,
+    conn: Connection,
     solar_system_id: int,
     activity: str,
 ) -> float:
@@ -459,8 +517,9 @@ async def get_sci_for_system(
     ensure_industry_tables(conn)
     if _sci_is_fresh(conn, solar_system_id, activity):
         row = conn.execute(
-            "SELECT cost_index FROM sci_cache WHERE solar_system_id=? AND activity=?",
-            (solar_system_id, activity),
+            text("SELECT cost_index FROM sci_cache"
+                 " WHERE solar_system_id=:sys AND activity=:activity"),
+            {"sys": solar_system_id, "activity": activity},
         ).fetchone()
         if row:
             return row[0]
@@ -474,21 +533,28 @@ async def get_sci_for_system(
         if r.status_code == 200:
             now = int(time.time())
             entries = [
-                (sys["solar_system_id"], idx["activity"], idx["cost_index"], now)
+                {"sys": sys["solar_system_id"], "activity": idx["activity"],
+                 "cost_index": idx["cost_index"], "cached_at": now}
                 for sys in r.json()
                 for idx in sys.get("cost_indices", [])
             ]
-            conn.executemany(
-                "INSERT INTO sci_cache"
-                " (solar_system_id, activity, cost_index, cached_at) VALUES (?,?,?,?) ON CONFLICT (solar_system_id, activity) DO UPDATE SET cost_index=excluded.cost_index, cached_at=excluded.cached_at",
-                entries,
-            )
+            if entries:
+                conn.execute(
+                    text("INSERT INTO sci_cache"
+                         " (solar_system_id, activity, cost_index, cached_at)"
+                         " VALUES (:sys, :activity, :cost_index, :cached_at)"
+                         " ON CONFLICT (solar_system_id, activity) DO UPDATE SET"
+                         " cost_index=excluded.cost_index,"
+                         " cached_at=excluded.cached_at"),
+                    entries,
+                )
             conn.commit()
     except Exception:
         pass
     row = conn.execute(
-        "SELECT cost_index FROM sci_cache WHERE solar_system_id=? AND activity=?",
-        (solar_system_id, activity),
+        text("SELECT cost_index FROM sci_cache"
+             " WHERE solar_system_id=:sys AND activity=:activity"),
+        {"sys": solar_system_id, "activity": activity},
     ).fetchone()
     return row[0] if row else 0.0
 

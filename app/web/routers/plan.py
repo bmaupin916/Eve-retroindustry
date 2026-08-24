@@ -46,6 +46,7 @@ from app.web.deps import (
     get_active_character_id,
     get_conn,
 )
+from app.db.conn import connect as _connect
 from app.web.industry_helper import (
     _SCC,
     get_adjusted_prices,
@@ -191,8 +192,10 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
     # connection from the engine. Deliberately `connect()` and not the
     # `connect_to_path(database_path())` used further down for the resolver:
     # that one names the SQLite file, and the defaults must come from whatever
-    # database the app is actually configured to read.
-    from app.db.conn import connect as _connect
+    # database the app is actually configured to read. `_connect` is imported at
+    # module level; a local `from ... import connect as _connect` here would
+    # make the name local to the whole function and leave every earlier use
+    # unbound.
     with _connect() as _dc:
         _defaults = app_defaults.get_defaults(_dc)
     if not prefill_station and _defaults.get("build_station_id"):
@@ -476,11 +479,12 @@ async def plan_result(
         # Station ME multiplier — per-product (a rig applies only to products
         # matching its category: Ship rig to ships, Equipment rig to modules, etc.).
         eff_rxn_station_for_me = reaction_station if reaction_station else station
-        mfg_facility = get_station_facility(conn, station)
-        rxn_facility = get_station_facility(conn, eff_rxn_station_for_me)
-        # Aggregated savings for the ROOT product (for display)
-        mfg_me_mult = get_station_me_multiplier(conn, station)
-        rxn_me_mult = get_station_me_multiplier(conn, eff_rxn_station_for_me)
+        with _connect() as _ic:
+            mfg_facility = get_station_facility(_ic, station)
+            rxn_facility = get_station_facility(_ic, eff_rxn_station_for_me)
+            # Aggregated savings for the ROOT product (for display)
+            mfg_me_mult = get_station_me_multiplier(_ic, station)
+            rxn_me_mult = get_station_me_multiplier(_ic, eff_rxn_station_for_me)
 
         # === Manufacturing fee parameters, computed up-front ===
         # The make-vs-buy optimizer needs each job's install fee, not just its
@@ -518,18 +522,19 @@ async def plan_result(
         else:
             rxn_solar_system_id = solar_system_id
 
-        adj_prices = await get_adjusted_prices(conn)
+        with _connect() as _ic:
+            adj_prices = await get_adjusted_prices(_ic)
 
-        mfg_sci = await get_sci_for_system(conn, solar_system_id, "manufacturing") if solar_system_id else 0.0
-        rxn_sci = await get_sci_for_system(conn, rxn_solar_system_id, "reaction") if rxn_solar_system_id else 0.0
+            mfg_sci = await get_sci_for_system(_ic, solar_system_id, "manufacturing") if solar_system_id else 0.0
+            rxn_sci = await get_sci_for_system(_ic, rxn_solar_system_id, "reaction") if rxn_solar_system_id else 0.0
 
-        # TE multipliers for the stations (structure + rigs)
-        mfg_te_mult = get_station_te_multiplier(conn, station)
-        rxn_te_mult = get_station_te_multiplier(conn, eff_rxn_station) if sep_rxn_station else mfg_te_mult
+            # TE multipliers for the stations (structure + rigs)
+            mfg_te_mult = get_station_te_multiplier(_ic, station)
+            rxn_te_mult = get_station_te_multiplier(_ic, eff_rxn_station) if sep_rxn_station else mfg_te_mult
 
-        # Cost bonus na SCI (Raitaru −3 %, Azbel −4 %, Sotiyo −5 %)
-        mfg_cost_bonus = get_station_cost_bonus(conn, station)
-        rxn_cost_bonus = get_station_cost_bonus(conn, eff_rxn_station) if sep_rxn_station else mfg_cost_bonus
+            # Cost bonus na SCI (Raitaru −3 %, Azbel −4 %, Sotiyo −5 %)
+            mfg_cost_bonus = get_station_cost_bonus(_ic, station)
+            rxn_cost_bonus = get_station_cost_bonus(_ic, eff_rxn_station) if sep_rxn_station else mfg_cost_bonus
 
         # Combined install-fee rate per activity: SCI×(1−structure bonus) + tax + SCC.
         rate_mfg = mfg_sci * (1.0 - mfg_cost_bonus) + fac_tax_rate + _SCC
@@ -539,7 +544,7 @@ async def plan_result(
         # tree contains, so their per-run times can be turned into per-product
         # job splits. Skipped entirely when splitting is off (the default), so
         # an unconfigured install pays nothing for it.
-        from app.db.conn import connect as _connect, connect_to_path
+        from app.db.conn import connect_to_path
         # `with`, not a bare open/close: every call between here and the
         # end of the block can raise — an unknown type, a blueprint with no
         # product, a split that divides by a zero job time — and each of
@@ -726,7 +731,11 @@ async def plan_result(
             cached = te_mult_cache.get(key)
             if cached is not None:
                 return cached
-            val = get_product_te_multiplier(conn, prod_facility, type_id)
+            # Inside the memo, so this opens once per distinct
+            # (facility, product) pair rather than once per step. A facility
+            # with no rigs never reaches the database at all.
+            with _connect() as _ic:
+                val = get_product_te_multiplier(_ic, prod_facility, type_id)
             te_mult_cache[key] = val
             return val
 
@@ -1177,29 +1186,33 @@ def _derive_job_splits(
         f"WHERE blueprint_type_id IN ({ph})", list(bp_ids))}
 
     splits: dict[int, int] = {}
-    for type_id, (bp_id, activity) in seen.items():
-        row = times.get(bp_id)
-        if not row:
-            continue
-        is_rxn = activity == "reaction"
-        base_time = row[1] if is_rxn else row[0]
-        if not base_time:
-            continue
-        sci_mult, _details = _science_skill_mult(conn, bp_id, activity, char_skills)
-        per_run = calc_job_time(
-            base_time=base_time,
-            runs=1,
-            te=0 if is_rxn else te,
-            industry_level=industry_level,
-            adv_industry_level=adv_industry_level,
-            facility_te_multiplier=get_product_te_multiplier(
-                conn, rxn_facility if is_rxn else mfg_facility, type_id),
-            is_reaction=is_rxn,
-            science_skill_mult=sci_mult,
-        )
-        limit = max_runs_per_job(per_run, max_days)
-        if limit:
-            splits[type_id] = limit
+    # One connection for the whole loop: `get_product_te_multiplier` is called
+    # once per product, and this function is only reached when a day limit is
+    # set, so opening per iteration would be a fresh sqlite3 handle per product.
+    with _connect() as _ic:
+        for type_id, (bp_id, activity) in seen.items():
+            row = times.get(bp_id)
+            if not row:
+                continue
+            is_rxn = activity == "reaction"
+            base_time = row[1] if is_rxn else row[0]
+            if not base_time:
+                continue
+            sci_mult, _details = _science_skill_mult(conn, bp_id, activity, char_skills)
+            per_run = calc_job_time(
+                base_time=base_time,
+                runs=1,
+                te=0 if is_rxn else te,
+                industry_level=industry_level,
+                adv_industry_level=adv_industry_level,
+                facility_te_multiplier=get_product_te_multiplier(
+                    _ic, rxn_facility if is_rxn else mfg_facility, type_id),
+                is_reaction=is_rxn,
+                science_skill_mult=sci_mult,
+            )
+            limit = max_runs_per_job(per_run, max_days)
+            if limit:
+                splits[type_id] = limit
     return splits
 
 

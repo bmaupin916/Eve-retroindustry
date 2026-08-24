@@ -35,11 +35,11 @@ def db(tmp_path):
     shutil.copy2(SDE, path)
     conn = sqlite3.connect(path)
     from app.market.prices import ensure_price_table
-    from app.web.industry_helper import ensure_industry_tables
     ensure_price_table(conn)
-    ensure_industry_tables(conn)
     from app.db.schema import ensure_schema
-    ensure_schema(conn)          # the shim wants a SQLAlchemy conn now
+    # `industry_helper.ensure_industry_tables` used to be called here too. It
+    # only ever forwarded to this, and it now takes a SQLAlchemy connection.
+    ensure_schema(conn)
     conn.close()
 
     # The module under test is on the portable query layer now, so the fixture

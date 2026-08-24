@@ -11,7 +11,7 @@ import sqlite3
 
 import pytest
 
-from app.db.conn import connect_to_path, dbapi
+from app.db.conn import connect_to_path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SDE = os.path.join(REPO, "sde_base.db")
@@ -27,10 +27,14 @@ def db(tmp_path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     from app.market.prices import ensure_price_table
-    from app.web.industry_helper import ensure_industry_tables
+    from app.db.schema import ensure_schema
     from app.web.location_resolver import ensure_location_name_table
     ensure_price_table(conn)
-    ensure_industry_tables(conn)
+    # Was `industry_helper.ensure_industry_tables`, which is now a shim that
+    # takes a SQLAlchemy connection and returns early on anything but SQLite.
+    # The fixture is creating the schema on the DBAPI handle, so it calls what
+    # that shim called.
+    ensure_schema(conn)
     # Needed as soon as a station is configured: the station context resolves
     # the system behind it to read its cost index.
     ensure_location_name_table(conn)
@@ -498,7 +502,9 @@ def test_raw_cost_includes_manufacturing_job_fees_not_just_reaction_ones(db):
     conn.commit()
 
     base_ctx = _station_context(conn, get_defaults(conn))
-    adjusted = get_adjusted_prices_cached(dbapi(conn))
+    # `industry_helper` is converted, so this takes the engine connection
+    # directly now rather than crossing through `dbapi`.
+    adjusted = get_adjusted_prices_cached(conn)
     ids = {r[0] for r in conn.exec_driver_sql("SELECT type_id FROM market_price_cache")}
     prices = _prices(conn, ids, "buy")
 

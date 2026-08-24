@@ -5,8 +5,11 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.55. **758 tests green, 1 skipped** — and
-  the one skip is POSIX file modes on Windows, not a backend. Postgres 17 has
+* Branch `docs/hosted-v2-design`, v0.9.56. **788 tests green, 2 skipped** — and
+  neither skip is a backend failure: one is POSIX file modes on Windows, the
+  other is `test_the_computed_percentage_stacks_multiplicatively`, which is
+  marked `sqlite_only` because it crosses into `location_resolver`.
+   Postgres 17 has
   now been run: the schema builds, all three migrations reach head on it, and
   the eight tests that had skipped through every previous commit all pass. The
   first run did fail once, correctly: `test_only_our_own_ids_are_generated`
@@ -27,10 +30,12 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 * Step 4 is **8 of 8 items in outline**, with one of them part-finished. The
   cache-only conversion is **done** (v0.9.55). What is left is the query
   conversion: `projects`, `industry` and `app_defaults` are converted, and
-  `industry_helper`, `app/character/*`, `location_resolver`, `media`,
-  `contracts`, `characters`, `planets`, `locations`, `prices`, `assets` and
-  `plan` are not, plus `deps.py`, `main.py` and `app/db/schema.py` at the end.
-  `grep -rn "dbapi(" app/` is the live measure and stands at **4**.
+  `industry_helper` is converted too (v0.9.56). Still to go:
+  `location_resolver`, `app/character/*`, `media`, `contracts`, `characters`,
+  `planets`, `locations`, `prices`, `assets` and `plan`, plus `deps.py`,
+  `main.py` and `app/db/schema.py` at the end.
+  `grep -rn "dbapi(" app/` is the live measure and stands at **5** — see the
+  note below on why it went up.
 
 To bring the Postgres tests back:
 
@@ -76,17 +81,17 @@ process, each sees the other's committed writes
 its own, and what is left at the end is deleting `get_conn()` once nothing
 calls it.
 
-Order — `projects`, `industry` and `app_defaults` are **done**; `industry` is
-the better worked example, because it hit the cases `projects` did not.
-Remaining: `industry_helper`, `app/character/*`, `location_resolver`, then
-`media`, `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`,
-`plan`, and finally `deps.py`, `main.py` and `app/db/schema.py` itself.
+Order — `projects`, `industry`, `app_defaults` and `industry_helper` are
+**done**; `industry` is the better worked example, because it hit the cases
+`projects` did not. Remaining: **`location_resolver` next** — all five standing
+`dbapi()` boundaries point at it — then `app/character/*`, `media`, `contracts`,
+`characters`, `planets`, `locations`, `prices`, `assets`, `plan`, and finally
+`deps.py`, `main.py` and `app/db/schema.py` itself.
 
-**`industry_helper` is next**, on the same "convert what is underneath" rule
-that put `app_defaults` before the routers: three of the four remaining
-`dbapi()` boundaries point at it (`get_adjusted_prices_cached` twice and the
-station-context block in `margins.py`). The fourth points at `app/character/*`
-plus `location_resolver`, which go together.
+~~**`industry_helper` is next**~~ — **done in v0.9.56**, on the same "convert
+what is underneath" rule that put `app_defaults` before the routers. Three of
+the four boundaries standing before it pointed at it: `get_adjusted_prices_cached`
+twice and the station-context block in `margins.py`.
 
 **Checked rather than assumed, because the obvious alternative looks better
 than it is.** `location_resolver` sits *underneath* `industry_helper` — three
@@ -97,15 +102,20 @@ them open its own `connect()`, in code that gets re-touched the moment those
 routers convert. `industry_helper` first costs three `dbapi()` markers instead
 of forty adaptations.
 
-**Expect the boundary count to stay at 4 through this slice, not fall to 1.**
-Converting `industry_helper` removes three boundaries (`margins.py` twice,
+**The boundary count went 4 → 5, and that was the right outcome.**
+The prediction going in was that it would stay flat: converting
+`industry_helper` removes three boundaries (`margins.py` twice,
 `reactions_helper.py` once) and creates three, because its own calls to
 `get_station_security_multiplier` then cross into the unconverted
-`location_resolver`. The boundary *moves down a level*; it does not disappear
-until `location_resolver` goes. Worth writing down because
-`grep -rn "dbapi(" app/` is the progress metric everywhere else in this file,
-and this is the one slice where a flat number is the expected result rather
-than a sign that nothing happened.
+`location_resolver`. It went up by one more than that because three handlers in
+`routers/locations.py` had to move onto `connect()` as well — they were almost
+entirely `industry_helper` calls — and one of them also asks `location_resolver`
+for a security status, which is a fifth crossing.
+
+The boundary *moved down a level*; it did not disappear, and it will not until
+`location_resolver` goes. All five now point at that one module. Worth writing
+down because `grep -rn "dbapi(" app/` is the progress metric everywhere else in
+this file, and a rising number here means the conversion worked.
 
 **Seven of its nineteen functions had no test at all**, found before converting
 anything by wrapping every function in the module and running the whole suite
@@ -114,10 +124,13 @@ in both directions — it misses everything reached through a route). The seven:
 `populate_rig_bonuses`, `get_rig_types`, `save_station_rigs_full`,
 `get_station_rigs_full`, `get_station_me_bonus`, `get_station_me_bonus_pct`,
 `save_station_me_bonus` — the whole station-rig cluster, including **both
-writers**. `tests/test_industry_helper_rigs.py` covers them, written against
-the `sqlite3` version deliberately, so the conversion has assertions to
-*preserve* rather than assertions invented afterwards to fit whatever it did.
-Thirteen mutations, each caught by the test that names it.
+writers**. They were covered first in `tests/test_industry_helper_rigs.py`,
+written against the `sqlite3` version deliberately, so the conversion had
+assertions to *preserve* rather than assertions invented afterwards to fit
+whatever it did — thirteen mutations, each caught by the test that names it.
+That file became `tests/test_industry_helper_on_postgres.py` when the module
+moved; the assertions are unchanged and only the fixture underneath them is
+different, which is the whole point of having written them first.
 
 **The probe is worth repeating on the next module.** It is twenty lines: wrap
 every function the module defines, count calls, print the zeroes at the end of
@@ -134,7 +147,8 @@ smallest.
 **Boundary crossings are marked.** A converted module calling an unconverted one
 passes `dbapi(conn)` — the driver connection from underneath. `grep -rn "dbapi("
 app/` is the list of boundaries still standing, and it should shrink to nothing.
-It stood at 6 before v0.9.48 and stands at **4** after it.
+It stood at 6 before v0.9.48, 4 after it, and **5** after v0.9.56 — see
+"The boundary count went 4 → 5" above for why that was the right direction.
 
 **A converted module called from an unconverted one is the other direction**, and
 it turns up as soon as something low in the stack is converted. `app_defaults`
@@ -352,10 +366,22 @@ work, not a move, and the event model has to be decided before it is written.
 ~~Run `projects` against Postgres~~, ~~sign in~~ and ~~the sync-health page~~ are
 all **done**. What that left is below.
 
-1. **Pick up the conversion.** `industry_helper` next — three of the four
-   remaining `dbapi()` boundaries point at it; the fourth is `app/character/*`
-   plus `location_resolver`, which go together. `grep -rn "dbapi(" app/` is the
-   live list and stands at **4**.
+1. **Pick up the conversion.** `location_resolver` next — **all five** standing
+   `dbapi()` boundaries now point at it, three from inside `industry_helper`
+   itself and one each from `routers/industry.py` and `routers/locations.py`.
+   `grep -rn "dbapi(" app/` is the live list.
+
+   It has ~40 call sites across seven routers that are not converted, so each of
+   those has to open its own `connect()`. That is the cost that made it the
+   wrong module to do *first*; it is the right one to do next, because nothing
+   else can drop a boundary until it moves.
+
+   **There is a ready-made definition of done.**
+   `test_the_computed_percentage_stacks_multiplicatively` in
+   `tests/test_industry_helper_on_postgres.py` is marked `sqlite_only` purely
+   because a station with rigs fitted sends it through
+   `get_station_security_multiplier`. Delete the marker; it should pass on both
+   backends. If it does not, `location_resolver` is not finished.
 
    **Nothing is blocked any more.** `industry_helper` was deferred through
    v0.9.49–0.9.53 only because it has ~26 call sites inside
@@ -589,3 +615,63 @@ a real regression.
   `with sqlite3.connect(...)` looks like a leak fix and is not one. It needs
   `contextlib.closing`. `build_plan` now uses it, and the mutation that swaps
   it back for a bare `with` is what proves the test can tell them apart.
+
+
+## int64 ids: a whole class of column is declared too narrow
+
+**Found by running the `industry_helper` rig tests against Postgres for the
+first time — eight failures there, none on SQLite.** Every one was
+`NumericValueOutOfRange: integer out of range`, from saving a rig configuration
+against a station id of 1035466617946.
+
+`station_rigs.location_id` was declared `Integer`. SQLite's INTEGER is a
+variable-width 64-bit type and the declaration is advisory, so it stored the
+value happily and had done for the life of the project. A Postgres INTEGER is
+exactly 32 bits. An Upwell structure id is around 1.03e12, and Upwell structures
+are the only things that can carry rigs at all — so on Postgres that table
+accepted NPC stations and rejected every station a player could actually
+configure.
+
+Fixed for that one column in migration 0009. **It is not the only one.** ESI
+declares character, corporation, location, item, order and contract ids as
+int64, and `app/db/schema.py` still declares these as `Integer`:
+
+* `location_id` — `location_name_cache`, `facility_tax_cache` (as `facility_id`)
+* `item_id` — `container_name_cache`
+* `contract_id`, `start_location_id`, `end_location_id` — the contract caches
+* `character_id`, `corporation_id` — across eight tables
+
+`solar_system_id` and `planet_id` are genuinely small (3e7 and 4e7) and are
+fine. `character_id` is the uncomfortable one: current ids run to about 2.1e9
+against an INTEGER ceiling of 2147483647, so it is not a future problem.
+
+Left as a separate item rather than swept into the conversion commit: each
+column needs deciding on its own, a widening `ALTER` on a live table is not
+something to do by pattern match, and the fix belongs with a test that proves
+the range rather than with a rewrite that happened to touch the file.
+
+**The general lesson, which is the reusable part:** SQLite ignores the width in
+a column declaration and Postgres enforces it, so *every* integer column in this
+schema is unverified until something writes a real-world-sized value to it on
+Postgres. Type declarations are not portable claims; they are portable only once
+a test has pushed a realistic value through them.
+
+## Mutating the wrong artifact proves nothing, quietly
+
+Reverting `station_rigs.location_id` to `Integer` **in the declaration** failed
+nothing on either backend, and the first reading of that was "the test is
+decorative". It was not: the Postgres fixture builds its tables with
+`upgrade_to_head`, so the column type there comes from the *migration*, and the
+declaration is only consulted by `create_all` and by
+`test_the_migrations_match_the_declaration`.
+
+Two artifacts, two separate claims, and each needs its own mutation:
+
+* neuter migration 0009 → **8 Postgres failures, 0 SQLite**. That asymmetry is
+  the evidence that the cross-backend half tests a backend difference rather
+  than running the same assertions twice.
+* revert the declaration → **1 failure**, in `test_migrations.py`, from the
+  guard that keeps declaration and history in step.
+
+Before concluding a mutation proves an assertion is decorative, check that it
+changed the artifact the test actually reads.

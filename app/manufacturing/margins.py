@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 
-from app.db.conn import (NO_SUCH_TABLE as _NO_SUCH_TABLE, dbapi,
+from app.db.conn import (NO_SUCH_TABLE as _NO_SUCH_TABLE,
                          recover_from_missing_table as _recover)
 
 from app.bom.resolver import (
@@ -177,8 +177,6 @@ def _station_context(conn: Connection, defaults: dict) -> dict:
         get_station_cost_bonus, get_station_facility, get_station_te_multiplier,
     )
 
-    # industry_helper is not converted yet, so it gets the driver connection.
-    raw = dbapi(conn)
     build = int(defaults.get("build_station_id") or 0)
     reaction = int(defaults.get("reaction_station_id") or 0) or build
 
@@ -212,8 +210,8 @@ def _station_context(conn: Connection, defaults: dict) -> dict:
     rxn_sci, rxn_cached = _sci(_system(reaction), "reaction")
     mfg_tax = float(defaults.get("facility_tax") or 0) / 100
     rxn_tax = float(defaults.get("reaction_facility_tax") or 0) / 100
-    mfg_bonus = get_station_cost_bonus(raw, build) if build else 0.0
-    rxn_bonus = get_station_cost_bonus(raw, reaction) if reaction else mfg_bonus
+    mfg_bonus = get_station_cost_bonus(conn, build) if build else 0.0
+    rxn_bonus = get_station_cost_bonus(conn, reaction) if reaction else mfg_bonus
 
     return {
         "build_station_id": build,
@@ -221,10 +219,10 @@ def _station_context(conn: Connection, defaults: dict) -> dict:
         "rate_mfg": mfg_sci * (1.0 - mfg_bonus) + mfg_tax + SCC,
         "rate_rxn": rxn_sci * (1.0 - rxn_bonus) + rxn_tax + SCC,
         "sci_cached": mfg_cached and rxn_cached,
-        "mfg_facility": get_station_facility(raw, build) if build else StationFacility(),
-        "rxn_facility": get_station_facility(raw, reaction) if reaction else StationFacility(),
-        "mfg_te_mult": get_station_te_multiplier(raw, build) if build else 1.0,
-        "rxn_te_mult": get_station_te_multiplier(raw, reaction) if reaction else 1.0,
+        "mfg_facility": get_station_facility(conn, build) if build else StationFacility(),
+        "rxn_facility": get_station_facility(conn, reaction) if reaction else StationFacility(),
+        "mfg_te_mult": get_station_te_multiplier(conn, build) if build else 1.0,
+        "rxn_te_mult": get_station_te_multiplier(conn, reaction) if reaction else 1.0,
     }
 
 
@@ -290,7 +288,7 @@ def compute_margin(
     basis = str(defaults.get("input_basis") or "sell")
 
     from app.web.industry_helper import get_adjusted_prices_cached
-    adjusted = get_adjusted_prices_cached(dbapi(conn))   # not converted yet
+    adjusted = get_adjusted_prices_cached(conn)
 
     inv_params, inv_warnings = (
         inv if inv is not None else build_invention_params(

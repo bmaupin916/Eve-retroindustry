@@ -116,17 +116,28 @@ def test_best_contract_price_bundle_fallback():
 
 # ── rig ↔ product applicability (authoritative EVE Ref group map) ────────────
 def test_rig_applies_to_product(app_module):
+    from sqlalchemy import text
+    from app.db.conn import connect
     from app.web.industry_helper import rig_applies_to_product as applies
-    conn = app_module.get_conn()
-    try:
+
+    # `industry_helper` is on the portable query layer, so this takes an engine
+    # connection rather than `app_module.get_conn()`. Passing the DBAPI handle
+    # fails loudly at the first statement — `execute() argument 1 must be str,
+    # not TextClause` — which is the failure mode worth having.
+    with connect() as conn:
         def tid(name):
-            r = conn.execute("SELECT type_id FROM sde_types WHERE name=? AND published=1",
-                             (name,)).fetchone()
+            r = conn.execute(
+                text("SELECT type_id FROM sde_types"
+                     " WHERE name=:name AND published=1"),
+                {"name": name}).fetchone()
             return r[0] if r else None
 
         def rig(group_id):
-            r = conn.execute("SELECT type_id FROM sde_types WHERE group_id=? AND published=1 "
-                             "ORDER BY type_id LIMIT 1", (group_id,)).fetchone()
+            r = conn.execute(
+                text("SELECT type_id FROM sde_types"
+                     " WHERE group_id=:gid AND published=1"
+                     " ORDER BY type_id LIMIT 1"),
+                {"gid": group_id}).fetchone()
             return r[0] if r else None
 
         r_large_ship = rig(1828)   # Basic Large Ship manufacturing rig
@@ -145,8 +156,6 @@ def test_rig_applies_to_product(app_module):
         assert applies(conn, r_drone, drone_amp) is False
         # An actual drone is bonused by the Drone rig.
         assert applies(conn, r_drone, warrior) is True
-    finally:
-        conn.close()
 
 
 def test_best_contract_price_none_when_absent():

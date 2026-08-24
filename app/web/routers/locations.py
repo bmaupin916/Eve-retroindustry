@@ -11,6 +11,9 @@ import asyncio
 
 from fastapi import APIRouter, Form, Request
 
+from sqlalchemy import text
+
+from app.db.conn import connect, dbapi
 from app.esi.client import esi_client
 from app.market.prices import (
     ensure_price_table,
@@ -51,28 +54,31 @@ async def station_industry_info(request: Request, location_id: int):
     Return SCI, facility tax, ME bonus and security multiplier for the given station/structure.
     Facility tax is derived from the character's recent jobs (cost/EIV − SCI).
     """
-    conn = get_conn()
-    sys_row = conn.execute(
-        "SELECT solar_system_id FROM location_name_cache WHERE location_id=?",
-        (location_id,),
-    ).fetchone()
-    solar_system_id: int | None = sys_row[0] if sys_row and sys_row[0] else None
+    with connect() as conn:
+        sys_row = conn.execute(
+            text("SELECT solar_system_id FROM location_name_cache"
+                 " WHERE location_id=:loc"),
+            {"loc": location_id},
+        ).fetchone()
+        solar_system_id: int | None = sys_row[0] if sys_row and sys_row[0] else None
 
-    mfg_sci = rxn_sci = 0.0
-    security_status: float | None = None
-    if solar_system_id:
-        mfg_sci = await get_sci_for_system(conn, solar_system_id, "manufacturing")
-        rxn_sci = await get_sci_for_system(conn, solar_system_id, "reaction")
-        # Pre-fetch security_status into the cache so the synchronous helper
-        # get_station_me_bonus_pct can scale rig bonuses correctly (×1.0 / ×1.9 / ×2.1).
-        security_status = await get_security_status(conn, solar_system_id)
+        mfg_sci = rxn_sci = 0.0
+        security_status: float | None = None
+        if solar_system_id:
+            mfg_sci = await get_sci_for_system(conn, solar_system_id, "manufacturing")
+            rxn_sci = await get_sci_for_system(conn, solar_system_id, "reaction")
+            # Pre-fetch security_status into the cache so the synchronous helper
+            # get_station_me_bonus_pct can scale rig bonuses correctly (×1.0 / ×1.9 / ×2.1).
+            # location_resolver is not converted yet, so it gets the driver
+            # connection — the same one underneath, so the write it commits is
+            # visible to the reads below.
+            security_status = await get_security_status(dbapi(conn), solar_system_id)
 
-    # We can't read facility tax exactly from ESI (deriving it from the job average was inaccurate).
-    # The user enters it manually and can save the value as a default (localStorage).
-    rig_info = get_station_rigs_full(conn, location_id)
-    # ME bonus recomputed with the security multiplier (overrides the stale stored value)
-    me_bonus_live = get_station_me_bonus_pct(conn, location_id)
-    conn.close()
+        # We can't read facility tax exactly from ESI (deriving it from the job average was inaccurate).
+        # The user enters it manually and can save the value as a default (localStorage).
+        rig_info = get_station_rigs_full(conn, location_id)
+        # ME bonus recomputed with the security multiplier (overrides the stale stored value)
+        me_bonus_live = get_station_me_bonus_pct(conn, location_id)
     return {
         "solar_system_id":  solar_system_id,
         "security_status":  security_status,
@@ -96,11 +102,12 @@ async def save_station_rigs(request: Request):
         rig1 = int(data["rig1_type_id"]) if data.get("rig1_type_id") else None
         rig2 = int(data["rig2_type_id"]) if data.get("rig2_type_id") else None
         rig3 = int(data["rig3_type_id"]) if data.get("rig3_type_id") else None
-        conn = get_conn()
-        save_station_rigs_full(conn, location_id, structure_type, rig1, rig2, rig3)
-        # Return the security-adjusted ME bonus (the helper applies the sec multiplier to rigs)
-        me_bonus = get_station_me_bonus_pct(conn, location_id)
-        conn.close()
+        with connect() as conn:
+            save_station_rigs_full(conn, location_id, structure_type,
+                                   rig1, rig2, rig3)
+            # Return the security-adjusted ME bonus (the helper applies the sec
+            # multiplier to rigs)
+            me_bonus = get_station_me_bonus_pct(conn, location_id)
         return {"ok": True, "me_bonus_pct": me_bonus}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -109,10 +116,9 @@ async def save_station_rigs(request: Request):
 @router.get("/api/rig-types")
 async def api_rig_types(structure_type: str = ""):
     """Return the available rigs for the given structure type (raitaru/azbel/sotiyo/athanor/tatara)."""
-    conn = get_conn()
-    populate_rig_bonuses(conn)
-    rigs = get_rig_types(conn, structure_type)
-    conn.close()
+    with connect() as conn:
+        populate_rig_bonuses(conn)
+        rigs = get_rig_types(conn, structure_type)
     return {"rigs": rigs}
 
 

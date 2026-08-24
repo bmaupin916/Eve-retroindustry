@@ -41,7 +41,6 @@ from sqlalchemy.engine import Connection
 
 from app.db.conn import (NO_SUCH_TABLE as _NO_SUCH_TABLE,
                          recover_from_missing_table as _recover)
-from app.db.conn import dbapi
 
 from app.bom.resolver import BOMResolver
 from app.manufacturing.margins import _station_context
@@ -448,7 +447,7 @@ def build_board(conn: Connection, db_path: str,
     # are cached, so this costs one query per product rather than one per call.
     resolver = BOMResolver(
         conn, blueprints=[], runs_per_job=None,
-        adjusted_prices=get_adjusted_prices_cached(dbapi(conn)),   # not converted yet
+        adjusted_prices=get_adjusted_prices_cached(conn),
         rate_mfg=ctx["rate_mfg"], rate_rxn=ctx["rate_rxn"],
     )
     raw_basis = str(defaults.get("raw_input_basis")

@@ -376,7 +376,14 @@ facility_tax_cache = Table(
 
 station_rigs = Table(
     "station_rigs", metadata,
-    Column("location_id", Integer, primary_key=True, autoincrement=False),
+    # BigInteger, not Integer: an Upwell structure id is around 1.03e12, which
+    # is fine in SQLite (whose INTEGER is 64-bit whatever the declaration says)
+    # and out of range for a Postgres INTEGER. Declared narrow, this table
+    # accepts NPC stations and rejects every player-owned structure — which is
+    # the only kind that can have rigs at all. Found by running the rig tests
+    # against Postgres; see the `int64 ids` note in docs/step-4-worklist.md,
+    # because this is one column of a wider class.
+    Column("location_id", BigInteger, primary_key=True, autoincrement=False),
     Column("me_bonus_pct", Float, nullable=False, server_default="0"),
     Column("updated_at", BigInteger, nullable=False),
     Column("structure_type", Text),
