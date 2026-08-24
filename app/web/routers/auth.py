@@ -332,7 +332,10 @@ async def _bg_initial_sync():
         if all_loc_ids and any_token:
             _sync_state.update({"phase": "locations", "step": "", "char": ""})
             try:
-                await resolve_station_names_bulk(list(all_loc_ids), token=any_token, conn=conn)
+                from app.db.conn import connect as _connect
+                with _connect() as _lc:
+                    await resolve_station_names_bulk(
+                        list(all_loc_ids), token=any_token, conn=_lc)
             except Exception as exc:
                 print(f"[sync] resolve_station_names_bulk failed: {exc}", flush=True)
     except Exception as exc:

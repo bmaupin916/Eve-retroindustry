@@ -1,9 +1,10 @@
 """Resolve a location_id to a station/structure name (shared between plan.py and web)."""
 from __future__ import annotations
 import asyncio
-import sqlite3
 import time
 import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 from app.esi.client import esi_client
 from app.db.schema import ensure_schema as ensure_db_schema
 
@@ -34,21 +35,30 @@ def _set_error_limited(seconds: float = 60.0) -> None:
     _error_limited_until = max(_error_limited_until, time.monotonic() + seconds)
 
 
-def ensure_location_name_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_location_name_table(conn: Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees
+    it exists, and only on SQLite.
+
+    The lazy create predates migrations and is SQLite-only by construction:
+    `app/db/schema.py` memoises by asking `PRAGMA database_list`, which is a
+    syntax error on Postgres. There the schema arrives through Alembic.
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
 async def get_security_status(
-    conn: sqlite3.Connection,
+    conn: Connection,
     system_id: int,
 ) -> float | None:
     """Return the security_status for the given system. Caches the result
     permanently (sec status doesn't normally change — only FW state, which we ignore)."""
     ensure_location_name_table(conn)
     row = conn.execute(
-        "SELECT security_status FROM solar_system_cache WHERE system_id=?",
-        (system_id,),
+        text("SELECT security_status FROM solar_system_cache"
+             " WHERE system_id=:sys"),
+        {"sys": system_id},
     ).fetchone()
     if row and row[0] is not None:
         return row[0]
@@ -64,9 +74,14 @@ async def get_security_status(
             sec = r.json().get("security_status")
             if sec is not None:
                 conn.execute(
-                    "INSERT INTO solar_system_cache "
-                    "(system_id, security_status, cached_at) VALUES (?,?,?) ON CONFLICT (system_id) DO UPDATE SET security_status=excluded.security_status, cached_at=excluded.cached_at",
-                    (system_id, float(sec), int(time.time())),
+                    text("INSERT INTO solar_system_cache"
+                         " (system_id, security_status, cached_at)"
+                         " VALUES (:sys, :sec, :cached_at)"
+                         " ON CONFLICT (system_id) DO UPDATE SET"
+                         " security_status=excluded.security_status,"
+                         " cached_at=excluded.cached_at"),
+                    {"sys": system_id, "sec": float(sec),
+                     "cached_at": int(time.time())},
                 )
                 conn.commit()
                 return float(sec)
@@ -75,11 +90,12 @@ async def get_security_status(
     return None
 
 
-def get_cached_security(conn: sqlite3.Connection, system_id: int) -> float | None:
+def get_cached_security(conn: Connection, system_id: int) -> float | None:
     """Synchronously read security from cache. Returns None if not cached."""
     row = conn.execute(
-        "SELECT security_status FROM solar_system_cache WHERE system_id=?",
-        (system_id,),
+        text("SELECT security_status FROM solar_system_cache"
+             " WHERE system_id=:sys"),
+        {"sys": system_id},
     ).fetchone()
     return row[0] if row and row[0] is not None else None
 
@@ -106,7 +122,7 @@ def security_multiplier(sec_status: float | None, is_reaction: bool = False) -> 
 
 
 def get_station_security_multiplier(
-    conn: sqlite3.Connection,
+    conn: Connection,
     location_id: int,
     is_reaction: bool = False,
 ) -> float:
@@ -115,20 +131,22 @@ def get_station_security_multiplier(
     Assumes solar_system_cache has been populated from /api/station-industry-info.
     """
     row = conn.execute(
-        "SELECT solar_system_id FROM location_name_cache WHERE location_id=?",
-        (location_id,),
+        text("SELECT solar_system_id FROM location_name_cache"
+             " WHERE location_id=:loc"),
+        {"loc": location_id},
     ).fetchone()
     if not row or not row[0]:
         return 1.0
     return security_multiplier(get_cached_security(conn, row[0]), is_reaction)
 
 
-async def get_region_for_location(conn: sqlite3.Connection, location_id: int, token: str | None = None) -> int | None:
+async def get_region_for_location(conn: Connection, location_id: int, token: str | None = None) -> int | None:
     """Return the region_id for the given location_id. Caches the result in the DB."""
     ensure_location_name_table(conn)
     row = conn.execute(
-        "SELECT solar_system_id, region_id FROM location_name_cache WHERE location_id=?",
-        (location_id,)
+        text("SELECT solar_system_id, region_id FROM location_name_cache"
+             " WHERE location_id=:loc"),
+        {"loc": location_id},
     ).fetchone()
 
     if row and row[1]:
@@ -142,8 +160,11 @@ async def get_region_for_location(conn: sqlite3.Connection, location_id: int, to
             _, sys_id = await resolve_station_name(client, location_id, token)
         if sys_id:
             conn.execute(
-                "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO NOTHING",
-                (location_id, str(location_id), sys_id)
+                text("INSERT INTO location_name_cache"
+                     " (location_id, name, solar_system_id)"
+                     " VALUES (:loc, :name, :sys)"
+                     " ON CONFLICT (location_id) DO NOTHING"),
+                {"loc": location_id, "name": str(location_id), "sys": sys_id},
             )
             conn.commit()
 
@@ -173,8 +194,9 @@ async def get_region_for_location(conn: sqlite3.Connection, location_id: int, to
 
         if region_id:
             conn.execute(
-                "UPDATE location_name_cache SET region_id=? WHERE location_id=?",
-                (region_id, location_id)
+                text("UPDATE location_name_cache SET region_id=:region"
+                     " WHERE location_id=:loc"),
+                {"region": region_id, "loc": location_id},
             )
             conn.commit()
         return region_id
@@ -182,32 +204,51 @@ async def get_region_for_location(conn: sqlite3.Connection, location_id: int, to
         return None
 
 
-def load_location_names_from_db(conn: sqlite3.Connection) -> dict[int, str]:
-    rows = conn.execute("SELECT location_id, name FROM location_name_cache").fetchall()
+def load_location_names_from_db(conn: Connection) -> dict[int, str]:
+    rows = conn.execute(
+        text("SELECT location_id, name FROM location_name_cache")).fetchall()
     return {r[0]: r[1] for r in rows}
 
 
-def load_location_sys_from_db(conn: sqlite3.Connection) -> dict[int, int]:
+def load_location_sys_from_db(conn: Connection) -> dict[int, int]:
     """Return {location_id: solar_system_id} for records where solar_system_id is not NULL."""
     rows = conn.execute(
-        "SELECT location_id, solar_system_id FROM location_name_cache WHERE solar_system_id IS NOT NULL"
-    ).fetchall()
+        text("SELECT location_id, solar_system_id FROM location_name_cache"
+             " WHERE solar_system_id IS NOT NULL")).fetchall()
     return {r[0]: r[1] for r in rows}
 
 
-def locations_in_system(conn: sqlite3.Connection, solar_system_id: int) -> list[dict]:
+def locations_in_system(conn: Connection, solar_system_id: int) -> list[dict]:
     rows = conn.execute(
-        "SELECT location_id, name FROM location_name_cache WHERE solar_system_id = ?",
-        (solar_system_id,)
+        text("SELECT location_id, name FROM location_name_cache"
+             " WHERE solar_system_id = :sys"),
+        {"sys": solar_system_id},
     ).fetchall()
     return [{"location_id": r[0], "name": r[1]} for r in rows]
 
 
-def save_location_names_to_db(conn: sqlite3.Connection, entries: dict[int, tuple[str, int | None]]):
-    """entries: {location_id: (name, solar_system_id | None)}"""
-    conn.executemany(
-        "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?, ?, ?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
-        [(lid, name, sys_id) for lid, (name, sys_id) in entries.items()]
+def save_location_names_to_db(conn: Connection, entries: dict[int, tuple[str, int | None]]):
+    """entries: {location_id: (name, solar_system_id | None)}
+
+    `region_id` is deliberately not named: it costs two ESI calls to fill in and
+    `ON CONFLICT DO UPDATE` writes only what it is given, so a name refresh
+    leaves it alone. The old `INSERT OR REPLACE` deleted the row and re-inserted
+    it, which nulled every column this statement does not mention.
+    """
+    # An empty batch is the common case — it means every name was already
+    # cached. `executemany` treated it as a no-op; SQLAlchemy has no rows to
+    # infer the parameter shape from and raises, so it is guarded here rather
+    # than at each call site.
+    if not entries:
+        return
+    conn.execute(
+        text("INSERT INTO location_name_cache"
+             " (location_id, name, solar_system_id)"
+             " VALUES (:location_id, :name, :solar_system_id)"
+             " ON CONFLICT (location_id) DO UPDATE SET name=excluded.name,"
+             " solar_system_id=excluded.solar_system_id"),
+        [{"location_id": lid, "name": name, "solar_system_id": sys_id}
+         for lid, (name, sys_id) in entries.items()],
     )
     conn.commit()
 
@@ -279,7 +320,7 @@ async def resolve_station_name(
 async def resolve_station_names_bulk(
     location_ids: list[int],
     token: str | None = None,
-    conn: sqlite3.Connection | None = None,
+    conn: Connection | None = None,
 ) -> dict[int, str]:
     if conn is not None:
         ensure_location_name_table(conn)

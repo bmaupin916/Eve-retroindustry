@@ -942,7 +942,8 @@ async def plan_result(
     location_ids = [o["location_id"] for o in stock_station_options]
 
     # Load the station name for display in the form
-    loc_names = load_location_names_from_db(conn)
+    with _connect() as _lc:
+        loc_names = load_location_names_from_db(_lc)
     station_name = loc_names.get(station, str(station))
     rxn_station_name = loc_names.get(reaction_station, str(reaction_station)) if reaction_station else ""
 
@@ -1100,7 +1101,8 @@ async def _build_stock_station_options(
     # The DB cache holds real names accumulated earlier (Assets resolves them
     # per-owner with a token and stores them here) — placeholders are never
     # stored in the DB. We use it as the primary source WITHOUT an ESI call.
-    db_names = load_location_names_from_db(conn)
+    with _connect() as _lc:
+        db_names = load_location_names_from_db(_lc)
 
     # Resolve via ESI only for stations that don't have a real name yet — and only
     # with the planning character's token. Resolving all ~79 structures with the
@@ -1111,7 +1113,9 @@ async def _build_stock_station_options(
     unresolved = [lid for lid in loc_ids if not _is_real(db_names.get(lid), lid)]
     if unresolved:
         try:
-            r = await resolve_station_names_bulk(unresolved, token=token, conn=conn)
+            with _connect() as _lc:
+                r = await resolve_station_names_bulk(
+                    unresolved, token=token, conn=_lc)
             resolved = {lid: n for lid, n in r.items() if _is_real(n, lid)}
         except Exception:
             pass

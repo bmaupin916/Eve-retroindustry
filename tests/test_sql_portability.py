@@ -13,6 +13,7 @@ claim about every call site, which only a call-site check can see.
 from __future__ import annotations
 
 import pathlib
+import ast
 import re
 import sqlite3
 
@@ -47,6 +48,34 @@ def _line_of(src: str, index: int) -> int:
     return src[:index].count("\n") + 1
 
 
+def _blank_docstrings(src: str) -> str:
+    """Blank out docstring bodies, keeping every line number intact.
+
+    A docstring explaining why `INSERT OR REPLACE` is gone is not a use of it.
+    That false positive had been handled twice by hand — once with a "line
+    starts with #" check, once by exempting the whole of `app/db/schema.py` —
+    and the second of those hid every real offender in the file it exempted.
+    This is the precise version: a docstring is never executable SQL, and
+    nothing else is touched.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:            # not this scan's business
+        return src
+    lines = src.splitlines(keepends=True)
+    holders = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    for node in ast.walk(tree):
+        if not isinstance(node, holders) or not node.body:
+            continue
+        if ast.get_docstring(node, clean=False) is None:
+            continue
+        first = node.body[0]
+        for i in range(first.lineno - 1, (first.end_lineno or first.lineno)):
+            if i < len(lines):
+                lines[i] = "\n"
+    return "".join(lines)
+
+
 # --- upserts ------------------------------------------------------------------
 
 def test_no_insert_or_replace_survives():
@@ -60,8 +89,9 @@ def test_no_insert_or_replace_survives():
     """
     offenders = []
     for rel, src in _sources():
-        if rel == SCHEMA_MODULE:
-            continue                                   # documents it in a docstring
+        # Docstrings are blanked rather than whole files skipped, so a module
+        # that *documents* the pattern is still scanned for uses of it.
+        src = _blank_docstrings(src)
         # `OR IGNORE` is the same family: SQLite-only, and `ON CONFLICT DO
         # NOTHING` says the same thing in both dialects.
         for m in re.finditer(r"INSERT\s+OR\s+(REPLACE|IGNORE)", src, re.I):

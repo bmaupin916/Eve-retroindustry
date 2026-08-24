@@ -13,17 +13,25 @@ the row when the request ends. That is the expensive failure, so it gets the
 `_reopen` treatment: every commit here is asserted through a *second*
 connection, which is the only version of the question that can fail.
 
-Written against the `sqlite3` version deliberately. These assertions exist to be
-preserved by the conversion, not written afterwards to fit whatever it did.
+**These assertions are unchanged by the conversion.** They were written against
+the `sqlite3` version first, exactly so that they could be preserved rather than
+invented afterwards to fit whatever the rewrite did. All that moved is the
+fixture underneath them, which now runs each one on both backends.
+
+Postgres comes from the container in `tests/test_postgres_schema.py`; without it
+those parameterisations skip and the SQLite half still runs.
 """
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from app.web import location_resolver as lr
+from tests.test_postgres_schema import URL as PG_URL, _reachable
+
+PG_SCHEMA = "pytest_location_resolver"
 
 SYSTEM = 30000142            # Jita
 STATION = 60003760           # Jita IV - Moon 4
@@ -86,22 +94,51 @@ def _stub_esi(monkeypatch, client: _Client) -> _Client:
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(params=["sqlite", "postgres"])
+def engine(request, tmp_path):
+    """An engine per backend, with the app tables present and empty.
+
+    A file rather than `:memory:` on SQLite, because the commit assertions open
+    a *second* connection and every `:memory:` connection is a distinct, empty
+    database that merely shares a name.
+    """
+    from app.db.migrate import upgrade_to_head
+
+    if request.param == "sqlite":
+        url = f"sqlite:///{tmp_path / 'eve_cache.db'}"
+        upgrade_to_head(url)
+        eng = create_engine(url)
+        yield eng
+        eng.dispose()
+        return
+
+    if not _reachable(PG_URL):
+        pytest.skip(f"no Postgres at {PG_URL} — see tests/test_postgres_schema.py")
+
+    admin = create_engine(PG_URL)
+    with admin.connect() as c:
+        c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
+        c.execute(text(f"CREATE SCHEMA {PG_SCHEMA}"))
+        c.commit()
+    admin.dispose()
+
+    scoped = PG_URL + ("&" if "?" in PG_URL else "?") + \
+        f"options=-csearch_path%3D{PG_SCHEMA}"
+    upgrade_to_head(scoped)
+
+    eng = create_engine(scoped)
+    yield eng
+    eng.dispose()
+
+
 @pytest.fixture
-def conn(tmp_path):
-    """A file, not `:memory:` — the commit assertions open a second connection,
-    and every `:memory:` connection is a distinct database sharing a name."""
-    c = sqlite3.connect(str(tmp_path / "eve_cache.db"))
-    lr.ensure_location_name_table(c)
-    yield c
-    c.close()
+def conn(engine):
+    with engine.connect() as c:
+        yield c
 
 
-def _reopen(conn) -> sqlite3.Connection:
-    """A second connection to the same file. `database_list` returns
-    (seq, name, file) per attached database; `main` is the one we opened."""
-    path = [r[2] for r in conn.execute("PRAGMA database_list")
-            if r[1] == "main"][0]
-    return sqlite3.connect(path)
+def _backend(conn) -> str:
+    return conn.engine.dialect.name
 
 
 @pytest.fixture(autouse=True)
@@ -120,9 +157,11 @@ def _reset_module_state():
 def _seed_location(conn, location_id=STATION, name="Jita IV",
                    system_id=SYSTEM, region_id=None):
     conn.execute(
-        "INSERT INTO location_name_cache (location_id, name, solar_system_id,"
-        " region_id) VALUES (?,?,?,?)",
-        (location_id, name, system_id, region_id))
+        text("INSERT INTO location_name_cache (location_id, name,"
+             " solar_system_id, region_id)"
+             " VALUES (:loc, :name, :sys, :region)"),
+        {"loc": location_id, "name": name, "sys": system_id,
+         "region": region_id})
     conn.commit()
 
 
@@ -135,14 +174,15 @@ def _rows_for(conn, system_id=SYSTEM) -> int:
     here is written permanently.
     """
     return conn.execute(
-        "SELECT COUNT(*) FROM solar_system_cache WHERE system_id=?",
-        (system_id,)).fetchone()[0]
+        text("SELECT COUNT(*) FROM solar_system_cache WHERE system_id=:sys"),
+        {"sys": system_id}).fetchone()[0]
 
 
 def _seed_security(conn, system_id=SYSTEM, sec=0.946):
     conn.execute(
-        "INSERT INTO solar_system_cache (system_id, security_status, cached_at)"
-        " VALUES (?,?,?)", (system_id, sec, 0))
+        text("INSERT INTO solar_system_cache (system_id, security_status,"
+             " cached_at) VALUES (:sys, :sec, 0)"),
+        {"sys": system_id, "sec": sec})
     conn.commit()
 
 
@@ -161,8 +201,9 @@ def test_a_cached_security_comes_back(conn):
 def test_a_null_security_reads_as_uncached(conn):
     """The column is nullable, and a row with NULL means "asked, got nothing"
     rather than a security of zero."""
-    conn.execute("INSERT INTO solar_system_cache (system_id, security_status,"
-                 " cached_at) VALUES (?,?,?)", (SYSTEM, None, 0))
+    conn.execute(
+        text("INSERT INTO solar_system_cache (system_id, security_status,"
+             " cached_at) VALUES (:sys, NULL, 0)"), {"sys": SYSTEM})
     conn.commit()
 
     assert lr.get_cached_security(conn, SYSTEM) is None
@@ -269,8 +310,9 @@ def test_saving_a_name_does_not_wipe_the_region(conn):
 
     lr.save_location_names_to_db(conn, {STATION: ("Jita IV - Moon 4", SYSTEM)})
 
-    row = conn.execute("SELECT name, region_id FROM location_name_cache"
-                       " WHERE location_id=?", (STATION,)).fetchone()
+    row = conn.execute(
+        text("SELECT name, region_id FROM location_name_cache"
+             " WHERE location_id=:loc"), {"loc": STATION}).fetchone()
     assert row[0] == "Jita IV - Moon 4", "the name did not update"
     assert row[1] == REGION, "the region was wiped"
 
@@ -287,15 +329,20 @@ def test_saving_nothing_is_not_an_error(conn):
     assert lr.load_location_names_from_db(conn) == {}
 
 
-def test_saved_names_survive_a_new_connection(conn):
-    """The lost-`commit()` net for this writer."""
-    lr.save_location_names_to_db(conn, {STATION: ("Jita IV", SYSTEM)})
+def test_saved_names_survive_a_new_connection(engine):
+    """The lost-`commit()` net for this writer.
 
-    other = _reopen(conn)
-    try:
-        assert lr.load_location_names_from_db(other) == {STATION: "Jita IV"}
-    finally:
-        other.close()
+    SQLAlchemy opens a transaction on first use and rolls it back when the
+    connection closes, where `sqlite3` in its default isolation mode commits
+    some statements for itself. Asking a *different* connection is the only
+    version of this question that can fail.
+    """
+    with engine.connect() as c:
+        lr.save_location_names_to_db(c, {STATION: ("Jita IV", SYSTEM)})
+
+    with engine.connect() as c:
+        assert lr.load_location_names_from_db(c) == {STATION: "Jita IV"}, (
+            f"on {engine.dialect.name}: the write did not commit")
 
 
 # ── get_security_status ──────────────────────────────────────────────────────
@@ -324,17 +371,16 @@ def test_an_uncached_security_is_fetched_and_stored(conn, monkeypatch):
     assert lr.get_cached_security(conn, SYSTEM) == pytest.approx(-0.19)
 
 
-def test_a_fetched_security_survives_a_new_connection(conn, monkeypatch):
+def test_a_fetched_security_survives_a_new_connection(engine, monkeypatch):
     """The lost-`commit()` net for the second writer."""
     _stub_esi(monkeypatch, _Client(_Resp(200, {"security_status": -0.19})))
 
-    asyncio.run(lr.get_security_status(conn, SYSTEM))
+    with engine.connect() as c:
+        asyncio.run(lr.get_security_status(c, SYSTEM))
 
-    other = _reopen(conn)
-    try:
-        assert lr.get_cached_security(other, SYSTEM) == pytest.approx(-0.19)
-    finally:
-        other.close()
+    with engine.connect() as c:
+        assert lr.get_cached_security(c, SYSTEM) == pytest.approx(-0.19), (
+            f"on {engine.dialect.name}: the write did not commit")
 
 
 def test_a_failed_security_fetch_returns_none_and_stores_nothing(conn, monkeypatch):
@@ -392,27 +438,28 @@ def test_a_region_is_resolved_through_the_constellation_and_stored(conn, monkeyp
 
     assert got == REGION
     assert client.calls == 2
-    row = conn.execute("SELECT region_id FROM location_name_cache"
-                       " WHERE location_id=?", (STATION,)).fetchone()
+    row = conn.execute(
+        text("SELECT region_id FROM location_name_cache"
+             " WHERE location_id=:loc"), {"loc": STATION}).fetchone()
     assert row[0] == REGION, "the region was not written back"
 
 
-def test_a_resolved_region_survives_a_new_connection(conn, monkeypatch):
+def test_a_resolved_region_survives_a_new_connection(engine, monkeypatch):
     """The lost-`commit()` net for the third writer."""
     _stub_esi(monkeypatch, _Client(
         _Resp(200, {"constellation_id": CONSTELLATION}),
         _Resp(200, {"region_id": REGION})))
-    _seed_location(conn, STATION, "Jita IV", SYSTEM)
 
-    asyncio.run(lr.get_region_for_location(conn, STATION))
+    with engine.connect() as c:
+        _seed_location(c, STATION, "Jita IV", SYSTEM)
+        asyncio.run(lr.get_region_for_location(c, STATION))
 
-    other = _reopen(conn)
-    try:
-        row = other.execute("SELECT region_id FROM location_name_cache"
-                            " WHERE location_id=?", (STATION,)).fetchone()
-        assert row[0] == REGION
-    finally:
-        other.close()
+    with engine.connect() as c:
+        row = c.execute(
+            text("SELECT region_id FROM location_name_cache"
+                 " WHERE location_id=:loc"), {"loc": STATION}).fetchone()
+    assert row[0] == REGION, (
+        f"on {engine.dialect.name}: the write did not commit")
 
 
 def test_a_failed_constellation_lookup_yields_no_region(conn, monkeypatch):
@@ -452,3 +499,13 @@ def test_a_shorter_latch_cannot_shorten_a_longer_one():
     lr._set_error_limited(1.0)
 
     assert lr._error_limited_until == long_hold
+
+
+# ── the control ──────────────────────────────────────────────────────────────
+
+def test_both_backends_are_actually_exercised(conn):
+    """Without this a broken Postgres fixture reads as a passing file: the
+    SQLite half would carry it, and running on both is the entire point."""
+    assert _backend(conn) in ("sqlite", "postgresql")
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM location_name_cache")).fetchone()[0] == 0

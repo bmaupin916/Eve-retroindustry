@@ -58,10 +58,9 @@ _SLOT_ORDER = (
 @router.get("/jobs", response_class=HTMLResponse)
 async def jobs_page(request: Request):
     conn = connect()
-    # `app/character/*` and `location_resolver` are not converted yet, so they
-    # get the driver connection from underneath this one — same connection,
-    # same transaction. Every `raw` here is a boundary that disappears when
-    # those modules are converted.
+    # `app/character/*` is not converted yet, so it gets the driver connection
+    # from underneath this one — same connection, same transaction. Every `raw`
+    # here is a boundary that disappears when that module is converted.
     raw = dbapi(conn)
     chars = list_characters(raw)
     if not chars:
@@ -115,9 +114,9 @@ async def jobs_page(request: Request):
         any_tok = next((t for t in tokens if t), None)
         try:
             loc_names = await resolve_station_names_bulk(
-                list(all_loc_ids), token=any_tok, conn=raw)
+                list(all_loc_ids), token=any_tok, conn=conn)
         except Exception:
-            loc_names = load_location_names_from_db(raw)
+            loc_names = load_location_names_from_db(conn)
 
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc)

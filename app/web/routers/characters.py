@@ -19,6 +19,7 @@ from app.auth.token_store import get_character_row, list_characters
 from app.character import orders as orders_api
 from app.character import wallet as wallet_api
 from app.market.prices import JITA_REGION, TRADE_HUBS
+from app.db.conn import connect as _connect
 from app.web.location_resolver import (
     get_region_for_location,
     load_location_names_from_db,
@@ -180,7 +181,9 @@ async def _wallet_names(conn, journal: list[dict], txns: list[dict], token: str
     struct_ids = _context_structure_ids(journal)
     if struct_ids:
         try:
-            names.update(await resolve_station_names_bulk(struct_ids, token=token, conn=conn))
+            with _connect() as _lc:
+                names.update(await resolve_station_names_bulk(
+                    struct_ids, token=token, conn=_lc))
         except Exception:
             pass
     return names
@@ -513,19 +516,22 @@ async def _finalize_orders(conn, raw_orders: list[dict], type_names_fn, token: s
     loc_ids = list({o.get("location_id") for o in raw_orders if o.get("location_id")})
     loc_names: dict[int, str] = {}
     if loc_ids:
-        try:
-            loc_names = await resolve_station_names_bulk(loc_ids, token=token, conn=conn)
-        except Exception:
-            loc_names = load_location_names_from_db(conn)
+        with _connect() as _lc:
+            try:
+                loc_names = await resolve_station_names_bulk(
+                    loc_ids, token=token, conn=_lc)
+            except Exception:
+                loc_names = load_location_names_from_db(_lc)
     # Region per order location — so clicking an order can open the region-wide
     # order book it competes in (cached; failures → None, popup falls back to Jita).
     # Skipped for history (those items aren't clickable) to avoid wasted lookups.
     loc_regions: dict[int, int] = {}
     if loc_ids and resolve_regions:
-        _regs = await asyncio.gather(
-            *[get_region_for_location(conn, lid, token) for lid in loc_ids],
-            return_exceptions=True,
-        )
+        with _connect() as _lc:
+            _regs = await asyncio.gather(
+                *[get_region_for_location(_lc, lid, token) for lid in loc_ids],
+                return_exceptions=True,
+            )
         for lid, reg in zip(loc_ids, _regs):
             if isinstance(reg, int):
                 loc_regions[lid] = reg

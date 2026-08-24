@@ -4,7 +4,6 @@ import time
 import httpx
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
-from app.db.conn import dbapi
 from app.esi.client import esi_client
 # Authoritative rig group_id → affected product group_ids, generated from EVE Ref
 # reference-data (see scripts/build_rig_affected_groups.py). Replaces the old
@@ -276,10 +275,8 @@ def get_station_te_multiplier(conn: Connection, location_id: int) -> float:
 
     rig_ids = [r for r in [row[1], row[2], row[3]] if r]
     if rig_ids:
-        # location_resolver is not converted yet, so it gets the driver
-        # connection. This marker disappears when it moves.
         sec_mult = get_station_security_multiplier(
-            dbapi(conn), location_id, structure_type in _RXN_STRUCTURE_TYPES
+            conn, location_id, structure_type in _RXN_STRUCTURE_TYPES
         )
         unique_ids = list(set(rig_ids))
         rig_te_map = {r[0]: r[1] for r in conn.execute(
@@ -344,9 +341,8 @@ def get_station_facility(conn: Connection, location_id: int):
             me_b, te_b = rig_map.get(rid, (0.0, 0.0))
             rigs.append((rid, me_b, te_b))
 
-    # location_resolver is not converted yet, so it gets the driver connection.
     sec_mult = get_station_security_multiplier(
-        dbapi(conn), location_id, structure_type in _RXN_STRUCTURE_TYPES
+        conn, location_id, structure_type in _RXN_STRUCTURE_TYPES
     )
     return StationFacility(
         structure_pct=structure_pct,
@@ -381,10 +377,8 @@ def get_station_me_multiplier(conn: Connection, location_id: int) -> float:
 
     rig_ids = [r for r in [row[1], row[2], row[3]] if r]
     if rig_ids:
-        # location_resolver is not converted yet, so it gets the driver
-        # connection. This marker disappears when it moves.
         sec_mult = get_station_security_multiplier(
-            dbapi(conn), location_id, structure_type in _RXN_STRUCTURE_TYPES
+            conn, location_id, structure_type in _RXN_STRUCTURE_TYPES
         )
         unique_ids = list(set(rig_ids))
         rig_me_map = {r[0]: r[1] for r in conn.execute(

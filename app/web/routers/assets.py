@@ -40,6 +40,7 @@ from app.web.deps import (
     get_active_token,
     get_conn,
 )
+from app.db.conn import connect as _connect
 from app.web.location_resolver import resolve_station_names_bulk
 from app.web.prices_helper import get_prices_for_ids
 
@@ -368,7 +369,8 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
 
         # ── Location names ────────────────────────────────────────────────────
         all_loc_ids = list(set(station_data.keys()) | set(corp_sd.keys()))
-        loc_names = await resolve_station_names_bulk(all_loc_ids, token, conn)
+        with _connect() as _lc:
+            loc_names = await resolve_station_names_bulk(all_loc_ids, token, _lc)
 
         sys_rows = conn.execute(
             "SELECT location_id, solar_system_id FROM location_name_cache WHERE solar_system_id IS NOT NULL"
@@ -1026,7 +1028,10 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
     structure_ids = [lid for lid in all_raw_loc_ids if lid not in asset_item_ids]
 
     # Resolve station names
-    loc_names = await resolve_station_names_bulk(structure_ids, token, conn) if structure_ids else {}
+    loc_names = {}
+    if structure_ids:
+        with _connect() as _lc:
+            loc_names = await resolve_station_names_bulk(structure_ids, token, _lc)
 
     # Resolve container names + their parent stations (per char)
     container_info: dict[int, tuple[str, int]] = {}
@@ -1044,7 +1049,9 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
         parent_ids_to_resolve = list({info[1] for info in container_info.values()
                                       if info[1] not in loc_names})
         if parent_ids_to_resolve and token:
-            parent_names = await resolve_station_names_bulk(parent_ids_to_resolve, token, conn)
+            with _connect() as _lc:
+                parent_names = await resolve_station_names_bulk(
+                    parent_ids_to_resolve, token, _lc)
             loc_names.update(parent_names)
 
     # Build the hierarchy: {station_id: {"hangar": [...], "containers": {cid: {"name": ..., "bps": [...]}}}}

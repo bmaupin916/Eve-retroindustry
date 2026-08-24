@@ -28,16 +28,15 @@ def db(tmp_path):
     conn.row_factory = sqlite3.Row
     from app.market.prices import ensure_price_table
     from app.db.schema import ensure_schema
-    from app.web.location_resolver import ensure_location_name_table
     ensure_price_table(conn)
     # Was `industry_helper.ensure_industry_tables`, which is now a shim that
     # takes a SQLAlchemy connection and returns early on anything but SQLite.
     # The fixture is creating the schema on the DBAPI handle, so it calls what
     # that shim called.
     ensure_schema(conn)
-    # Needed as soon as a station is configured: the station context resolves
-    # the system behind it to read its cost index.
-    ensure_location_name_table(conn)
+    # `location_resolver.ensure_location_name_table` is a SQLAlchemy-layer
+    # shim now; `ensure_schema` above already creates this table on the DBAPI
+    # handle, which is what that shim forwarded to.
     conn.close()
 
     # The module under test is on the portable query layer now, so the fixture

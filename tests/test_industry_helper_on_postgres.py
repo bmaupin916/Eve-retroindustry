@@ -9,17 +9,20 @@ ends. Assertions written afterwards can only describe whatever the rewrite did.
 These had to survive it, which is the stronger claim, and all that changed is
 the fixture underneath them.
 
-**One test is SQLite-only, and the reason is the point.** `industry_helper` is
-converted; `location_resolver` is not. Four functions here
-(`get_station_facility`, `get_station_te_multiplier`,
-`get_station_me_multiplier` and `get_station_me_bonus_pct`) ask it for the
-system security multiplier whenever a station actually has rigs fitted, and it
-still builds `?` placeholders, which psycopg does not accept. So the module is
-on the portable layer without being Postgres-clean end to end, and
-`test_the_computed_percentage_stacks_multiplicatively` is the assertion that
-says exactly where the edge is. When `location_resolver` converts, drop the
-marker and it should pass on both — that is the definition of done for the next
-slice.
+**Every test here now runs on both backends.** One of them —
+`test_the_computed_percentage_stacks_multiplicatively` — did not, and the reason
+is worth keeping. Four functions here (`get_station_facility`,
+`get_station_te_multiplier`, `get_station_me_multiplier` and
+`get_station_me_bonus_pct`) ask `location_resolver` for the system security
+multiplier whenever a station actually has rigs fitted, and it still built `?`
+placeholders, which psycopg does not accept. So `industry_helper` was on the
+portable layer without being Postgres-clean end to end, and that one test
+carried a `sqlite_only` marker naming exactly where the edge was.
+
+Deleting that marker was the stated definition of done for the
+`location_resolver` slice, and it is gone. A marker that names the next piece of
+work turns out to be a better handover note than a paragraph in a worklist:
+it fails loudly the moment the claim stops being true.
 
 Both backends are seeded with the same handful of real rig types rather than a
 copy of `sde_base.db`, so the two halves run on identical data and the expected
@@ -59,10 +62,6 @@ SEED_TYPES = [
 
 STATION = 1035466617946
 NPC_STATION = 60003760
-
-# `location_resolver` still speaks `?`, so anything that asks it for a security
-# multiplier cannot run on Postgres yet.
-crosses_into_location_resolver = pytest.mark.sqlite_only
 
 
 @pytest.fixture(params=["sqlite", "postgres"])
@@ -122,10 +121,7 @@ def _seed(eng) -> None:
 
 
 @pytest.fixture
-def conn(engine, request):
-    if engine.dialect.name != "sqlite" and \
-            request.node.get_closest_marker("sqlite_only"):
-        pytest.skip("crosses into location_resolver, which is not converted yet")
+def conn(engine):
     with engine.connect() as c:
         yield c
 
@@ -414,7 +410,6 @@ def test_an_unconfigured_station_has_a_neutral_multiplier(conn):
     assert ih.get_station_me_bonus_pct(conn, NPC_STATION) == 0.0
 
 
-@crosses_into_location_resolver
 def test_the_computed_percentage_stacks_multiplicatively(conn):
     """`get_station_me_bonus` returns what was *stored* — an arithmetic sum —
     and `get_station_me_bonus_pct` returns the *combined* saving, which stacks
@@ -424,9 +419,10 @@ def test_the_computed_percentage_stacks_multiplicatively(conn):
     Raitaru + two T1 ME rigs: 1 - (1-0.01)(1-0.02)(1-0.02) = 1 - 0.950796,
     so 4.9204 %, where the stored arithmetic sum says 5.0.
 
-    SQLite-only until `location_resolver` converts: a station with rigs fitted
-    sends this through `get_station_security_multiplier`, which still builds `?`
-    placeholders.
+    This was SQLite-only until `location_resolver` converted: a station with
+    rigs fitted sends it through `get_station_security_multiplier`, which used
+    to build `?` placeholders. It runs on both backends now, which was the
+    stated definition of done for that slice.
     """
     ih.populate_rig_bonuses(conn)
     ih.save_station_rigs_full(conn, STATION, "raitaru", ME_RIG_T1, ME_RIG_T1, None)

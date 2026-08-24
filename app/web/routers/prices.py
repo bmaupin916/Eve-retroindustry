@@ -31,6 +31,7 @@ from app.web.deps import (
     get_active_token,
     get_conn,
 )
+from app.db.conn import connect as _connect
 from app.web.location_resolver import (
     get_region_for_location,
     load_location_names_from_db,
@@ -242,10 +243,12 @@ async def api_market_orders(request: Request, type_id: int, region_id: int = JIT
         loc_ids = list({o.get("location_id") for o in orders if o.get("location_id")})
         loc_names: dict[int, str] = {}
         if loc_ids:
-            try:
-                loc_names = await resolve_station_names_bulk(loc_ids, token=token, conn=conn)
-            except Exception:
-                loc_names = load_location_names_from_db(conn)
+            with _connect() as _lc:
+                try:
+                    loc_names = await resolve_station_names_bulk(
+                        loc_ids, token=token, conn=_lc)
+                except Exception:
+                    loc_names = load_location_names_from_db(_lc)
 
         def _loc(lid):
             if not lid:
@@ -474,7 +477,8 @@ async def prices_station_stream(request: Request, location_id: int):
     token = get_active_token(request, conn)
     ensure_price_table(conn)
     try:
-        region_id = await get_region_for_location(conn, location_id, token)
+        with _connect() as _lc:
+            region_id = await get_region_for_location(_lc, location_id, token)
     except Exception:
         region_id = None
 
@@ -543,7 +547,8 @@ async def api_station_volume(request: Request):
     # Region of this location — returned so the price-history chart can offer
     # "custom station" (history is region-wide; ESI has no per-structure history).
     try:
-        region_id = await get_region_for_location(conn, location_id, token)
+        with _connect() as _lc:
+            region_id = await get_region_for_location(_lc, location_id, token)
     except Exception:
         region_id = None
 

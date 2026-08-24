@@ -13,7 +13,7 @@ from fastapi import APIRouter, Form, Request
 
 from sqlalchemy import text
 
-from app.db.conn import connect, dbapi
+from app.db.conn import connect
 from app.esi.client import esi_client
 from app.market.prices import (
     ensure_price_table,
@@ -27,6 +27,7 @@ from app.web.deps import (
     get_active_character,
     get_active_token,
     get_conn,
+    ensure_schema,
 )
 from app.web.industry_helper import (
     get_rig_types,
@@ -37,7 +38,6 @@ from app.web.industry_helper import (
     save_station_rigs_full,
 )
 from app.web.location_resolver import (
-    ensure_location_name_table,
     get_region_for_location,
     get_security_status,
     load_location_names_from_db,
@@ -46,6 +46,35 @@ from app.web.location_resolver import (
 )
 
 router = APIRouter()
+
+
+# ── cache access from an unconverted router ──────────────────────────────────
+# `location_resolver` is on the portable query layer; this router still holds a
+# raw sqlite3 handle from `get_conn()`. Each of these opens its own engine
+# connection and closes it immediately. They exist as helpers rather than inline
+# `with` blocks because `suggest_station` touches the cache six times across a
+# 140-line body, and wrapping it would reindent a handler this change has no
+# other reason to touch.
+
+async def _resolve_names(ids, token):
+    with connect() as c:
+        return await resolve_station_names_bulk(ids, token=token, conn=c)
+
+
+def _names_from_db() -> dict[int, str]:
+    with connect() as c:
+        return load_location_names_from_db(c)
+
+
+def _locations_in_system(solar_system_id: int) -> list[dict]:
+    with connect() as c:
+        return locations_in_system(c, solar_system_id)
+
+
+async def _region_for(location_id: int, token: str | None) -> int | None:
+    with connect() as c:
+        return await get_region_for_location(c, location_id, token)
+
 
 
 @router.get("/api/station-industry-info")
@@ -69,10 +98,7 @@ async def station_industry_info(request: Request, location_id: int):
             rxn_sci = await get_sci_for_system(conn, solar_system_id, "reaction")
             # Pre-fetch security_status into the cache so the synchronous helper
             # get_station_me_bonus_pct can scale rig bonuses correctly (×1.0 / ×1.9 / ×2.1).
-            # location_resolver is not converted yet, so it gets the driver
-            # connection — the same one underneath, so the write it commits is
-            # visible to the reads below.
-            security_status = await get_security_status(dbapi(conn), solar_system_id)
+            security_status = await get_security_status(conn, solar_system_id)
 
         # We can't read facility tax exactly from ESI (deriving it from the job average was inaccurate).
         # The user enters it manually and can save the value as a default (localStorage).
@@ -128,7 +154,7 @@ async def suggest_station(request: Request, q: str = ""):
         return {"owned": [], "other": []}
 
     conn = get_conn()
-    ensure_location_name_table(conn)
+    ensure_schema(conn)
     char = get_active_character(request, conn)
     token = get_active_token(request, conn)
     pattern = q.strip().lower()
@@ -141,7 +167,7 @@ async def suggest_station(request: Request, q: str = ""):
             if not a.get("is_singleton", False):
                 asset_locs.add(a["location_id"])
 
-    all_names = load_location_names_from_db(conn)
+    all_names = _names_from_db()
     cache_empty = len(all_names) == 0
 
     # Stations with assets — filter by name
@@ -202,7 +228,7 @@ async def suggest_station(request: Request, q: str = ""):
                 npc_ids = station_search.json().get("station", [])[:20]
                 new_ids = [sid for sid in npc_ids if sid not in all_names]
                 if new_ids:
-                    new_names = await resolve_station_names_bulk(new_ids, token=None, conn=conn)
+                    new_names = await _resolve_names(new_ids, None)
                     all_names.update(new_names)
                 for sid in npc_ids:
                     if sid in asset_locs and sid not in owned_ids:
@@ -218,7 +244,7 @@ async def suggest_station(request: Request, q: str = ""):
                 struct_ids = structure_search.json().get("structure", [])[:20]
                 new_struct_ids = [sid for sid in struct_ids if sid not in all_names]
                 if new_struct_ids:
-                    new_names = await resolve_station_names_bulk(new_struct_ids, token=token, conn=conn)
+                    new_names = await _resolve_names(new_struct_ids, token)
                     all_names.update(new_names)
                 for sid in struct_ids:
                     if sid in asset_locs and sid not in owned_ids:
@@ -234,7 +260,7 @@ async def suggest_station(request: Request, q: str = ""):
                 system_ids = system_search.json().get("solar_system", [])
 
             for sys_id in system_ids[:10]:
-                for entry in locations_in_system(conn, sys_id):
+                for entry in _locations_in_system(sys_id):
                     lid = entry["location_id"]
                     if lid in asset_locs and lid not in owned_ids:
                         owned.append(entry)
@@ -259,7 +285,7 @@ async def suggest_station(request: Request, q: str = ""):
                         new_npc.extend(sys_r.json().get("stations", []))
                 new_npc_ids = [sid for sid in new_npc if sid not in all_names]
                 if new_npc_ids:
-                    new_names = await resolve_station_names_bulk(new_npc_ids, token=None, conn=conn)
+                    new_names = await _resolve_names(new_npc_ids, None)
                     all_names.update(new_names)
                 for sid in new_npc:
                     if sid not in asset_locs and sid not in other_ids:
@@ -285,7 +311,7 @@ async def add_station(request: Request, raw: str = Form(...)):
     """
     import re
     conn = get_conn()
-    ensure_location_name_table(conn)
+    ensure_schema(conn)
     token = get_active_token(request, conn)
 
     raw = raw.strip()
@@ -352,7 +378,7 @@ async def location_rename(request: Request):
     if not name:
         return {"ok": False, "error": "Empty name"}
     conn = get_conn()
-    ensure_location_name_table(conn)
+    ensure_schema(conn)
     conn.execute(
         "INSERT INTO location_name_cache (location_id, name) VALUES (?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name",
         (location_id, name),
@@ -378,7 +404,7 @@ async def location_resolve(request: Request, location_id: int):
         name, sys_id = await resolve_station_name(client, location_id, token)
     resolved = name != str(location_id) and not name.startswith("[")
     if resolved:
-        ensure_location_name_table(conn)
+        ensure_schema(conn)
         conn.execute(
             "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
             (location_id, name, sys_id),
@@ -397,7 +423,7 @@ async def my_location(request: Request):
     if not token or not char:
         conn.close()
         return {"error": "Not signed in"}
-    ensure_location_name_table(conn)
+    ensure_schema(conn)
 
     try:
         async with esi_client() as client:
@@ -473,7 +499,7 @@ async def fetch_plan_sell_price(request: Request, location_id: int, type_id: int
     )
     conn.commit()
 
-    region_id = await get_region_for_location(conn, location_id, token)
+    region_id = await _region_for(location_id, token)
 
     try:
         if location_id >= 1_000_000_000:
@@ -505,7 +531,7 @@ async def api_plan_contract_price(request: Request, location_id: int, type_id: i
     conn = get_conn()
     try:
         token = get_active_token(request, conn)
-        region_id = await get_region_for_location(conn, location_id, token)
+        region_id = await _region_for(location_id, token)
         if not region_id:
             return {"ok": False, "error": "Could not determine the station's region."}
         status = contracts_helper.get_index_status(conn, region_id)

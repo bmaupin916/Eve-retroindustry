@@ -5,10 +5,10 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.57. **836 tests green, 2 skipped** — and
-  neither skip is a backend failure: one is POSIX file modes on Windows, the
-  other is `test_the_computed_percentage_stacks_multiplicatively`, which is
-  marked `sqlite_only` because it crosses into `location_resolver`.
+* Branch `docs/hosted-v2-design`, v0.9.58. **893 tests green, 1 skipped** — and
+  the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
+  marker is gone: `location_resolver` converted, so the test that named it as
+  the blocker now runs on both backends.
   Postgres 17 is run routinely now: the schema builds, all ten migrations reach
   head on it, and every cross-backend file runs both halves. The
   first run did fail once, correctly: `test_only_our_own_ids_are_generated`
@@ -29,12 +29,12 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 * Step 4 is **8 of 8 items in outline**, with one of them part-finished. The
   cache-only conversion is **done** (v0.9.55). What is left is the query
   conversion: `projects`, `industry` and `app_defaults` are converted, and
-  `industry_helper` is converted too (v0.9.56). Still to go:
-  `location_resolver`, `app/character/*`, `media`, `contracts`, `characters`,
+  `industry_helper` (v0.9.56) and `location_resolver` (v0.9.58) are converted
+  too. Still to go: `app/character/*`, `media`, `contracts`, `characters`,
   `planets`, `locations`, `prices`, `assets` and `plan`, plus `deps.py`,
   `main.py` and `app/db/schema.py` at the end.
-  `grep -rn "dbapi(" app/` is the live measure and stands at **5** — see the
-  note below on why it went up.
+  `grep -rn "dbapi(" app/` is the live measure and stands at **1** — a single
+  crossing in `routers/industry.py`, pointing at `app/character/*`.
 
 To bring the Postgres tests back:
 
@@ -80,12 +80,12 @@ process, each sees the other's committed writes
 its own, and what is left at the end is deleting `get_conn()` once nothing
 calls it.
 
-Order — `projects`, `industry`, `app_defaults` and `industry_helper` are
-**done**; `industry` is the better worked example, because it hit the cases
-`projects` did not. Remaining: **`location_resolver` next** — all five standing
-`dbapi()` boundaries point at it — then `app/character/*`, `media`, `contracts`,
-`characters`, `planets`, `locations`, `prices`, `assets`, `plan`, and finally
-`deps.py`, `main.py` and `app/db/schema.py` itself.
+Order — `projects`, `industry`, `app_defaults`, `industry_helper` and
+`location_resolver` are **done**; `industry` is the better worked example,
+because it hit the cases `projects` did not. Remaining: **`app/character/*`
+next** — the one remaining `dbapi()` boundary points at it — then `media`,
+`contracts`, `characters`, `planets`, `locations`, `prices`, `assets`, `plan`,
+and finally `deps.py`, `main.py` and `app/db/schema.py` itself.
 
 ~~**`industry_helper` is next**~~ — **done in v0.9.56**, on the same "convert
 what is underneath" rule that put `app_defaults` before the routers. Three of
@@ -365,22 +365,27 @@ work, not a move, and the event model has to be decided before it is written.
 ~~Run `projects` against Postgres~~, ~~sign in~~ and ~~the sync-health page~~ are
 all **done**. What that left is below.
 
-1. **Pick up the conversion.** `location_resolver` next — **all five** standing
-   `dbapi()` boundaries now point at it, three from inside `industry_helper`
-   itself and one each from `routers/industry.py` and `routers/locations.py`.
-   `grep -rn "dbapi(" app/` is the live list.
+1. **Pick up the conversion.** `app/character/*` next — the **one** remaining
+   `dbapi()` boundary points at it, in `routers/industry.py:64`, where
+   `list_characters(raw)` is the only thing still needing the driver handle.
+   `grep -rn "dbapi(" app/` is the live list and it is down to that single line.
 
-   It has ~40 call sites across seven routers that are not converted, so each of
-   those has to open its own `connect()`. That is the cost that made it the
-   wrong module to do *first*; it is the right one to do next, because nothing
-   else can drop a boundary until it moves.
+   `app/character/*` is also what `token_store` sits behind, so read
+   `tests/conftest.py` first: this is the area where a test writing to the real
+   database cost three characters and their refresh tokens.
 
-   **There is a ready-made definition of done.**
-   `test_the_computed_percentage_stacks_multiplicatively` in
-   `tests/test_industry_helper_on_postgres.py` is marked `sqlite_only` purely
-   because a station with rigs fitted sends it through
-   `get_station_security_multiplier`. Delete the marker; it should pass on both
-   backends. If it does not, `location_resolver` is not finished.
+   **Run the coverage probe before writing anything.** Twenty lines — wrap every
+   function the module defines, run the whole suite, print the ones with a count
+   of zero. It found seven untested functions in `industry_helper` and four in
+   `location_resolver`, both times including writers, and both times the grep for
+   the same names in `tests/` gave a different and wrong answer. The one caveat
+   that decides whether it tells the truth is in the note further down: it has to
+   rebind the wrappers into modules that already did `from … import X`.
+
+   **Leave a `sqlite_only` marker if this slice ends with a known edge.** That is
+   how v0.9.56 handed `location_resolver` to v0.9.58, and it worked better than
+   the paragraph beside it — see "A marker that names the next slice" below. The
+   marker is still registered in `pytest.ini` with nothing using it, deliberately.
 
    **Nothing is blocked any more.** `industry_helper` was deferred through
    v0.9.49–0.9.53 only because it has ~26 call sites inside
@@ -734,3 +739,60 @@ the market volume columns, which were not ids at all, and that one column named
 specification is telling you the worst case and the measurement is telling you
 the problem.** Design for the worst case where it is free; act on the
 measurement where it is not.
+
+
+## The boundary count came back down: 5 → 1
+
+`location_resolver` landed in v0.9.58 and every crossing it was holding open
+went with it — three from inside `industry_helper`, one from
+`routers/locations.py`, one from `routers/industry.py`. What is left is a single
+`dbapi()` in `routers/industry.py:64`, and it points at `app/character/*`.
+
+The prediction from v0.9.56 held: the number rising then was the boundary moving
+*down* a level rather than nothing happening, and a module that collects
+boundaries is a module whose conversion pays for several at once.
+
+**The cost landed where it was predicted to.** Nine caller files, ~39 call
+sites. `locations.py` got four small helpers rather than inline `with` blocks,
+because `suggest_station` touches the cache six times across a 140-line body and
+wrapping it would have reindented a handler this change had no other reason to
+touch — which is how a mechanical diff becomes an unreviewable one.
+
+## A marker that names the next slice beats a paragraph that describes it
+
+v0.9.56 left exactly one test marked `sqlite_only`, on
+`test_the_computed_percentage_stacks_multiplicatively`, because a station with
+rigs fitted routed through `get_station_security_multiplier` and that still
+spoke `?`. The marker *was* the definition of done for this slice: delete it, and
+if it passes on both backends the module is finished.
+
+It worked better than the worklist paragraph next to it. A paragraph goes stale
+silently; the marker is executable, sits in the file the next person is already
+reading, and fails the moment the claim behind it stops being true. Worth
+repeating: when a slice leaves a known edge, mark the test that sits on it rather
+than only writing it down here.
+
+The marker itself stays registered in `pytest.ini` with nothing using it. That is
+deliberate — the next module will want it.
+
+## Blanket exemptions in a scanner hide the thing the scanner is for
+
+Converting `location_resolver` tripped `test_no_insert_or_replace_survives`, on a
+**docstring** that explained why `INSERT OR REPLACE` had been removed. Not a use
+of it.
+
+The scan had met this twice before and patched around it twice: once with a
+"line starts with `#`" check, once by skipping the whole of `app/db/schema.py`
+because it "documents it in a docstring". The second of those is the expensive
+kind of fix — it exempted an entire module, so a real offender anywhere in the
+schema file would have gone unreported for as long as the exemption stood.
+
+Replaced with the precise version: blank out docstring bodies via the AST
+(keeping line numbers), scan everything else, and drop the whole-file skip.
+Verified rather than assumed — planting a real `INSERT OR REPLACE` in
+`location_resolver.py` **and** in `schema.py` is caught in both, and prose
+mentioning it is not.
+
+**The general form:** when a check produces a false positive for the third time,
+the fix is to make the check understand the distinction, not to add a third
+exemption. And an exemption scoped to a whole file is a hole, not a tuning.

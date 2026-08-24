@@ -82,7 +82,6 @@ from app.web.prices_helper import (
 )
 from app.web.location_resolver import (
     resolve_station_names_bulk,
-    ensure_location_name_table,
     load_location_names_from_db,
     locations_in_system,
     get_region_for_location,
@@ -116,6 +115,7 @@ from app.character.skills import (
     get_mfg_skill_ids,
 )
 from app.db import conn as db_conn
+from app.db.conn import connect as _connect
 from app.db.migrate import upgrade_to_head
 from app.db.schema import create_sde_schema
 from app.sync import worker as sync_worker
@@ -299,7 +299,6 @@ async def _startup_populate_groups():
         if _SDE_READY[0]:
             # industry_helper is on the portable query layer now, so it gets an
             # engine connection rather than this startup's raw handle.
-            from app.db.conn import connect as _connect
             with _connect() as _ic:
                 populate_rig_bonuses(_ic)
             await _ensure_groups_populated(conn)
@@ -602,7 +601,9 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
         if _dock_ids:
             _any_tok = next((t for t in tokens.values() if t), None)
             try:
-                dock_names = await resolve_station_names_bulk(list(_dock_ids), token=_any_tok, conn=conn)
+                with _connect() as _lc:
+                    dock_names = await resolve_station_names_bulk(
+                        list(_dock_ids), token=_any_tok, conn=_lc)
             except Exception:
                 dock_names = {}
         if _sys_ids:

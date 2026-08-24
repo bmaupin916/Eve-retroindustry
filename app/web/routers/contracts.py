@@ -23,6 +23,7 @@ from app.web.deps import (
     get_active_character_id,
     get_conn,
 )
+from app.db.conn import connect as _connect
 from app.web.location_resolver import (
     load_location_names_from_db,
     resolve_station_names_bulk,
@@ -81,10 +82,12 @@ async def _finalize_contracts(conn, raw: list[dict], token: str | None) -> list[
     party_names = await _resolve_party_names(party_ids) if party_ids else {}
     loc_names: dict[int, str] = {}
     if loc_ids:
-        try:
-            loc_names = await resolve_station_names_bulk(list(loc_ids), token=token, conn=conn)
-        except Exception:
-            loc_names = load_location_names_from_db(conn)
+        with _connect() as _lc:
+            try:
+                loc_names = await resolve_station_names_bulk(
+                    list(loc_ids), token=token, conn=_lc)
+            except Exception:
+                loc_names = load_location_names_from_db(_lc)
     return _decorate_contracts(raw, party_names, loc_names)
 
 
@@ -336,10 +339,12 @@ async def public_contracts_page(request: Request, region: str = "", item: str = 
                 tokens = await asyncio.gather(
                     *[_valid_token_async(cid) for cid, _ in list_characters(conn)])
                 any_tok = next((t for t in tokens if t), None)
-                try:
-                    loc_names = await resolve_station_names_bulk(list(loc_ids), token=any_tok, conn=conn)
-                except Exception:
-                    loc_names = load_location_names_from_db(conn)
+                with _connect() as _lc:
+                    try:
+                        loc_names = await resolve_station_names_bulk(
+                            list(loc_ids), token=any_tok, conn=_lc)
+                    except Exception:
+                        loc_names = load_location_names_from_db(_lc)
             for c in results:
                 c["type_label"] = contracts_api.type_label(c["type"])
                 c["issuer_name"] = party_names.get(c["issuer_id"], str(c["issuer_id"] or ""))
