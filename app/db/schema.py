@@ -72,7 +72,7 @@ metadata = MetaData()
 
 characters = Table(
     "characters", metadata,
-    Column("character_id", Integer, primary_key=True, autoincrement=False),
+    Column("character_id", BigInteger, primary_key=True, autoincrement=False),
     Column("character_name", Text, nullable=False),
     # Refresh tokens are bound to the client ID that issued them: change
     # EVE_CLIENT_ID and every row here becomes unusable, which is why the
@@ -80,7 +80,7 @@ characters = Table(
     Column("refresh_token", Text, nullable=False),
     Column("access_token", Text),
     Column("token_expires_at", Float),
-    Column("corporation_id", Integer),
+    Column("corporation_id", BigInteger),
     Column("last_sync_at", Float),
     Column("added_at", Float, nullable=False),
 )
@@ -88,7 +88,7 @@ characters = Table(
 app_sessions = Table(
     "app_sessions", metadata,
     Column("session_id", Text, primary_key=True),
-    Column("character_id", Integer, nullable=False),
+    Column("character_id", BigInteger, nullable=False),
     Column("csrf_token", Text, nullable=False),
     Column("created_at", Float, nullable=False),
     Column("last_seen_at", Float, nullable=False),
@@ -98,7 +98,7 @@ app_owner = Table(
     "app_owner", metadata,
     # Single-row table: the first character to log in claims the instance.
     Column("id", Integer, primary_key=True, autoincrement=False),
-    Column("character_id", Integer, nullable=False),
+    Column("character_id", BigInteger, nullable=False),
     Column("claimed_at", Float, nullable=False),
     CheckConstraint("id = 1", name="ck_app_owner_single_row"),
 )
@@ -108,7 +108,7 @@ app_bootstrap = Table(
     # Single-use, ten-minute login links minted by `python -m app.web.bootstrap`
     # — the way back in when the SSO callback registration does not match.
     Column("token", Text, primary_key=True),
-    Column("character_id", Integer, nullable=False),
+    Column("character_id", BigInteger, nullable=False),
     Column("created_at", Float, nullable=False),
 )
 
@@ -130,21 +130,21 @@ app_defaults = Table(
 
 char_assets_cache = Table(
     "char_assets_cache", metadata,
-    Column("character_id", Integer, nullable=False),
+    Column("character_id", BigInteger, nullable=False),
     Column("data_json", Text, nullable=False),
     Column("cached_at", Float),
 )
 
 corp_assets_cache = Table(
     "corp_assets_cache", metadata,
-    Column("corporation_id", Integer, nullable=False),
+    Column("corporation_id", BigInteger, nullable=False),
     Column("data_json", Text, nullable=False),
     Column("cached_at", Float),
 )
 
 char_blueprints_cache = Table(
     "char_blueprints_cache", metadata,
-    Column("character_id", Integer, nullable=False),
+    Column("character_id", BigInteger, nullable=False),
     Column("data_json", Text, nullable=False),
     Column("cached_at", Float),
 )
@@ -160,7 +160,7 @@ char_jobs_cache = Table(
 
 char_skills_cache = Table(
     "char_skills_cache", metadata,
-    Column("character_id", Integer, primary_key=True, autoincrement=False),
+    Column("character_id", BigInteger, primary_key=True, autoincrement=False),
     Column("data_json", Text, nullable=False),
     Column("cached_at", Float, nullable=False),
 )
@@ -172,7 +172,7 @@ char_wallet_cache = Table(
     # any more. Balances stay here rather than moving into the ledger table
     # next to it: two places holding the same number is how they come to
     # disagree, and this one already has a second consumer.
-    Column("character_id", Integer, primary_key=True, autoincrement=False),
+    Column("character_id", BigInteger, primary_key=True, autoincrement=False),
     Column("balance", Float, nullable=False),
     Column("cached_at", Float, nullable=False),
 )
@@ -292,8 +292,8 @@ market_price_cache = Table(
     Column("cached_at", Float),
     # Both arrived as ALTER TABLE ADD COLUMN guarded by a PRAGMA probe. They
     # are ordinary columns of the baseline now.
-    Column("volume", Integer),
-    Column("jita_available", Integer),
+    Column("volume", BigInteger),
+    Column("jita_available", BigInteger),
 )
 
 custom_price_override = Table(
@@ -311,8 +311,8 @@ hub_price_cache = Table(
     Column("type_id", Integer, primary_key=True, autoincrement=False),
     Column("sell_price", Float),
     Column("buy_price", Float),
-    Column("volume", Integer),
-    Column("available", Integer),
+    Column("volume", BigInteger),
+    Column("available", BigInteger),
     Column("cached_at", Float),
 )
 
@@ -327,11 +327,11 @@ price_history_cache = Table(
 
 station_volume_cache = Table(
     "station_volume_cache", metadata,
-    Column("location_id", Integer, primary_key=True, autoincrement=False),
+    Column("location_id", BigInteger, primary_key=True, autoincrement=False),
     Column("type_id", Integer, primary_key=True, autoincrement=False),
-    Column("volume", Integer),
+    Column("volume", BigInteger),
     Column("best_sell", Float),
-    Column("traded_volume", Integer),
+    Column("traded_volume", BigInteger),
     Column("cached_at", Float),
 )
 
@@ -369,7 +369,7 @@ sci_cache = Table(
 
 facility_tax_cache = Table(
     "facility_tax_cache", metadata,
-    Column("facility_id", Integer, primary_key=True, autoincrement=False),
+    Column("facility_id", BigInteger, primary_key=True, autoincrement=False),
     Column("tax_rate", Float, nullable=False),
     Column("cached_at", BigInteger, nullable=False),
 )
@@ -409,7 +409,7 @@ rig_bonuses = Table(
 
 location_name_cache = Table(
     "location_name_cache", metadata,
-    Column("location_id", Integer, primary_key=True, autoincrement=False),
+    Column("location_id", BigInteger, primary_key=True, autoincrement=False),
     Column("name", Text, nullable=False),
     Column("solar_system_id", Integer),
     # `region_id` existed only as an ALTER — it was never in any CREATE TABLE,
@@ -440,7 +440,7 @@ route_jump_cache = Table(
 
 pi_extractor_cache = Table(
     "pi_extractor_cache", metadata,
-    Column("char_id", Integer, primary_key=True, autoincrement=False),
+    Column("char_id", BigInteger, primary_key=True, autoincrement=False),
     Column("planet_id", Integer, primary_key=True, autoincrement=False),
     Column("product_id", Integer, primary_key=True, autoincrement=False),
     Column("char_name", Text),
@@ -562,9 +562,9 @@ public_contracts = Table(
     Column("volume", Float),
     Column("date_expired", Text),
     Column("title", Text),
-    Column("start_location_id", Integer),
-    Column("end_location_id", Integer),
-    Column("issuer_id", Integer),
+    Column("start_location_id", BigInteger),
+    Column("end_location_id", BigInteger),
+    Column("issuer_id", BigInteger),
     Index("idx_pc_region", "region_id"),
 )
 

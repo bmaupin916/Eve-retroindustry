@@ -5,13 +5,12 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.56. **788 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.57. **836 tests green, 2 skipped** — and
   neither skip is a backend failure: one is POSIX file modes on Windows, the
   other is `test_the_computed_percentage_stacks_multiplicatively`, which is
   marked `sqlite_only` because it crosses into `location_resolver`.
-   Postgres 17 has
-  now been run: the schema builds, all three migrations reach head on it, and
-  the eight tests that had skipped through every previous commit all pass. The
+  Postgres 17 is run routinely now: the schema builds, all ten migrations reach
+  head on it, and every cross-backend file runs both halves. The
   first run did fail once, correctly: `test_only_our_own_ids_are_generated`
   whitelists the tables allowed to mint their own ids, and `sync_events` —
   added after that whitelist was written — belongs on it, because its id *is*
@@ -632,23 +631,57 @@ are the only things that can carry rigs at all — so on Postgres that table
 accepted NPC stations and rejected every station a player could actually
 configure.
 
-Fixed for that one column in migration 0009. **It is not the only one.** ESI
-declares character, corporation, location, item, order and contract ids as
-int64, and `app/db/schema.py` still declares these as `Integer`:
+Fixed for that one column in migration 0009, and for the other **23 in
+v0.9.57** (migration 0010). `tests/test_int64_columns_on_postgres.py` writes a
+real oversized value into each and reads it back, on both backends.
 
-* `location_id` — `location_name_cache`, `facility_tax_cache` (as `facility_id`)
-* `item_id` — `container_name_cache`
-* `contract_id`, `start_location_id`, `end_location_id` — the contract caches
-* `character_id`, `corporation_id` — across eight tables
+**The criterion had to change on contact.** The plan was "widen whatever ESI
+declares int64". Asking the live OpenAPI spec what CCP actually declares gives:
 
-`solar_system_id` and `planet_id` are genuinely small (3e7 and 4e7) and are
-fine. `character_id` is the uncomfortable one: current ids run to about 2.1e9
-against an INTEGER ceiling of 2147483647, so it is not a future problem.
+    location_id int64   character_id int64   type_id int64
+    contract_id int64   corporation_id int64  group_id int64
+    order_id    int64   item_id       int64   category_id int64
 
-Left as a separate item rather than swept into the conversion commit: each
-column needs deciding on its own, a widening `ALTER` on a live table is not
-something to do by pattern match, and the fix belongs with a test that proves
-the range rather than with a rewrite that happened to touch the file.
+— which is *everything*, `type_id` and `group_id` included. So the declared type
+cannot decide this; taken literally it means widening every column in the
+schema, which is the reflex the exercise was supposed to avoid. CCP declaring
+int64 means they have reserved the room, not that they are using it.
+
+What decides it is the range the values actually occupy, so that got measured —
+static ids from the SDE, live ids sampled from public ESI endpoints:
+
+| id | highest actually seen | against the int32 ceiling |
+|---|---|---|
+| `type_id` | 371,027 | 0.017 % |
+| `solar_system_id` | 30,030,141 | 1.4 % |
+| `contract_id` | 234,465,667 | 10.9 % |
+| `corporation_id` | 2,042,491,468 | **95.1 %** |
+| `character_id` | 2,124,549,094 | **98.9 %** |
+| `order_id` | 7,407,646,135 | **3.4x over** |
+| `location_id` (structure) | 1,049,982,731,184 | **489x over** |
+| `volume`, 7 days of Tritanium | 34,190,149,437 | **15.9x over** |
+
+Two things fell out of measuring that no amount of reading would have given:
+
+* **The market volume columns were the worst of it, and were not on the list at
+  all** — the list was about ids. `market_price_cache.volume` is seven days of
+  regional trade and `jita_available` is every Jita sell order's remaining units
+  summed; both are over the ceiling today for Tritanium, Pyerite and Mexallon,
+  which is most of what an industry tool prices.
+* **`margin_snapshot.item_id` must not be widened.** It is `margin_watchlist.id`
+  — our own autoincrement row number, not an EVE asset id. It is the one column
+  whose name would have got it swept in by a name-based pass.
+* **`character_id` is the only preventive one.** 2,124,549,094 still *fits*, so
+  a test writing a real id passes with or without the fix. The test writes
+  2,200,000,000 instead — the id of a character created a little way into the
+  future, near enough that ~23 million signups close the gap. That is stated in
+  the file rather than glossed, because a test that cannot fail is not evidence.
+
+Left alone, and the reasons are in migration 0010's docstring: `type_id`,
+`group_id`, `category_id`, `region_id`, `solar_system_id`, `planet_id`,
+`contract_id`, every `id` we mint ourselves, and the count columns. `quantity`
+is the one to re-check one day — ESI declares it int64 and an asset stack can
+hold billions of units — but nothing was measured over the ceiling.
 
 **The general lesson, which is the reusable part:** SQLite ignores the width in
 a column declaration and Postgres enforces it, so *every* integer column in this
@@ -675,3 +708,29 @@ Two artifacts, two separate claims, and each needs its own mutation:
 
 Before concluding a mutation proves an assertion is decorative, check that it
 changed the artifact the test actually reads.
+
+
+## A vendor's declared type is a ceiling, not a measurement
+
+The int64 sweep (v0.9.57) nearly went wrong in a way worth remembering, because
+the same shape will come up for every other "make it portable" question.
+
+The plan said: verify each column against ESI's declared type. That sounds like
+the rigorous option — go to the source of truth rather than guess. The source of
+truth answered "int64" for every integer field it has, `type_id` and `group_id`
+included, and following it literally would have widened the entire schema while
+feeling principled about it.
+
+A declared type says what the vendor has reserved the right to send. It says
+nothing about what they send. The question "does this column need 64 bits" is
+answered by the range the data occupies, and that has to be measured: the SDE
+for static ids, public ESI endpoints for live ones. Twenty minutes of sampling
+turned a schema-wide rewrite into 23 columns with a stated reason each, and
+turned up the two things reading could not have: that the worst offenders were
+the market volume columns, which were not ids at all, and that one column named
+`item_id` holds our own row number and had to be left alone.
+
+**When a specification and a measurement disagree about scope, the
+specification is telling you the worst case and the measurement is telling you
+the problem.** Design for the worst case where it is free; act on the
+measurement where it is not.

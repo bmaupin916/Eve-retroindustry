@@ -6,7 +6,7 @@ Lives here rather than in `app/web/main.py` because both `app/esi/client.py` and
 Bump APP_VERSION on every release; `main.py` re-exports it.
 """
 
-APP_VERSION = "0.9.56"
+APP_VERSION = "0.9.57"
 
 # Contact path CCP's best-practices guide asks every consumer of their services
 # to publish, so they can reach a human before they reach for a ban.
