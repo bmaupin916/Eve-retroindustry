@@ -37,8 +37,18 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
+from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy.exc import OperationalError
 
-from app.web.routers.assets import _ROUTE_CHUNK, load_route_jumps, save_route_jumps
+from app.web.routers.assets import (
+    _ROUTE_CHUNK,
+    ensure_route_jump_table,
+    load_route_jumps,
+    save_route_jumps,
+)
+from tests.test_postgres_schema import URL as PG_URL, _reachable
+
+PG_SCHEMA = "pytest_route_jumps"
 
 #: The lowest `SQLITE_LIMIT_VARIABLE_NUMBER` still in the wild — the default
 #: before SQLite 3.32. The build running these tests allows 32,766.
@@ -50,21 +60,61 @@ DODIXIE = 30002659
 RENS = 30002510
 
 
-@pytest.fixture
-def conn(tmp_path):
+@pytest.fixture(scope="module", params=["sqlite", "postgres"])
+def engine(request, tmp_path_factory):
+    """An engine per backend, built once for the module.
+
+    The row-value `IN` is the reason this file runs on both rather than one:
+    `(sys_a, sys_b) IN ((:a1, :b1), …)` is the only construct in the conversion
+    that is not a placeholder swap, and "SQLAlchemy expands tuples for it" is a
+    claim about two dialects, not one.
+    """
     from app.db.migrate import upgrade_to_head
 
-    path = tmp_path / "routes.db"
-    upgrade_to_head(f"sqlite:///{path}")
-    c = sqlite3.connect(str(path))
-    yield c
-    c.close()
+    if request.param == "sqlite":
+        url = f"sqlite:///{tmp_path_factory.mktemp('db') / 'routes.db'}"
+        upgrade_to_head(url)
+        eng = create_engine(url)
+        yield eng
+        eng.dispose()
+        return
+
+    if not _reachable(PG_URL):
+        pytest.skip(f"no Postgres at {PG_URL} — see tests/test_postgres_schema.py")
+
+    admin = create_engine(PG_URL)
+    with admin.connect() as c:
+        c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
+        c.execute(text(f"CREATE SCHEMA {PG_SCHEMA}"))
+        c.commit()
+    admin.dispose()
+
+    scoped = PG_URL + ("&" if "?" in PG_URL else "?") + \
+        f"options=-csearch_path%3D{PG_SCHEMA}"
+    upgrade_to_head(scoped)
+
+    eng = create_engine(scoped)
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture
+def conn(engine):
+    """A connection with an empty cache.
+
+    Emptied **before** rather than after, so a test that dies half-way cannot
+    leave its rows for the next one — one module-scoped schema serves them all.
+    """
+    with engine.connect() as c:
+        c.execute(text("DELETE FROM route_jump_cache"))
+        c.commit()
+        yield c
 
 
 def _rows(conn) -> list[tuple]:
-    return conn.execute(
+    return [tuple(r) for r in conn.execute(text(
         "SELECT sys_a, sys_b, jumps FROM route_jump_cache ORDER BY sys_a, sys_b"
-    ).fetchall()
+    )).fetchall()]
 
 
 # ── the round trip ───────────────────────────────────────────────────────────
@@ -169,18 +219,19 @@ def test_the_upsert_refreshes_the_jump_count(conn):
 
 
 def test_the_upsert_moves_the_timestamp_forward(conn):
-    save_route_jumps(conn, JITA, {AMARR: 9})
-    first = conn.execute("SELECT cached_at FROM route_jump_cache").fetchone()[0]
+    def _cached_at() -> float:
+        return conn.execute(text("SELECT cached_at FROM route_jump_cache")).fetchone()[0]
 
-    conn.execute("UPDATE route_jump_cache SET cached_at=?", (first - 3600,))
+    save_route_jumps(conn, JITA, {AMARR: 9})
+    first = _cached_at()
+
+    conn.execute(text("UPDATE route_jump_cache SET cached_at=:t"), {"t": first - 3600})
     conn.commit()
-    assert conn.execute("SELECT cached_at FROM route_jump_cache").fetchone()[0] == \
-        pytest.approx(first - 3600), "the backdate did not take"
+    assert _cached_at() == pytest.approx(first - 3600), "the backdate did not take"
 
     save_route_jumps(conn, JITA, {AMARR: 9})
 
-    assert conn.execute(
-        "SELECT cached_at FROM route_jump_cache").fetchone()[0] > first - 3600
+    assert _cached_at() > first - 3600
 
 
 # ── scoping: one origin's routes are not another's ───────────────────────────
@@ -253,7 +304,7 @@ def test_more_destinations_than_one_chunk(conn):
     assert got[dests[900]] == 900 % 40
 
 
-def test_the_chunking_is_what_keeps_the_query_under_the_parameter_cap(conn):
+def test_the_chunking_is_what_keeps_the_query_under_the_parameter_cap(tmp_path):
     """The test above passes with the chunking deleted, and that is not a gap
     in it — it is a fact about this build.
 
@@ -271,16 +322,60 @@ def test_the_chunking_is_what_keeps_the_query_under_the_parameter_cap(conn):
 
     Same shape as the assets container-name test: **when a test names a
     threshold, check the threshold is real.**
-    """
-    dests = list(range(31000000, 31000000 + 901))
-    save_route_jumps(conn, JITA, {d: 1 for d in dests})
 
-    was = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
-    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, OLD_SQLITE_VAR_CAP)
+    SQLite-only by nature, not by neglect: `setlimit` is a SQLite API, and the
+    cap it lowers is a SQLite compile-time setting. Postgres has its own limit
+    at 65,535 and no way to lower it for one connection, so there is nothing to
+    reproduce there — the chunk is under both caps and the other tests in this
+    file cover the query on that backend.
+
+    **It builds its own engine, and that is the whole reason it works.**
+
+    SQLite checks `SQLITE_LIMIT_VARIABLE_NUMBER` when it *prepares* a statement,
+    and prepared statements are cached — by SQLAlchemy's compiled cache on the
+    engine and by `sqlite3` on the connection. Sharing the module's engine meant
+    `test_more_destinations_than_one_chunk` had already run the identical SQL
+    with 1,802 parameters while the cap was still 32,766. Lowering the cap
+    afterwards changed nothing, because the statement was never prepared again.
+
+    The consequence was a test that passed with the chunking deleted whenever it
+    ran after its neighbour, and failed correctly only in isolation. It survived
+    a conversion battery telling me so, and the reason it took a battery to find
+    is that a green test and a blind test look the same.
+
+    A positive control is kept below and is deliberately the **same statement
+    shape** as the real query. The first control used a different SQL string,
+    which sailed through — it proved the cap had reached the connection, not
+    that it protected the statement under test. A control has to travel the same
+    path as the thing it is vouching for.
+    """
+    from app.db.migrate import upgrade_to_head
+
+    url = f"sqlite:///{tmp_path / 'cold.db'}"
+    upgrade_to_head(url)
+    cold = create_engine(url)
     try:
-        got = load_route_jumps(conn, JITA, dests)
+        with cold.connect() as conn:
+            dests = list(range(31000000, 31000000 + 901))
+            save_route_jumps(conn, JITA, {d: 1 for d in dests})
+
+            driver = conn.connection.driver_connection
+            driver.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, OLD_SQLITE_VAR_CAP)
+
+            # Positive control: the same row-value shape, one chunk too big.
+            # If this stops raising, the cap is not reaching the statement and
+            # the assertion below means nothing.
+            probe = text("SELECT sys_a, sys_b, jumps FROM route_jump_cache"
+                         " WHERE (sys_a, sys_b) IN :pairs").bindparams(
+                bindparam("pairs", expanding=True))
+            too_many = [(JITA, d) for d in dests]
+            with pytest.raises(OperationalError, match="too many SQL variables"):
+                conn.execute(probe, {"pairs": too_many})
+            conn.rollback()
+
+            got = load_route_jumps(conn, JITA, dests)
     finally:
-        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, was)
+        cold.dispose()
 
     assert len(got) == 901, (
         f"the query bound more than {OLD_SQLITE_VAR_CAP} parameters at once — "
@@ -296,22 +391,49 @@ def test_a_chunk_boundary_does_not_drop_the_last_pair(conn):
     assert len(load_route_jumps(conn, JITA, dests)) == _ROUTE_CHUNK
 
 
+# ── the schema shim ──────────────────────────────────────────────────────────
+
+def test_the_schema_shim_is_safe_on_every_backend(conn):
+    """`ensure_route_jump_table` is called on every `/api/assets/distances`.
+
+    It delegates to `ensure_schema`, which memoises what it has applied by
+    asking `PRAGMA database_list` which file it is looking at — a **syntax
+    error** on Postgres. So the dialect guard is not tidiness: without it this
+    endpoint raises on that backend, on every request, and the failure is in a
+    schema shim rather than anywhere near the query.
+
+    Running on both backends is the entire point of this test. On SQLite it
+    asserts the shim still does its job; on Postgres it asserts the guard
+    catches before the PRAGMA does.
+    """
+    ensure_route_jump_table(conn)
+
+    save_route_jumps(conn, JITA, {AMARR: 9})
+    assert load_route_jumps(conn, JITA, [AMARR]) == {AMARR: 9}, (
+        "the shim ran but the table it guarantees is not usable")
+
+
 # ── the writer's transaction boundary ────────────────────────────────────────
 
-def test_the_writer_commits(conn, tmp_path):
+def test_the_writer_commits(conn, engine):
     """Unlike most writers here, this one owns its boundary — its caller closes
     the connection immediately afterwards, so a commit left to the caller would
-    be a commit that never happened."""
+    be a commit that never happened.
+
+    Asserted from a **second connection**, which is what makes it a statement
+    about the commit rather than about this session: an uncommitted row is
+    perfectly visible to the connection that wrote it. Before the conversion
+    this opened a raw `sqlite3.connect` on the database file, which is not a
+    thing that exists on Postgres; a second connection from the same engine says
+    the same thing on both.
+    """
     save_route_jumps(conn, JITA, {AMARR: 9})
 
-    other = sqlite3.connect(str(tmp_path / "routes.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM route_jump_cache").fetchone()[0] == 1, (
+    with engine.connect() as other:
+        assert other.execute(text(
+            "SELECT COUNT(*) FROM route_jump_cache")).fetchone()[0] == 1, (
             "the writer did not commit, and `assets_distances` closes the "
             "connection on the next line")
-    finally:
-        other.close()
 
 
 def test_a_failed_lookup_is_never_stored(conn):

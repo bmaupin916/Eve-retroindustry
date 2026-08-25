@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.67. **1451 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.68. **1480 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -56,8 +56,14 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
   **The measure from here is the count of raw `?`-parameter statements**, and
   it has to be taken with an AST walk rather than a grep — see "Count
-  statements with an AST" below. **137** of them at v0.9.66, down from 145 at
-  v0.9.65; twelve files still hold a raw `get_conn()` handle.
+  statements with an AST" below. **129** of them at v0.9.68, down from 137 at
+  v0.9.66 and 145 at v0.9.65; **twelve** files still hold a raw `get_conn()`
+  handle — still twelve after v0.9.68, because `routers/assets.py` has zero raw
+  statements of its own and *still* opens one: `get_active_character`,
+  `get_active_token` and the `_load_*_from_cache` helpers in `deps.py` all take
+  a `sqlite3.Connection`. The two counts measure different things and only the
+  statement count moved. `deps.py` is what closes that gap, and it is deliberately
+  last.
 
 To bring the Postgres tests back:
 
@@ -1408,24 +1414,41 @@ for f in pathlib.Path("app").rglob("*.py"):
 which is where the `IN ({ph})` placeholder patterns live, and those are the ones
 that need an expanding bindparam rather than a mechanical rewrite.
 
-## Where the remaining statements are (145 at v0.9.65, 137 after v0.9.66)
+## Where the remaining statements are (145 at v0.9.65, 137 after v0.9.66, 129 after v0.9.68)
 
-| cluster | statements |
-| --- | --- |
-| `routers/plan.py` | 18 |
-| prices — `prices_helper`, `routers/prices`, `market/prices` | 39 |
-| PI — `routers/planets`, `pi_planner_helper` | 18 |
-| `main.py`, `deps.py` | 17 |
-| `routers/assets`, `routers/locations`, `contracts_helper` | 24 |
-| infrastructure — `bootstrap`, `security`, `schema`, `conn` | 19 |
-| the rest | 10 |
+Regenerated from the AST scan rather than edited by hand, because the previous
+version of this table had drifted from what the scan actually reported.
 
-**Take `deps.py` next, and not because it is biggest.** Three of the four
-conversions in this session tripped over *callers* rather than modules: dead
-`conn` parameters in `_finalize_contracts`, `_wallet_names`, `_decorate` and
-`_finalize_orders`, and the `/api/contracts/items` regression. `deps.py` is
-where `get_conn()` itself lives, so converting it forces those dead parameters
-out in one place instead of leaving them to be rediscovered router by router.
+| cluster | statements | files |
+| --- | --- | --- |
+| prices — `prices_helper` 15, `routers/prices` 13, `market/prices` 11 | 39 | 3 |
+| `routers/plan.py` | 18 | 1 |
+| PI — `routers/planets` 11, `pi_planner_helper` 7 | 18 | 2 |
+| `main.py` 9, `deps.py` 8 | 17 | 2 |
+| infrastructure — `security` 7, `bootstrap` 7, `conn` 4, `schema` 1 | 19 | 4 |
+| `routers/locations.py` | 8 | 1 |
+| the rest — `schematics` 4, `type_resolver` 2, `esi_oauth` 2, `routers/auth` 1, `planner` 1 | 10 | 5 |
+
+`routers/assets.py` and `contracts_helper.py` have left this table entirely.
+
+**`deps.py` is last, not next — this paragraph used to say the opposite.**
+
+The old advice was to take `deps.py` first, on the reasoning that it is
+underneath everything and converting it would force the dead `conn` parameters
+out in one place. That was overturned by counting: its three cache readers have
+**twelve call sites across five routers** that are still on `get_conn()`, so
+converting the readers first makes each of those routers open its own connection
+in code that is about to be re-touched anyway.
+
+The order that has actually worked, three units in, is **by router** — the
+router and whatever helper holds its SQL, together, with the readers coming
+along for free. `contracts_helper` + `routers/contracts` (v0.9.66) and
+`routers/assets` (v0.9.68) both went that way. `get_conn()` itself, with its 59
+call sites, is the closing act.
+
+Next by that rule: `routers/locations.py` (8), then PI — `routers/planets` and
+`pi_planner_helper` (18 between them) — then `routers/plan.py` (18), then the
+prices cluster (39 across three files, the largest single unit left).
 
 
 ## The route-jump chunk was twice the size it could be (v0.9.67)
@@ -1478,6 +1501,91 @@ an empty parameter list where `sqlite3.executemany` treats it as a no-op.
 **The conversion itself is not in this commit.** It is a behaviour change, so it
 goes in ahead of the mechanical rewrite with the test that proves it, the same
 way the `AttributeError` gap in `load_cached_blueprints` was left for its own.
+
+
+## routers/assets.py converted (v0.9.68)
+
+Eight statements to zero. Five of them had **no behavioural test at all**, so
+the work was mostly writing the net — `tests/test_assets_router_queries.py`, nine
+tests — and only then rewriting the SQL.
+
+**What the conversion actually risked.** Only one statement was not a
+placeholder swap: `WHERE (sys_a, sys_b) IN ((?,?), …)` is a row-value
+comparison, and it now goes through an expanding bindparam handed a list of
+*tuples*. SQLAlchemy renders `IN (VALUES (?, ?), …)` on SQLite — checked, not
+assumed, and `tests/test_route_jump_cache.py` now runs all of its assertions on
+both backends for exactly this reason.
+
+**The schema shim needed a dialect guard, and it is load-bearing.**
+`ensure_route_jump_table` delegates to `ensure_schema`, which memoises by asking
+`PRAGMA database_list` which file it is looking at — a syntax error on Postgres.
+Without the guard `/api/assets/distances` raises on that backend on every
+request, from a shim nowhere near the query. Removing the guard gives **1
+Postgres failure, 0 SQLite failures**, which is the shape a real portability fix
+has.
+
+**One prediction from the pre-conversion net came true.** `save_route_jumps`'
+`if not jumps: return` was redundant under `sqlite3`, whose `executemany`
+no-ops on an empty sequence, and is load-bearing now — SQLAlchemy raises
+`StatementError` on an empty parameter list. The docstring said so before the
+rewrite; the code comment records it after.
+
+### The chunking test was blind, and only the battery said so
+
+The most useful thing this conversion produced is a test that had stopped
+detecting anything.
+
+**SQLite checks `SQLITE_LIMIT_VARIABLE_NUMBER` when it *prepares* a statement,
+and prepared statements are cached** — by SQLAlchemy's compiled cache on the
+engine and by `sqlite3` on the connection. The chunking test shared the module
+engine with `test_more_destinations_than_one_chunk`, which runs earlier and
+executes the identical SQL with 1,802 parameters while the cap is still 32,766.
+Lowering the cap afterwards changed nothing: the statement was never prepared
+again.
+
+So it passed with the chunking deleted whenever it ran after its neighbour, and
+failed correctly only in isolation. Order-dependent and blind, and a blind test
+is indistinguishable from a passing one.
+
+Two mistakes on the way there, both worth keeping:
+
+* **The first positive control was itself vacuous.** It used a *different* SQL
+  string, never prepared before, so it raised happily — proving the cap had
+  reached the connection, not that it protected the statement under test. A
+  control has to travel the same path as the thing it vouches for. The control
+  is now the same row-value shape as the real query.
+* **The probe that was meant to settle whether two mutations were observable
+  reported "OUTPUT DIFFERS" for both** — because the CSRF token is minted per
+  render, 123 characters of noise. Normalised out, both renders were
+  byte-identical. Fourth instance this session of a selector reporting something
+  other than what it was assumed to.
+
+The fix is a **cold engine**: the test builds its own database so nothing has
+pre-prepared the statement, and it is no longer parametrised, being a SQLite
+API test by nature.
+
+### Two statements are not load-bearing, and are recorded as such
+
+Mutation testing said so and a rendering probe confirmed it with byte-identical
+HTML:
+
+* The reaction query's `blueprint_type_id IN (…)` is a **size** filter.
+  `reaction_bp_types` is only ever asked about ids that came from
+  `all_bp_type_ids`, so a superset cannot change a badge.
+* The page's `WHERE solar_system_id IS NOT NULL` is redundant, because
+  `sys_map.get(sid)` returns `None` for a missing key and for a `None` value
+  alike. **The same SELECT in `assets_distances` is essential** — there the
+  values become route destinations. One statement, two call sites, redundant in
+  one and load-bearing in the other.
+
+A third of the same shape survives in the conversion battery: `sde_types … IN`
+returning every type still resolves the right names.
+
+**A test of mine was deleted rather than repaired.** It opened its own
+connection, ran its own copy of the SELECT, and asserted on that — it would have
+passed with `assets.py` deleted. What it tested was SQLite.
+
+Batteries: 15/17 before the conversion, 19/20 after, survivors as above.
 
 
 ## contracts_helper and routers/contracts converted (v0.9.66)

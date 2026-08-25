@@ -12,10 +12,12 @@ only caller.
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import time as _time
 
 import httpx
+
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
@@ -43,7 +45,7 @@ from app.web.deps import (
     get_active_token,
     get_conn,
 )
-from app.db.conn import connect as _connect
+from app.db.conn import connect as _connect, dbapi
 from app.web.location_resolver import resolve_station_names_bulk
 from app.web.prices_helper import get_prices_for_ids
 
@@ -158,14 +160,16 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
         # — so we can badge them "RXN" instead of "BPO".
         reaction_bp_types: set[int] = set()
         if all_bp_type_ids:
-            _ph_r = ",".join("?" * len(all_bp_type_ids))
-            reaction_bp_types = {
-                r[0] for r in conn.execute(
-                    f"SELECT blueprint_type_id FROM sde_blueprints "
-                    f"WHERE reaction_time > 0 AND blueprint_type_id IN ({_ph_r})",
-                    list(all_bp_type_ids),
-                ).fetchall()
-            }
+            with _connect() as _rc:
+                reaction_bp_types = {
+                    r[0] for r in _rc.execute(
+                        text("SELECT blueprint_type_id FROM sde_blueprints"
+                             " WHERE reaction_time > 0"
+                             " AND blueprint_type_id IN :ids")
+                        .bindparams(bindparam("ids", expanding=True)),
+                        {"ids": list(all_bp_type_ids)},
+                    ).fetchall()
+                }
 
         def _bp_kind(a, is_copy: bool) -> str | None:
             """Badge kind for a blueprint asset: bpc / bpo / rxn (or None)."""
@@ -379,9 +383,10 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
         with _connect() as _lc:
             loc_names = await resolve_station_names_bulk(all_loc_ids, token, _lc)
 
-        sys_rows = conn.execute(
-            "SELECT location_id, solar_system_id FROM location_name_cache WHERE solar_system_id IS NOT NULL"
-        ).fetchall()
+        with _connect() as _sc:
+            sys_rows = _sc.execute(text(
+                "SELECT location_id, solar_system_id FROM location_name_cache"
+                " WHERE solar_system_id IS NOT NULL")).fetchall()
         sys_map = {r[0]: r[1] for r in sys_rows}
 
         # ── Build personal stations ──────────────────────────────────────────
@@ -621,9 +626,10 @@ async def assets_distances(request: Request):
         conn.close()
         return {"ok": False, "error": "Character is not in a solar system"}
 
-    rows = conn.execute(
-        "SELECT location_id, solar_system_id FROM location_name_cache WHERE solar_system_id IS NOT NULL"
-    ).fetchall()
+    with _connect() as _sc:
+        rows = _sc.execute(text(
+            "SELECT location_id, solar_system_id FROM location_name_cache"
+            " WHERE solar_system_id IS NOT NULL")).fetchall()
     loc_to_sys = {row[0]: row[1] for row in rows}
 
     # Deduplicate systems — one ESI call per unique destination
@@ -634,8 +640,12 @@ async def assets_distances(request: Request):
     # call per unique destination system (482 on this account) EVERY time it ran.
     # The pair is stored normalised (low, high) because the gate network is
     # undirected — the shortest path is the same in both directions.
-    ensure_route_jump_table(conn)
-    cached_jumps = load_route_jumps(conn, origin_sys, unique_sys)
+    # Two short-lived connections rather than one held open, because the ESI
+    # fan-out below sits between them: a pooled connection parked across that
+    # await is one no other request can have while the network is slow.
+    with _connect() as _rc:
+        ensure_route_jump_table(_rc)
+        cached_jumps = load_route_jumps(_rc, origin_sys, unique_sys)
     todo = [s for s in unique_sys if s not in cached_jumps and s != origin_sys]
 
     async def _jumps(client: httpx.AsyncClient, dest: int) -> int:
@@ -658,7 +668,8 @@ async def assets_distances(request: Request):
         sys_jumps.update(fresh)
         # Only persist real answers; -1 means the lookup failed (transient) or the
         # systems aren't connected, and we must be able to retry that.
-        save_route_jumps(conn, origin_sys, {s: j for s, j in fresh.items() if j >= 0})
+        with _connect() as _rc:
+            save_route_jumps(_rc, origin_sys, {s: j for s, j in fresh.items() if j >= 0})
     conn.close()
 
     distances = {loc_id: sys_jumps.get(sys_id, -1) for loc_id, sys_id in loc_to_sys.items()}
@@ -695,12 +706,12 @@ async def _resolve_corp_container_names(
     type_id_set = {asset_map[cid]["type_id"] for cid in container_ids if cid in asset_map}
     type_names: dict[int, str] = {}
     if type_id_set:
-        conn_local = get_conn()
-        ph = ",".join("?" * len(type_id_set))
-        rows = conn_local.execute(
-            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})", list(type_id_set)
-        ).fetchall()
-        conn_local.close()
+        with _connect() as _tc:
+            rows = _tc.execute(
+                text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": list(type_id_set)},
+            ).fetchall()
         type_names = {r[0]: r[1] for r in rows}
 
     for cid in container_ids:
@@ -913,12 +924,12 @@ async def _resolve_container_names(
     type_id_set = {asset_map[cid]["type_id"] for cid in container_ids if cid in asset_map}
     type_names: dict[int, str] = {}
     if type_id_set:
-        conn_local = get_conn()
-        ph = ",".join("?" * len(type_id_set))
-        rows = conn_local.execute(
-            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})", list(type_id_set)
-        ).fetchall()
-        conn_local.close()
+        with _connect() as _tc:
+            rows = _tc.execute(
+                text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": list(type_id_set)},
+            ).fetchall()
         type_names = {r[0]: r[1] for r in rows}
 
     for cid in container_ids:
@@ -980,12 +991,15 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
         names = await resolve_names_bulk(conn, list(all_unique_type_ids), None)
 
         if all_unique_type_ids:
-            ph = ",".join("?" * len(all_unique_type_ids))
-            prod_rows = conn.execute(
-                f"SELECT blueprint_type_id, product_type_id FROM sde_blueprint_products"
-                f" WHERE blueprint_type_id IN ({ph}) AND activity IN ('manufacturing','reaction')",
-                list(all_unique_type_ids),
-            ).fetchall()
+            with _connect() as _pc:
+                prod_rows = _pc.execute(
+                    text("SELECT blueprint_type_id, product_type_id"
+                         " FROM sde_blueprint_products"
+                         " WHERE blueprint_type_id IN :ids"
+                         " AND activity IN ('manufacturing','reaction')")
+                    .bindparams(bindparam("ids", expanding=True)),
+                    {"ids": list(all_unique_type_ids)},
+                ).fetchall()
             product_type_map = {r[0]: r[1] for r in prod_rows}
         else:
             product_type_map = {}
@@ -1110,9 +1124,20 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
 # permanently. Pairs are stored normalised (low, high): the gate network is
 # undirected, so the shortest path is the same both ways and one row serves both.
 
-def ensure_route_jump_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_route_jump_table(conn: Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists.
+
+    **Guarded on the dialect, and the guard is not cosmetic.** `ensure_schema`
+    memoises what it has already applied by asking `PRAGMA database_list` which
+    file it is looking at, and that is a syntax error on Postgres — so calling
+    it there fails rather than doing nothing. There is also nothing for it to
+    do: `route_jump_cache` is in the migration history, so on any backend built
+    by `upgrade_to_head` the table already exists. This shim only covers the
+    SQLite database that predates that history.
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(dbapi(conn))
 
 
 # The variable cap is a *compile-time* setting: 999 before SQLite 3.32, 32,766 on
@@ -1124,31 +1149,49 @@ def ensure_route_jump_table(conn: sqlite3.Connection) -> None:
 _ROUTE_CHUNK = 450          # destinations, not parameters — see above
 
 
-def load_route_jumps(conn: sqlite3.Connection, origin: int, dests: list[int]) -> dict[int, int]:
-    """Cached jump counts from `origin` to each of `dests` ({dest: jumps})."""
+def load_route_jumps(conn: Connection, origin: int, dests: list[int]) -> dict[int, int]:
+    """Cached jump counts from `origin` to each of `dests` ({dest: jumps}).
+
+    The `IN` is a **row-value** comparison over the normalised pair, which is
+    the one construct here that is not a mechanical rewrite: the expanding
+    bindparam is handed a list of *tuples* and renders `(:a1, :b1), (:a2, :b2)`.
+    Checked on both backends before this was written rather than assumed.
+    """
     if not dests:
         return {}
     out: dict[int, int] = {}
     for chunk_start in range(0, len(dests), _ROUTE_CHUNK):
         chunk = dests[chunk_start:chunk_start + _ROUTE_CHUNK]
         pairs = [(min(origin, d), max(origin, d)) for d in chunk]
-        ph = ",".join("(?,?)" * 1 for _ in pairs)
-        flat: list[int] = [v for pair in pairs for v in pair]
         rows = conn.execute(
-            f"SELECT sys_a, sys_b, jumps FROM route_jump_cache "
-            f"WHERE (sys_a, sys_b) IN ({ph})", flat
+            text("SELECT sys_a, sys_b, jumps FROM route_jump_cache"
+                 " WHERE (sys_a, sys_b) IN :pairs")
+            .bindparams(bindparam("pairs", expanding=True)),
+            {"pairs": pairs},
         ).fetchall()
         for a, b, j in rows:
             out[b if a == origin else a] = j
     return out
 
 
-def save_route_jumps(conn: sqlite3.Connection, origin: int, jumps: dict[int, int]) -> None:
+def save_route_jumps(conn: Connection, origin: int, jumps: dict[int, int]) -> None:
+    """Upsert the normalised pairs. Commits — see `test_the_writer_commits`.
+
+    The `if not jumps` guard was redundant under `sqlite3`, whose `executemany`
+    treats an empty sequence as a no-op. It is **load-bearing now**: SQLAlchemy
+    raises `StatementError: A value is required for bind parameter` when handed
+    an empty parameter list. `test_saving_nothing_writes_nothing` predicted that
+    before the rewrite and is what holds it.
+    """
     if not jumps:
         return
     now = _time.time()
-    conn.executemany(
-        "INSERT INTO route_jump_cache (sys_a, sys_b, jumps, cached_at) VALUES (?,?,?,?) ON CONFLICT (sys_a, sys_b) DO UPDATE SET jumps=excluded.jumps, cached_at=excluded.cached_at",
-        [(min(origin, d), max(origin, d), j, now) for d, j in jumps.items()],
+    conn.execute(
+        text("INSERT INTO route_jump_cache (sys_a, sys_b, jumps, cached_at)"
+             " VALUES (:sys_a, :sys_b, :jumps, :cached_at)"
+             " ON CONFLICT (sys_a, sys_b) DO UPDATE SET"
+             " jumps=excluded.jumps, cached_at=excluded.cached_at"),
+        [{"sys_a": min(origin, d), "sys_b": max(origin, d), "jumps": j,
+          "cached_at": now} for d, j in jumps.items()],
     )
     conn.commit()
