@@ -112,7 +112,8 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
             tok = await _valid_token_async(cid)
             primary_token = primary_token or tok
 
-            assets, at = load_cached_assets(conn, cid)
+            with _connect() as _ac:
+                assets, at = load_cached_assets(_ac, cid)
             if assets is None:
                 unsynced.append(_name or str(cid))
                 char_assets[cid] = []
@@ -130,8 +131,11 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
             # it — and it asked ESI for it *before* consulting its own cache, so
             # even a cache hit cost a round trip on every page view.
             corp_id = (character_row(cid) or {}).get("corporation_id") or 0
-            corp_list, corp_at = (load_cached_corp_assets(conn, corp_id)
-                                  if corp_id else (None, 0.0))
+            if corp_id:
+                with _connect() as _ac:
+                    corp_list, corp_at = load_cached_corp_assets(_ac, corp_id)
+            else:
+                corp_list, corp_at = None, 0.0
             corp_data[cid] = (corp_id, corp_list or [])
             if corp_list is not None:
                 oldest.append(corp_at)
@@ -685,11 +689,8 @@ async def _resolve_corp_container_names(
 
     # Same cache as the character variant. The worker fills it from the corp
     # asset sync, which already holds the role this endpoint needs.
-    conn_names = get_conn()
-    try:
+    with _connect() as conn_names:
         custom_names = load_cached_container_names(conn_names, owned_ids)
-    finally:
-        conn_names.close()
 
     type_id_set = {asset_map[cid]["type_id"] for cid in container_ids if cid in asset_map}
     type_names: dict[int, str] = {}
@@ -906,11 +907,8 @@ async def _resolve_container_names(
     # not there, and the display falls back to the container's type below —
     # which is the same thing that happened when the POST failed, so nothing
     # about the rendering changed except that it no longer costs a round trip.
-    conn_names = get_conn()
-    try:
+    with _connect() as conn_names:
         custom_names = load_cached_container_names(conn_names, owned_ids)
-    finally:
-        conn_names.close()
 
     type_id_set = {asset_map[cid]["type_id"] for cid in container_ids if cid in asset_map}
     type_names: dict[int, str] = {}

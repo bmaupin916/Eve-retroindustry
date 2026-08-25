@@ -450,9 +450,9 @@ async def plan_result(
         # three lists were fetched over and over to compute a different number
         # from identical inputs.
         blueprints, _bp_at = load_cached_blueprints(conn, char_id)
-        all_assets, _as_at = load_cached_assets(conn, char_id)
-        with _connect() as _sc:
-            char_skills = get_cached_skills(_sc, char_id)
+        with _connect() as _ac:
+            all_assets, _as_at = load_cached_assets(_ac, char_id)
+            char_skills = get_cached_skills(_ac, char_id)
         if blueprints is None or all_assets is None:
             raise ValueError(
                 "This character has not been synced yet — the background worker "

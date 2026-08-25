@@ -314,13 +314,16 @@ async def _bg_initial_sync():
                     _sync_state["step"] = "blueprints"
                     await fetch_blueprints(client, char_id, token, conn)
                     _sync_state["step"] = "assets"
-                    personal = await fetch_assets(client, char_id, token, conn)
+                    with _connect() as _ac:
+                        personal = await fetch_assets(client, char_id, token, _ac)
                     _sync_state["step"] = "skills"
                     with _connect() as _sc:
                         await fetch_skills(client, char_id, token, _sc)
                     _sync_state["step"] = "corp assets"
                     try:
-                        corp_id, corp = await fetch_corp_assets(client, char_id, token, conn)
+                        with _connect() as _ac:
+                            corp_id, corp = await fetch_corp_assets(
+                                client, char_id, token, _ac)
                         if corp_id:
                             with _connect() as _tc:
                                 update_corporation_id(_tc, char_id, corp_id)

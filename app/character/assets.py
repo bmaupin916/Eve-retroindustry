@@ -5,9 +5,10 @@ Returns materials available at a given station/structure.
 from __future__ import annotations
 from dataclasses import dataclass
 import time
-import sqlite3
 import json
 import httpx
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE  = "https://esi.evetech.net/latest"
@@ -25,31 +26,42 @@ class CharAsset:
     is_blueprint_copy:  bool   # True = BPC (blueprint copy with no market price)
 
 
-def ensure_assets_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_assets_table(conn: Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees
+    it exists, and only on SQLite — `app/db/schema.py` memoises by asking
+    `PRAGMA database_list`, which is a syntax error on Postgres, where the
+    schema arrives through Alembic instead."""
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
-def _load_cache(conn: sqlite3.Connection, character_id: int) -> list[dict] | None:
+def _load_cache(conn: Connection, character_id: int) -> list[dict] | None:
     row = conn.execute(
-        "SELECT data_json, cached_at FROM char_assets_cache WHERE character_id=?",
-        (character_id,)
+        text("SELECT data_json, cached_at FROM char_assets_cache"
+             " WHERE character_id=:cid"),
+        {"cid": character_id},
     ).fetchone()
     if row and (time.time() - (row[1] or 0)) < CACHE_TTL:
         return json.loads(row[0])
     return None
 
 
-def _save_cache(conn: sqlite3.Connection, character_id: int, data: list[dict]):
-    conn.execute("DELETE FROM char_assets_cache WHERE character_id=?", (character_id,))
+def _save_cache(conn: Connection, character_id: int, data: list[dict]):
+    # DELETE then INSERT rather than an upsert, and one row per character is
+    # the invariant: without the delete a second save leaves two, and which one
+    # a later read wins becomes a question about row order.
+    conn.execute(text("DELETE FROM char_assets_cache WHERE character_id=:cid"),
+                 {"cid": character_id})
     conn.execute(
-        "INSERT INTO char_assets_cache (character_id, data_json, cached_at) VALUES (?,?,?)",
-        (character_id, json.dumps(data), time.time())
+        text("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :cached_at)"),
+        {"cid": character_id, "data": json.dumps(data), "cached_at": time.time()},
     )
     conn.commit()
 
 
-def load_cached_container_names(conn: sqlite3.Connection,
+def load_cached_container_names(conn: Connection,
                                item_ids) -> dict[int, str]:
     """{item_id: custom name} for whichever of `item_ids` have one.
 
@@ -62,28 +74,35 @@ def load_cached_container_names(conn: sqlite3.Connection,
     if not ids:
         return {}
     out: dict[int, str] = {}
-    # Chunked: SQLite's parameter limit is 999 by default and a big account can
-    # hold more containers than that.
+    # Chunked, because a statement caps how many parameters it may bind and an
+    # expanding bindparam still binds one per id. That cap is a compile-time
+    # setting: 999 before SQLite 3.32, 32,766 on the build here, 65,535 on
+    # Postgres. 900 is under all of them, and the cost of chunking below the
+    # limit is one extra round trip per 900 containers.
+    stmt = text("SELECT item_id, name FROM container_name_cache"
+                " WHERE item_id IN :ids").bindparams(
+                    bindparam("ids", expanding=True))
     for start in range(0, len(ids), 900):
         chunk = ids[start:start + 900]
-        ph = ",".join("?" * len(chunk))
-        for item_id, name in conn.execute(
-            f"SELECT item_id, name FROM container_name_cache WHERE item_id IN ({ph})",
-            chunk,
-        ).fetchall():
+        for item_id, name in conn.execute(stmt, {"ids": chunk}).fetchall():
             out[item_id] = name
     return out
 
 
-def save_cached_container_names(conn: sqlite3.Connection,
+def save_cached_container_names(conn: Connection,
                                 names: dict[int, str]) -> None:
-    for item_id, name in names.items():
-        conn.execute(
-            "INSERT INTO container_name_cache (item_id, name, cached_at)"
-            " VALUES (?,?,?) ON CONFLICT (item_id) DO UPDATE SET"
-            " name=excluded.name, cached_at=excluded.cached_at",
-            (int(item_id), name, time.time()),
-        )
+    # No commit, deliberately: the sync worker's per-character block owns the
+    # transaction boundary and commits after this returns.
+    if not names:
+        return
+    conn.execute(
+        text("INSERT INTO container_name_cache (item_id, name, cached_at)"
+             " VALUES (:item_id, :name, :cached_at)"
+             " ON CONFLICT (item_id) DO UPDATE SET"
+             " name=excluded.name, cached_at=excluded.cached_at"),
+        [{"item_id": int(item_id), "name": name, "cached_at": time.time()}
+         for item_id, name in names.items()],
+    )
 
 
 def _field(asset, name: str):
@@ -114,7 +133,7 @@ def container_item_ids(assets) -> list[int]:
 
 
 async def fetch_container_names(client, owner_id: int, token: str, item_ids,
-                                conn: sqlite3.Connection | None = None,
+                                conn: Connection | None = None,
                                 corporate: bool = False) -> dict[int, str] | None:
     """Resolve custom names for `item_ids` in one POST, and cache them.
 
@@ -152,7 +171,7 @@ async def fetch_container_names(client, owner_id: int, token: str, item_ids,
     return out
 
 
-def load_cached_assets(conn: sqlite3.Connection,
+def load_cached_assets(conn: Connection,
                        character_id: int) -> tuple[list[CharAsset] | None, float]:
     """(assets, cached_at) from the cache at any age, or (None, 0) if absent.
 
@@ -167,8 +186,9 @@ def load_cached_assets(conn: sqlite3.Connection,
     statement about your assets rather than about the sync.
     """
     row = conn.execute(
-        "SELECT data_json, cached_at FROM char_assets_cache WHERE character_id=?",
-        (character_id,)).fetchone()
+        text("SELECT data_json, cached_at FROM char_assets_cache"
+             " WHERE character_id=:cid"),
+        {"cid": character_id}).fetchone()
     if not row:
         return None, 0.0
     try:
@@ -177,12 +197,13 @@ def load_cached_assets(conn: sqlite3.Connection,
         return None, 0.0
 
 
-def load_cached_corp_assets(conn: sqlite3.Connection,
+def load_cached_corp_assets(conn: Connection,
                             corporation_id: int) -> tuple[list[CharAsset] | None, float]:
     """The same, for a corporation's hangars."""
     row = conn.execute(
-        "SELECT data_json, cached_at FROM corp_assets_cache WHERE corporation_id=?",
-        (corporation_id,)).fetchone()
+        text("SELECT data_json, cached_at FROM corp_assets_cache"
+             " WHERE corporation_id=:corp"),
+        {"corp": corporation_id}).fetchone()
     if not row:
         return None, 0.0
     try:
@@ -195,7 +216,7 @@ async def fetch_assets(
     client: httpx.AsyncClient,
     character_id: int,
     access_token: str,
-    conn: sqlite3.Connection,
+    conn: Connection,
     force_refresh: bool = False,
 ) -> list[CharAsset]:
     """Loads all of the character's assets (paginated), with caching."""
@@ -243,26 +264,34 @@ def _parse_assets(raw: list[dict]) -> list[CharAsset]:
     return result
 
 
-def ensure_corp_assets_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_corp_assets_table(conn: Connection) -> None:
+    """Schema shim. See `ensure_assets_table` — SQLite-only for the same
+    reason."""
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
-def _load_corp_cache(conn: sqlite3.Connection, corporation_id: int) -> list[dict] | None:
+def _load_corp_cache(conn: Connection, corporation_id: int) -> list[dict] | None:
     row = conn.execute(
-        "SELECT data_json, cached_at FROM corp_assets_cache WHERE corporation_id=?",
-        (corporation_id,)
+        text("SELECT data_json, cached_at FROM corp_assets_cache"
+             " WHERE corporation_id=:corp"),
+        {"corp": corporation_id},
     ).fetchone()
     if row and (time.time() - (row[1] or 0)) < CACHE_TTL:
         return json.loads(row[0])
     return None
 
 
-def _save_corp_cache(conn: sqlite3.Connection, corporation_id: int, data: list[dict]):
-    conn.execute("DELETE FROM corp_assets_cache WHERE corporation_id=?", (corporation_id,))
+def _save_corp_cache(conn: Connection, corporation_id: int, data: list[dict]):
+    conn.execute(text("DELETE FROM corp_assets_cache"
+                      " WHERE corporation_id=:corp"),
+                 {"corp": corporation_id})
     conn.execute(
-        "INSERT INTO corp_assets_cache (corporation_id, data_json, cached_at) VALUES (?,?,?)",
-        (corporation_id, json.dumps(data), time.time())
+        text("INSERT INTO corp_assets_cache (corporation_id, data_json, cached_at)"
+             " VALUES (:corp, :data, :cached_at)"),
+        {"corp": corporation_id, "data": json.dumps(data),
+         "cached_at": time.time()},
     )
     conn.commit()
 
@@ -271,7 +300,7 @@ async def fetch_corp_assets(
     client: httpx.AsyncClient,
     character_id: int,
     access_token: str,
-    conn: sqlite3.Connection,
+    conn: Connection,
     force_refresh: bool = False,
 ) -> tuple[int, list[CharAsset]]:
     """Fetch corporation assets. Returns (corp_id, assets). Empty list if no ESI access."""

@@ -296,7 +296,7 @@ class SyncWorker:
                                                         force_refresh=True)
                     changed += self._diff(char_id, "blueprints", blueprints)
 
-                    assets = await fetch_assets(client, char_id, token, raw,
+                    assets = await fetch_assets(client, char_id, token, conn,
                                                 force_refresh=True)
                     changed += self._diff(char_id, "assets", assets)
 
@@ -306,7 +306,7 @@ class SyncWorker:
                     # is inside it. No event — renaming a can is not news.
                     await fetch_container_names(
                         client, char_id, token, container_item_ids(assets or []),
-                        conn=raw)
+                        conn=conn)
 
                     skills = await fetch_skills(client, char_id, token, conn)
                     changed += self._diff(char_id, "skills", skills)
@@ -364,7 +364,7 @@ class SyncWorker:
 
                     try:
                         corp_id, corp_assets = await fetch_corp_assets(
-                            client, char_id, token, raw, force_refresh=True)
+                            client, char_id, token, conn, force_refresh=True)
                         if corp_id:
                             update_corporation_id(conn, char_id, corp_id)
                             changed += self._diff(
@@ -373,7 +373,7 @@ class SyncWorker:
                             await fetch_container_names(
                                 client, corp_id, token,
                                 container_item_ids(corp_assets or []),
-                                conn=raw, corporate=True)
+                                conn=conn, corporate=True)
                             # Same role requirement as corp assets and the same
                             # best-effort handling: a 403 returns an error
                             # string rather than raising, and writes nothing.

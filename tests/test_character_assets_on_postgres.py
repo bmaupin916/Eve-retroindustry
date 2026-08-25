@@ -8,9 +8,12 @@ both fetchers, in other words — and `tests/test_sync_worker.py` monkeypatches
 the fetchers onto the worker module, which is why the worker is well covered
 while these never run.
 
-Written against the `sqlite3` version deliberately, so the conversion has
-assertions to *preserve* rather than assertions invented afterwards to fit
-whatever it did.
+**These assertions are unchanged by the conversion.** They were written
+against the `sqlite3` version first, exactly so they could be preserved rather
+than invented afterwards to fit whatever the rewrite did. Only the fixture
+underneath moved, and it now runs each of them on both backends — bar one,
+marked `sqlite_only`, which lowers a SQLite compile-time limit and has no
+Postgres equivalent.
 
 Three things here are conversion traps rather than ordinary behaviour:
 
@@ -34,8 +37,12 @@ import sqlite3
 import time
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from app.character import assets as assets_api
+from tests.test_postgres_schema import URL as PG_URL, _reachable
+
+PG_SCHEMA = "pytest_character_assets"
 
 CHAR = 2_112_625_428
 CORP = 98_000_001
@@ -88,30 +95,90 @@ def _asset(item_id, type_id=TRITANIUM, location_id=JITA, qty=100,
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(scope="module", params=["sqlite", "postgres"])
+def engine(request, tmp_path_factory):
+    """An engine per backend, built once for the module.
+
+    Function scope here would drop and rebuild a Postgres schema — all ten
+    migrations — for every test in the file; clearing the tables between tests
+    is the same isolation for a fraction of the cost.
+    """
+    from app.db.migrate import upgrade_to_head
+
+    if request.param == "sqlite":
+        url = f"sqlite:///{tmp_path_factory.mktemp('db') / 'eve_cache.db'}"
+        upgrade_to_head(url)
+        eng = create_engine(url)
+        yield eng
+        eng.dispose()
+        return
+
+    if not _reachable(PG_URL):
+        pytest.skip(f"no Postgres at {PG_URL} — see tests/test_postgres_schema.py")
+
+    admin = create_engine(PG_URL)
+    with admin.connect() as c:
+        c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
+        c.execute(text(f"CREATE SCHEMA {PG_SCHEMA}"))
+        c.commit()
+    admin.dispose()
+
+    scoped = PG_URL + ("&" if "?" in PG_URL else "?") + \
+        f"options=-csearch_path%3D{PG_SCHEMA}"
+    upgrade_to_head(scoped)
+
+    eng = create_engine(scoped)
+    yield eng
+    eng.dispose()
+
+
+#: Emptied before every test, so one module-scoped schema can serve them all.
+_CLEARED = ("char_assets_cache", "corp_assets_cache", "container_name_cache")
+
+
+@pytest.fixture(autouse=True)
+def _empty_tables(engine):
+    """Before, not after: a test that dies half-way must not leave its rows for
+    the next one to read."""
+    with engine.connect() as c:
+        for table in _CLEARED:
+            c.execute(text(f"DELETE FROM {table}"))
+        c.commit()
+    yield
+
+
 @pytest.fixture
-def conn(tmp_path):
-    """A file, not `:memory:` — the commit assertions open a second connection."""
-    c = sqlite3.connect(str(tmp_path / "eve_cache.db"))
-    assets_api.ensure_assets_table(c)
-    assets_api.ensure_corp_assets_table(c)
-    yield c
-    c.close()
+def conn(engine, request):
+    if engine.dialect.name != "sqlite" and \
+            request.node.get_closest_marker("sqlite_only"):
+        pytest.skip("lowers a SQLite compile-time limit; no Postgres equivalent")
+    with engine.connect() as c:
+        yield c
 
 
-def _reopen(conn) -> sqlite3.Connection:
-    path = [r[2] for r in conn.execute("PRAGMA database_list")
-            if r[1] == "main"][0]
-    return sqlite3.connect(path)
+def _backend(conn) -> str:
+    return conn.engine.dialect.name
 
 
 # ── the schema shims ─────────────────────────────────────────────────────────
 
-def test_the_shims_create_the_tables_they_name(conn):
-    tables = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'")}
+def test_both_backends_are_actually_exercised(conn):
+    """Without this a broken Postgres fixture reads as a passing file: the
+    SQLite half would carry it, and running on both is the entire point."""
+    assert _backend(conn) in ("sqlite", "postgresql")
+    for table in _CLEARED:
+        assert conn.execute(
+            text(f"SELECT COUNT(*) FROM {table}")).fetchone()[0] == 0
 
-    assert "char_assets_cache" in tables
-    assert "corp_assets_cache" in tables
+
+def test_the_schema_shims_are_safe_on_either_backend(conn):
+    """Both forward to `PRAGMA database_list`, which is a syntax error on
+    Postgres. The dialect guard is what makes them safe to keep calling."""
+    assets_api.ensure_assets_table(conn)
+    assets_api.ensure_corp_assets_table(conn)
+
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM char_assets_cache")).fetchone()[0] == 0
 
 
 # ── the character cache ──────────────────────────────────────────────────────
@@ -132,23 +199,23 @@ def test_saving_twice_replaces_rather_than_duplicating(conn):
     assets_api._save_cache(conn, CHAR, [_asset(1)])
     assets_api._save_cache(conn, CHAR, [_asset(2)])
 
-    rows = conn.execute("SELECT COUNT(*) FROM char_assets_cache"
-                        " WHERE character_id=?", (CHAR,)).fetchone()[0]
+    rows = conn.execute(
+        text("SELECT COUNT(*) FROM char_assets_cache WHERE character_id=:cid"),
+        {"cid": CHAR}).fetchone()[0]
     assert rows == 1, "the character has two cache rows"
     got, _ = assets_api.load_cached_assets(conn, CHAR)
     assert [a.item_id for a in got] == [2]
 
 
-def test_saved_assets_survive_a_new_connection(conn):
+def test_saved_assets_survive_a_new_connection(engine):
     """The lost-`commit()` net for this writer."""
-    assets_api._save_cache(conn, CHAR, [_asset(1)])
+    with engine.connect() as c:
+        assets_api._save_cache(c, CHAR, [_asset(1)])
 
-    other = _reopen(conn)
-    try:
-        got, _ = assets_api.load_cached_assets(other, CHAR)
-        assert [a.item_id for a in got] == [1]
-    finally:
-        other.close()
+    with engine.connect() as c:
+        got, _ = assets_api.load_cached_assets(c, CHAR)
+    assert [a.item_id for a in got] == [1], (
+        f"on {engine.dialect.name}: the write did not commit")
 
 
 def test_an_unsynced_character_reads_as_none_not_empty(conn):
@@ -170,8 +237,10 @@ def test_a_character_with_nothing_reads_as_empty_not_none(conn):
 
 
 def test_a_corrupt_cache_reads_as_unsynced(conn):
-    conn.execute("INSERT INTO char_assets_cache (character_id, data_json,"
-                 " cached_at) VALUES (?,?,?)", (CHAR, "{not json", time.time()))
+    conn.execute(
+        text("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :at)"),
+        {"cid": CHAR, "data": "{not json", "at": time.time()})
     conn.commit()
 
     assert assets_api.load_cached_assets(conn, CHAR) == (None, 0.0)
@@ -181,10 +250,11 @@ def test_the_read_path_ignores_the_ttl(conn):
     """`load_cached_assets` deliberately returns an aged cache. Applying the
     fetcher's TTL here made a stale cache indistinguishable from an empty one,
     so the page fetched — which is what the worker exists to prevent."""
-    conn.execute("INSERT INTO char_assets_cache (character_id, data_json,"
-                 " cached_at) VALUES (?,?,?)",
-                 (CHAR, json.dumps([_asset(1)]),
-                  time.time() - assets_api.CACHE_TTL * 10))
+    conn.execute(
+        text("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :at)"),
+        {"cid": CHAR, "data": json.dumps([_asset(1)]),
+         "at": time.time() - assets_api.CACHE_TTL * 10})
     conn.commit()
 
     got, cached_at = assets_api.load_cached_assets(conn, CHAR)
@@ -195,10 +265,11 @@ def test_the_read_path_ignores_the_ttl(conn):
 
 def test_the_fetcher_path_enforces_the_ttl(conn):
     """...and `_load_cache`, which the fetcher uses, does not."""
-    conn.execute("INSERT INTO char_assets_cache (character_id, data_json,"
-                 " cached_at) VALUES (?,?,?)",
-                 (CHAR, json.dumps([_asset(1)]),
-                  time.time() - assets_api.CACHE_TTL - 1))
+    conn.execute(
+        text("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :at)"),
+        {"cid": CHAR, "data": json.dumps([_asset(1)]),
+         "at": time.time() - assets_api.CACHE_TTL - 1})
     conn.commit()
 
     assert assets_api._load_cache(conn, CHAR) is None
@@ -256,32 +327,33 @@ def test_a_single_page_costs_one_call(conn):
 
 # ── the corporation cache ────────────────────────────────────────────────────
 
-def test_saved_corp_assets_read_back_and_survive_a_new_connection(conn):
-    assets_api._save_corp_cache(conn, CORP, [_asset(9)])
+def test_saved_corp_assets_read_back_and_survive_a_new_connection(engine):
+    with engine.connect() as c:
+        assets_api._save_corp_cache(c, CORP, [_asset(9)])
 
-    other = _reopen(conn)
-    try:
-        got, cached_at = assets_api.load_cached_corp_assets(other, CORP)
-        assert [a.item_id for a in got] == [9]
-        assert cached_at > 0
-    finally:
-        other.close()
+    with engine.connect() as c:
+        got, cached_at = assets_api.load_cached_corp_assets(c, CORP)
+    assert [a.item_id for a in got] == [9], (
+        f"on {engine.dialect.name}: the write did not commit")
+    assert cached_at > 0
 
 
 def test_saving_corp_assets_twice_replaces(conn):
     assets_api._save_corp_cache(conn, CORP, [_asset(1)])
     assets_api._save_corp_cache(conn, CORP, [_asset(2)])
 
-    rows = conn.execute("SELECT COUNT(*) FROM corp_assets_cache"
-                        " WHERE corporation_id=?", (CORP,)).fetchone()[0]
+    rows = conn.execute(
+        text("SELECT COUNT(*) FROM corp_assets_cache"
+             " WHERE corporation_id=:corp"), {"corp": CORP}).fetchone()[0]
     assert rows == 1
 
 
 def test_a_stale_corp_cache_is_not_fresh(conn):
-    conn.execute("INSERT INTO corp_assets_cache (corporation_id, data_json,"
-                 " cached_at) VALUES (?,?,?)",
-                 (CORP, json.dumps([_asset(1)]),
-                  time.time() - assets_api.CACHE_TTL - 1))
+    conn.execute(
+        text("INSERT INTO corp_assets_cache (corporation_id, data_json,"
+             " cached_at) VALUES (:corp, :data, :at)"),
+        {"corp": CORP, "data": json.dumps([_asset(1)]),
+         "at": time.time() - assets_api.CACHE_TTL - 1})
     conn.commit()
 
     assert assets_api._load_corp_cache(conn, CORP) is None
@@ -318,7 +390,8 @@ def test_no_corp_role_yields_the_corp_id_and_nothing_else(conn):
 
     assert corp_id == CORP
     assert got == []
-    assert conn.execute("SELECT COUNT(*) FROM corp_assets_cache").fetchone()[0] == 0, (
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM corp_assets_cache")).fetchone()[0] == 0, (
         "a refused fetch was written to the cache")
 
 
@@ -401,6 +474,7 @@ def test_asking_for_no_containers_touches_nothing(conn):
     assert assets_api.load_cached_container_names(conn, []) == {}
 
 
+@pytest.mark.sqlite_only
 def test_the_container_lookup_survives_a_low_parameter_limit(conn):
     """The `IN (...)` is chunked at 900 because a statement has a cap on how
     many parameters it may bind.
@@ -420,14 +494,29 @@ def test_the_container_lookup_survives_a_low_parameter_limit(conn):
     assets_api.save_cached_container_names(conn, names)
     conn.commit()
 
-    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+    driver = conn.connection.driver_connection
+    driver.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
     try:
         got = assets_api.load_cached_container_names(conn, list(names))
     finally:
-        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 32766)
+        driver.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 32766)
 
     assert len(got) == 1500
     assert got[1] == "Can 1" and got[1500] == "Can 1500"
+
+
+def test_saving_no_container_names_is_not_an_error(conn):
+    """An empty batch is the common case — nothing on this character is named.
+
+    It was a no-op for the per-row loop this replaced, and it is *not* one for
+    a SQLAlchemy executemany: with no rows to infer the parameter shape from it
+    raises. Guarded in the writer rather than at the call site, and this is what
+    says so.
+    """
+    assets_api.save_cached_container_names(conn, {})
+    conn.commit()
+
+    assert assets_api.load_cached_container_names(conn, [1]) == {}
 
 
 def test_naming_a_container_again_replaces_the_name(conn):
@@ -438,7 +527,7 @@ def test_naming_a_container_again_replaces_the_name(conn):
     assert assets_api.load_cached_container_names(conn, [1]) == {1: "New"}
 
 
-def test_the_commit_for_container_names_lives_upstream(conn):
+def test_the_commit_for_container_names_lives_upstream(engine):
     """`save_cached_container_names` does not commit, and neither does
     `fetch_container_names`. The sync worker's per-character block does.
 
@@ -447,18 +536,14 @@ def test_the_commit_for_container_names_lives_upstream(conn):
     worker's loses every custom name with no symptom — the page just shows bare
     hull types again, which is how this was found the first time.
     """
-    assets_api.save_cached_container_names(conn, {1: "Ore Can"})
+    with engine.connect() as writer:
+        assets_api.save_cached_container_names(writer, {1: "Ore Can"})
 
-    other = _reopen(conn)
-    try:
-        assert assets_api.load_cached_container_names(other, [1]) == {}, (
-            "the writer committed on its own; the worker's boundary moved")
-    finally:
-        other.close()
+        with engine.connect() as other:
+            assert assets_api.load_cached_container_names(other, [1]) == {}, (
+                "the writer committed on its own; the worker's boundary moved")
 
-    conn.commit()
-    other = _reopen(conn)
-    try:
+        writer.commit()
+
+    with engine.connect() as other:
         assert assets_api.load_cached_container_names(other, [1]) == {1: "Ore Can"}
-    finally:
-        other.close()

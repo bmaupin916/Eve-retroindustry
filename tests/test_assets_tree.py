@@ -512,14 +512,22 @@ def test_the_fetcher_asks_only_about_ids_the_character_owns(app_module, tmp_path
     ids = assets_api.container_item_ids(mine)
     assert ids == [111], f"derived {ids} — an id we do not own would be posted"
 
-    got = asyncio.run(assets_api.fetch_container_names(
-        _Client(), 1, "tok", ids, conn=conn))
-    conn.commit()
-
-    assert posted == [[111]], posted
-    assert got == {111: "Mine"}
-    assert assets_api.load_cached_container_names(conn, [111, 222]) == {111: "Mine"}
     conn.close()
+    # `app/character/assets.py` is on the portable query layer now, so the
+    # fetcher takes an engine connection. The schema above was applied on the
+    # DBAPI handle, which is the same file either way.
+    from sqlalchemy import create_engine
+    eng = create_engine(f"sqlite:///{tmp_path / 'c.db'}")
+    with eng.connect() as ec:
+        got = asyncio.run(assets_api.fetch_container_names(
+            _Client(), 1, "tok", ids, conn=ec))
+        ec.commit()
+
+        assert posted == [[111]], posted
+        assert got == {111: "Mine"}
+        assert assets_api.load_cached_container_names(
+            ec, [111, 222]) == {111: "Mine"}
+    eng.dispose()
 
 
 def test_an_asset_holding_nothing_is_not_a_container(app_module):
@@ -552,12 +560,10 @@ def test_the_resolver_names_a_container_from_the_cache(app_module):
 
     from app.character import assets as assets_api
 
-    conn = app_module.get_conn()
-    try:
-        assets_api.save_cached_container_names(conn, {111: "Ammo Bin"})
-        conn.commit()
-    finally:
-        conn.close()
+    from app.db.conn import connect as _connect
+    with _connect() as ec:
+        assets_api.save_cached_container_names(ec, {111: "Ammo Bin"})
+        ec.commit()
 
     mine = [{"item_id": 111, "type_id": MEGATHRON, "location_id": 60003760},
             {"item_id": 112, "type_id": MEGATHRON, "location_id": 60003760}]
@@ -599,13 +605,17 @@ def test_the_fetcher_asks_only_about_ids_the_corp_owns(app_module, tmp_path):
     ours = [{"item_id": 5001, "type_id": MEGATHRON, "location_id": 60003760},
             {"item_id": 5002, "type_id": MEGATHRON, "location_id": 5001}]
 
-    got = asyncio.run(assets_api.fetch_container_names(
-        _Client(), 98000001, "tok", assets_api.container_item_ids(ours),
-        conn=conn, corporate=True))
+    conn.close()
+    from sqlalchemy import create_engine
+    eng = create_engine(f"sqlite:///{tmp_path / 'corp.db'}")
+    with eng.connect() as ec:
+        got = asyncio.run(assets_api.fetch_container_names(
+            _Client(), 98000001, "tok", assets_api.container_item_ids(ours),
+            conn=ec, corporate=True))
 
     assert posted == [[5001]], posted
     assert got == {5001: "Ore Bin"}
-    conn.close()
+    eng.dispose()
 
 
 def test_the_corp_resolver_returns_nothing_when_it_owns_nothing(app_module):

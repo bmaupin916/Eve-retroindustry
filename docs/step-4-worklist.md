@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.59. **965 tests green, 1 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.60. **1025 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -35,10 +35,11 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   `grep -rn "dbapi(" app/` is the live measure and stands at **0** as of
   v0.9.59 — there are no boundaries left to cross. What remains is not
   crossings but modules still holding a raw `get_conn()` handle of their own:
-  the rest of `app/character/*` (`assets`, `blueprints`, `contracts`, `wallet`,
-  `orders`, `planets`), then `media`, `contracts`, `characters`, `planets`,
-  `locations`, `prices`, `assets`, `plan`, and finally `deps.py`, `main.py` and
-  `app/db/schema.py`.
+  `character/blueprints`, `character/contracts`, `character/wallet`,
+  `character/orders`, `character/planets`, then `media`, `contracts`,
+  `characters`, `planets`, `locations`, `prices`, `assets`, `plan`, and finally
+  `deps.py`, `main.py` and `app/db/schema.py`. `character/assets` converted in
+  v0.9.60.
 
 To bring the Postgres tests back:
 
@@ -971,3 +972,66 @@ table lists chosen with more care than the others.
 
 Full suite as of v0.9.59: **4m42s** with Postgres up, against roughly three
 minutes before any cross-backend file existed.
+
+
+## character/assets converted (v0.9.60)
+
+Nine of its functions had never been executed by the suite — both cache writers,
+both fetchers, both `ensure_*_table` shims, both location roll-ups and the corp
+cache reader. Tests first, then the conversion, and the assertions came through
+unchanged onto the cross-backend fixture.
+
+Three of those nine were carrying behaviour worth naming:
+
+* `_save_cache` is **DELETE then INSERT**, not an upsert. One row per character
+  is the invariant; without the delete a second save leaves two and "which one
+  wins" becomes a question about row order.
+* **Two readers of one table with opposite TTL rules.** `load_cached_assets`
+  ignores `CACHE_TTL` on purpose and `_load_cache`, which the fetcher uses,
+  enforces it — because applying the TTL on the read path made an aged cache
+  indistinguishable from an empty one, so the page fetched.
+* `save_cached_container_names` does not commit, and neither does
+  `fetch_container_names`. The worker's per-character block does.
+
+## A test can pass because the limit it names is not the limit
+
+`load_cached_container_names` chunks its `IN (...)` at 900, and the comment said
+that was because "SQLite's parameter limit is 999 by default". Measured, because
+the mutation that removed the chunking failed nothing:
+
+    SQLITE_LIMIT_VARIABLE_NUMBER: 32766
+      32766 placeholders: OK
+      32767 placeholders: too many SQL variables
+
+999 has been wrong since SQLite 3.32 in 2020. So a test asking for 1,500 ids —
+written as "more containers than the parameter limit" — was nowhere near the
+limit and passed with the chunking deleted.
+
+The chunking is still right: the cap is a **compile-time setting**, some
+distribution builds do ship 999, and Postgres caps at 65,535. What changed is
+the test, which now lowers `SQLITE_LIMIT_VARIABLE_NUMBER` to 999 for the
+connection. That reproduces the build the chunking exists for at a realistic
+number of containers instead of needing 33,000 of them, and it is the one test
+in the file marked `sqlite_only` — there is no Postgres equivalent of lowering
+a SQLite compile-time limit.
+
+**The general form:** when a test names a threshold, check the threshold is
+real. "More than the limit" is an assertion about the environment, and
+environments move.
+
+## The mutation harness was filtering on a substring, not a parameter
+
+The batteries split backends with `pytest -k sqlite` and `-k postgres`. That
+matches the **test name** as well as the parameter id, and
+`test_the_schema_shims_are_a_no_op_off_sqlite[postgres]` contains both words —
+so the "sqlite" run included a Postgres case, and two asymmetric mutations
+reported as failing on both backends when they only failed on one.
+
+The fix is `-k "[sqlite]"` / `-k "[postgres]"`, matching the bracketed parameter
+id. Worth carrying into every future battery, along with the smaller habit of
+not putting a backend name in a test name.
+
+It cost nothing this time because the wrong answer was *more* alarming than the
+truth. It would cost a great deal in the other direction — a mutation that
+fails only Postgres, reported as failing both, looks like a portable bug rather
+than the backend difference it is.

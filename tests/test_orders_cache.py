@@ -39,6 +39,22 @@ def conn(tmp_path):
     c.close()
 
 
+
+def _engine_conn(conn):
+    """An engine connection onto the same file this raw `conn` is attached to.
+
+    `app/character/assets.py` is on the portable query layer; the fixture above
+    is shared with tests for modules that are not, so it keeps handing out a
+    sqlite3 handle and the few tests that need the other kind ask for it here.
+    """
+    import contextlib
+    from sqlalchemy import create_engine
+    path = [r[2] for r in conn.execute("PRAGMA database_list")
+            if r[1] == "main"][0]
+    eng = create_engine(f"sqlite:///{path}")
+    return contextlib.closing(eng.connect())
+
+
 ALICE, BOB, CORP = 90_000_001, 90_000_002, 98_000_001
 
 
@@ -565,10 +581,11 @@ def test_the_asset_reader_ignores_the_ttl(conn):
                              "location_flag": "Hangar"}]), stale))
     conn.commit()
 
-    assert assets_api._load_cache(conn, ALICE) is None, (
-        "the fixture is not actually stale — this test would pass vacuously")
+    with _engine_conn(conn) as ec:
+        assert assets_api._load_cache(ec, ALICE) is None, (
+            "the fixture is not actually stale — this test would pass vacuously")
 
-    assets, at = assets_api.load_cached_assets(conn, ALICE)
+        assets, at = assets_api.load_cached_assets(ec, ALICE)
 
     assert assets is not None, "an aged cache read as never-synced"
     assert len(assets) == 1
@@ -595,7 +612,8 @@ def test_the_blueprint_reader_ignores_the_ttl(conn):
 
 def test_an_unsynced_character_has_no_assets_rather_than_none(conn):
     """Same distinction as everywhere else. An empty hangar is a statement."""
-    assert assets_api.load_cached_assets(conn, ALICE) == (None, 0.0)
+    with _engine_conn(conn) as ec:
+        assert assets_api.load_cached_assets(ec, ALICE) == (None, 0.0)
     assert bp_api.load_cached_blueprints(conn, ALICE) == (None, 0.0)
 
 
@@ -626,27 +644,31 @@ def test_container_ids_accept_objects_as_well_as_dicts(conn):
 
 
 def test_container_names_round_trip(conn):
-    assets_api.save_cached_container_names(conn, {111: "Ammo Bin", 222: "Ore"})
-    conn.commit()
+    with _engine_conn(conn) as ec:
+        assets_api.save_cached_container_names(ec, {111: "Ammo Bin", 222: "Ore"})
+        ec.commit()
 
-    assert assets_api.load_cached_container_names(conn, [111, 333]) == {111: "Ammo Bin"}
+        assert assets_api.load_cached_container_names(
+            ec, [111, 333]) == {111: "Ammo Bin"}
 
 
 def test_a_failed_name_fetch_caches_nothing(conn):
     """A name that failed to resolve must not be stored as a name, and must not
     wipe one that resolved earlier."""
-    assets_api.save_cached_container_names(conn, {111: "Ammo Bin"})
-    conn.commit()
-
     class _Failing:
         async def post(self, *a, **k):
             raise RuntimeError("ESI down")
 
-    got = asyncio.run(assets_api.fetch_container_names(
-        _Failing(), 1, "tok", [111], conn=conn))
+    with _engine_conn(conn) as ec:
+        assets_api.save_cached_container_names(ec, {111: "Ammo Bin"})
+        ec.commit()
 
-    assert got is None
-    assert assets_api.load_cached_container_names(conn, [111]) == {111: "Ammo Bin"}
+        got = asyncio.run(assets_api.fetch_container_names(
+            _Failing(), 1, "tok", [111], conn=ec))
+
+        assert got is None
+        assert assets_api.load_cached_container_names(
+            ec, [111]) == {111: "Ammo Bin"}
 
 
 def test_neither_inventory_page_calls_a_fetcher(client, monkeypatch):
