@@ -9,7 +9,7 @@ so they cost nothing in a normal run and catch the whole class the moment
 someone brings one up:
 
     docker run -d --name eve-pg -e POSTGRES_PASSWORD=eve -e POSTGRES_USER=eve \\
-        -e POSTGRES_DB=eve_retroindustry -p 55432:5432 postgres:17
+        -e POSTGRES_DB=eve_retroindustry -p 5433:5432 postgres:17
 
 Point `EVE_TEST_POSTGRES_URL` somewhere else to use a different one.
 """
@@ -21,7 +21,7 @@ import pytest
 
 sqlalchemy = pytest.importorskip("sqlalchemy")
 
-DEFAULT_URL = "postgresql+psycopg://eve:eve@localhost:55432/eve_retroindustry"
+DEFAULT_URL = "postgresql+psycopg://eve:eve@localhost:5433/eve_retroindustry"
 URL = os.environ.get("EVE_TEST_POSTGRES_URL", DEFAULT_URL)
 
 

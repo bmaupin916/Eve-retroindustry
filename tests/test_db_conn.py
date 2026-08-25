@@ -116,7 +116,7 @@ def test_scalar_returns_none_rather_than_raising(sqlite_url):
 
 PG_URL = os.environ.get(
     "EVE_TEST_POSTGRES_URL",
-    "postgresql+psycopg://eve:eve@localhost:55432/eve_retroindustry")
+    "postgresql+psycopg://eve:eve@localhost:5433/eve_retroindustry")
 
 
 def _pg_reachable() -> bool:

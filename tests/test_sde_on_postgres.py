@@ -335,7 +335,7 @@ def test_a_url_is_passed_through_and_a_path_is_not(tmp_path, monkeypatch):
     turned into `sqlite:///postgresql+psycopg://...`."""
     import import_sde
 
-    url = "postgresql+psycopg://eve:eve@localhost:55432/eve_retroindustry"
+    url = "postgresql+psycopg://eve:eve@localhost:5433/eve_retroindustry"
     assert import_sde._target_url(url) == url
 
     resolved = import_sde._target_url(str(tmp_path / "out.db"))
@@ -368,7 +368,7 @@ def test_the_database_url_wins_when_it_is_set(tmp_path, monkeypatch):
 
     monkeypatch.setenv("EVE_APP_DIR", str(tmp_path))
     monkeypatch.setenv("EVE_DATABASE_URL",
-                       "postgresql+psycopg://eve:eve@localhost:55432/eve")
+                       "postgresql+psycopg://eve:eve@localhost:5433/eve")
 
     assert import_sde._target_url(None).startswith("postgresql")
 

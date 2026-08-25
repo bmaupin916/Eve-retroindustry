@@ -44,7 +44,27 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 To bring the Postgres tests back:
 
 ```bash
-docker run -d --name eve-pg -e POSTGRES_PASSWORD=eve -e POSTGRES_USER=eve -e POSTGRES_DB=eve_retroindustry -p 55432:5432 postgres:17
+docker start eve-pg
+```
+
+If the container is gone entirely:
+
+```bash
+docker run -d --name eve-pg -e POSTGRES_PASSWORD=eve -e POSTGRES_USER=eve -e POSTGRES_DB=eve_retroindustry -p 5433:5432 postgres:17
+```
+
+**The host port is 5433, and it must stay below 49152.** It was 55432 until
+2026-08-25, when `docker start` began failing with *"bind: An attempt was made
+to access a socket in a way forbidden by its access permissions"*. That is not
+Docker: Windows' TCP dynamic port range is 49152–65535, and WinNAT/Hyper-V
+reserves blocks inside it at boot. One boot happened to reserve 55357–55456,
+which swallowed 55432. Any port in that range can be taken away on any reboot,
+so the fix was to move below the range rather than to restart `winnat`.
+
+To confirm it is really a reservation rather than something listening:
+
+```bash
+netsh interface ipv4 show excludedportrange protocol=tcp
 ```
 
 ## The thing to read first
