@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.66. **1432 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.67. **1451 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -1426,6 +1426,58 @@ conversions in this session tripped over *callers* rather than modules: dead
 `_finalize_orders`, and the `/api/contracts/items` regression. `deps.py` is
 where `get_conn()` itself lives, so converting it forces those dead parameters
 out in one place instead of leaving them to be rediscovered router by router.
+
+
+## The route-jump chunk was twice the size it could be (v0.9.67)
+
+A real bug, shipped, found by writing the test net *before* the conversion
+rather than by the conversion itself. It is the clearest example so far of why
+the net goes in first.
+
+`load_route_jumps` in `app/web/routers/assets.py` chunked its `IN` list at
+**900**, with a trailing comment saying "stay under SQLite's var limit". Every
+other chunked `IN` in this codebase — `character/assets.py`,
+`character/planets.py` — binds **one** parameter per element, so 900 elements
+cost 900 parameters and the number is right. This one is a **row-value** `IN`
+over normalised `(sys_a, sys_b)` pairs, so it binds **two**. A chunk of 900
+destinations bound **1,800** parameters, against the 999 the comment itself
+cites. *The chunk counted destinations and the cap counts parameters.*
+
+It never fired here because `SQLITE_LIMIT_VARIABLE_NUMBER` is a **compile-time**
+setting and this build allows 32,766. It is 999 before SQLite 3.32 and some
+distribution builds still ship that — which is the build the chunking exists
+for, and is a plausible VPS. On one, `/api/assets/distances` raises
+`too many SQL variables` above **499** destination systems. The comment two
+lines up records **482 unique systems** on the developer's own account. Seventeen
+under the cliff.
+
+The fix is `_ROUTE_CHUNK = 450` — 900 parameters, named in destinations with the
+factor of two written down next to it.
+
+**How the test caught it, and how it nearly did not.** The first chunking test
+fed it 901 destinations and passed — and also passed with the chunking deleted
+entirely, because 1,802 parameters is nothing against 32,766. That is the same
+trap as the assets container-name test: *when a test names a threshold, check
+the threshold is real.* The rewrite lowers the cap on the connection with
+`conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)`, which reproduces the
+old build at a realistic number of destinations instead of needing 16,000 of
+them. It failed against the shipped 900 with the genuine `OperationalError`.
+
+Two tests now pin it, deliberately: `setlimit` reproduces the failure, and a
+plain `_ROUTE_CHUNK * 2 <= 999` assertion states the arithmetic so a future edit
+fails on the line that explains why. The battery gained `M14` (back to 900) and
+`M15` (**500** — one destination over), and both are caught, so the boundary is
+exact rather than approximate.
+
+13/15 on the battery. The two survivors are the `if not dests` and `if not
+jumps` early returns, both confirmed redundant by measurement and both said so
+in their docstrings rather than papered over — and the second becomes
+load-bearing after the conversion, because SQLAlchemy raises `StatementError` on
+an empty parameter list where `sqlite3.executemany` treats it as a no-op.
+
+**The conversion itself is not in this commit.** It is a behaviour change, so it
+goes in ahead of the mechanical rewrite with the test that proves it, the same
+way the `AttributeError` gap in `load_cached_blueprints` was left for its own.
 
 
 ## contracts_helper and routers/contracts converted (v0.9.66)

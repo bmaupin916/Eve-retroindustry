@@ -1115,13 +1115,22 @@ def ensure_route_jump_table(conn: sqlite3.Connection) -> None:
     ensure_db_schema(conn)
 
 
+# The variable cap is a *compile-time* setting: 999 before SQLite 3.32, 32,766 on
+# the build here, 65,535 on Postgres. Every other chunked `IN` in this codebase
+# binds one parameter per element, so a chunk of 900 costs 900. **This one binds
+# two** — the row-value pair `(sys_a, sys_b)` — so the chunk counts destinations
+# while the cap counts parameters, and the two are a factor of 2 apart. Sized in
+# destinations, halved: 450 destinations is 900 parameters, under 999 everywhere.
+_ROUTE_CHUNK = 450          # destinations, not parameters — see above
+
+
 def load_route_jumps(conn: sqlite3.Connection, origin: int, dests: list[int]) -> dict[int, int]:
     """Cached jump counts from `origin` to each of `dests` ({dest: jumps})."""
     if not dests:
         return {}
     out: dict[int, int] = {}
-    for chunk_start in range(0, len(dests), 900):       # stay under SQLite's var limit
-        chunk = dests[chunk_start:chunk_start + 900]
+    for chunk_start in range(0, len(dests), _ROUTE_CHUNK):
+        chunk = dests[chunk_start:chunk_start + _ROUTE_CHUNK]
         pairs = [(min(origin, d), max(origin, d)) for d in chunk]
         ph = ",".join("(?,?)" * 1 for _ in pairs)
         flat: list[int] = [v for pair in pairs for v in pair]
