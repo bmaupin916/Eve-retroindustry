@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.60. **1025 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.60. **1026 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -377,27 +377,31 @@ work, not a move, and the event model has to be decided before it is written.
 all **done**. What that left is below.
 
 1. **Pick up the conversion.** No boundary is forcing the order any more —
-   `grep -rn "dbapi(" app/` is zero from v0.9.59. Take the rest of
-   `app/character/*` one module at a time: `assets`, `blueprints`, `contracts`,
-   `wallet`, `orders`, `planets`.
+   `grep -rn "dbapi(" app/` is zero from v0.9.59. Five modules left in
+   `app/character/*`, one at a time: `blueprints`, `contracts`, `wallet`,
+   `orders`, `planets`. (`assets` converted in v0.9.60.)
 
-   **Run the coverage probe first and let it choose.** Of the 35 functions it
-   found untested across this area, most of the remaining ones are in `assets`
-   (nine, including both cache writers and both fetchers) and `contracts` (six).
-   Those are the ones that bite; `orders` and `planets` are already well covered
-   by `tests/test_orders_cache.py`.
+   **`blueprints` is the natural next one**: smallest of the five at 124 lines
+   and four statements, it sits beside `assets` on the same two pages, and the
+   probe found three of its functions untested including its cache writer.
+   `contracts` is the biggest remaining gap at six.
 
-   The probe is twenty lines and it has to rebind wrappers into modules that
-   already did `from … import X` — see the note further down. It also has a
-   known blind spot worth remembering: it reports a function as never-called
-   when the tests monkeypatch it onto the *caller's* module, which is exactly
-   why every `fetch_*` shows as dead.
+   **Run the coverage probe first and let it confirm.** It is twenty lines, and
+   it has to rebind wrappers into modules that already did `from … import X` —
+   see the note further down. It also has a known blind spot worth remembering:
+   it reports a function as never-called when the tests monkeypatch it onto the
+   *caller's* module, which is why every `fetch_*` shows as dead.
 
-   **Also worth doing, and measured:** four cross-backend test files still use a
-   function-scoped `engine` fixture, which rebuilds a Postgres schema per test.
-   Module scope plus clearing tables is ~18x faster and worth about 38 seconds
-   of the 4m42s suite. See "The cross-backend fixtures are why the suite got
-   slow".
+   **Also worth doing, and measured:** **six** cross-backend test files still use
+   a function-scoped `engine` fixture, which rebuilds a Postgres schema — all ten
+   migrations — per test: `test_app_defaults_on_postgres`,
+   `test_industry_helper_on_postgres`, `test_int64_columns_on_postgres`,
+   `test_industry_on_postgres`, `test_projects_on_postgres`,
+   `test_sde_on_postgres`. Module scope plus clearing tables is ~18x faster.
+   `test_character_assets_on_postgres.py` is the worked example. See "The
+   cross-backend fixtures are why the suite got slow"; note the last two need
+   their cleared-table lists chosen with care, because one seeds `sde_types` per
+   module and the other runs the importer.
 
    `app/character/*` is also what `token_store` sits behind, so read
    `tests/conftest.py` first: this is the area where a test writing to the real
@@ -970,8 +974,9 @@ Done for `test_character_caches_on_postgres.py` and
 and `test_sde_on_postgres` runs the importer, so those two need their cleared-
 table lists chosen with more care than the others.
 
-Full suite as of v0.9.59: **4m42s** with Postgres up, against roughly three
-minutes before any cross-backend file existed.
+Full suite as of v0.9.60: **3m28s** with Postgres up and 1,028 tests, against
+roughly three minutes before any cross-backend file existed. It peaked over ten
+minutes before the two biggest files went module-scoped.
 
 
 ## character/assets converted (v0.9.60)
