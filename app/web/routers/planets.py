@@ -20,6 +20,7 @@ from app.sync import worker as sync_worker
 from app.web import pi_planner_helper
 from app.db.location import database_path
 from app.db.schema import ensure_schema as ensure_db_schema
+from app.db.conn import connect as _connect
 from app.web.deps import _tr, all_characters, get_conn
 
 router = APIRouter()
@@ -41,7 +42,12 @@ def _load_pi_colonies(conn: sqlite3.Connection, chars) -> list:
       "forbidden"         — token predates the PI scope; prompt a re-auth
       None                — never synced
     """
-    return [(cid, planets_api.load_cached_colonies(conn, cid)[0]) for cid, _ in chars]
+    # Its own connection: `app/character/planets.py` is on the portable
+    # query layer while this router is not, so `conn` here is still a raw
+    # sqlite3 handle for the PI-cache statements below. Same database.
+    with _connect() as _pc:
+        return [(cid, planets_api.load_cached_colonies(_pc, cid)[0])
+                for cid, _ in chars]
 
 
 def _pi_cache_age(conn: sqlite3.Connection, chars) -> float:
@@ -51,8 +57,9 @@ def _pi_cache_age(conn: sqlite3.Connection, chars) -> float:
     and a page that quoted the freshest would be describing whichever character
     happened to sync last.
     """
-    ages = [at for cid, _ in chars
-            if (at := planets_api.load_cached_colonies(conn, cid)[1])]
+    with _connect() as _pc:
+        ages = [at for cid, _ in chars
+                if (at := planets_api.load_cached_colonies(_pc, cid)[1])]
     return min(ages) if ages else 0.0
 
 
@@ -360,7 +367,8 @@ def _resolve_planet_names(conn: sqlite3.Connection, planet_ids) -> dict[int, str
     right after somebody sets them up.
     """
     _ensure_pi_cache_tables(conn)
-    return planets_api.load_planet_names(conn, planet_ids)
+    with _connect() as _pc:
+        return planets_api.load_planet_names(_pc, planet_ids)
 
 
 def _store_pi_cache_for_chars(conn: sqlite3.Connection, char_ids, entries) -> None:
@@ -401,8 +409,10 @@ def _pi_refresh_alerts(conn: sqlite3.Connection, chars) -> None:
     raw: list[tuple] = []
     ok_cids: list[int] = []
 
-    for cid, _name in chars:
-        res, _at = planets_api.load_cached_colonies(conn, cid)
+    with _connect() as _pc:
+        colonies_by_char = [(cid, planets_api.load_cached_colonies(_pc, cid)[0])
+                            for cid, _name in chars]
+    for cid, res in colonies_by_char:
         if res is None or isinstance(res, str):
             # Never synced, or the token lacks the scope. Either way this
             # character's existing rows stay: replacing them with nothing would

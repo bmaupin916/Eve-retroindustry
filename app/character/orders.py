@@ -14,10 +14,11 @@ Scope: esi-markets.read_character_orders.v1 / esi-markets.read_corporation_order
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 
 import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 ESI_BASE = "https://esi.evetech.net/latest"
 
@@ -34,7 +35,7 @@ def _auth(token: str) -> dict:
 
 # ── cache ────────────────────────────────────────────────────────────────────
 
-def load_cached_orders(conn: sqlite3.Connection, owner_id: int,
+def load_cached_orders(conn: Connection, owner_id: int,
                        kind: str = CHARACTER,
                        state: str = ACTIVE) -> tuple[list[dict] | None, float]:
     """(orders, cached_at), or (None, 0) if this owner has never been synced.
@@ -45,9 +46,9 @@ def load_cached_orders(conn: sqlite3.Connection, owner_id: int,
     claim a character is idle when it has simply not been reached.
     """
     row = conn.execute(
-        "SELECT data_json, cached_at FROM market_orders_cache"
-        " WHERE owner_id=? AND owner_kind=? AND state=?",
-        (owner_id, kind, state),
+        text("SELECT data_json, cached_at FROM market_orders_cache"
+             " WHERE owner_id=:owner_id AND owner_kind=:kind AND state=:state"),
+        {"owner_id": owner_id, "kind": kind, "state": state},
     ).fetchone()
     if not row:
         return None, 0.0
@@ -57,14 +58,20 @@ def load_cached_orders(conn: sqlite3.Connection, owner_id: int,
         return None, 0.0
 
 
-def save_cached_orders(conn: sqlite3.Connection, owner_id: int, orders: list[dict],
+def save_cached_orders(conn: Connection, owner_id: int, orders: list[dict],
                        kind: str = CHARACTER, state: str = ACTIVE) -> None:
+    # No commit, deliberately: the caller owns the transaction boundary. All
+    # three parts of the primary key are the conflict target — drop one and
+    # this does not raise, it inserts a second row, and a corporation's book
+    # can then appear as the pilot's own.
     conn.execute(
-        "INSERT INTO market_orders_cache"
-        " (owner_id, owner_kind, state, data_json, cached_at) VALUES (?,?,?,?,?)"
-        " ON CONFLICT (owner_id, owner_kind, state) DO UPDATE SET"
-        " data_json=excluded.data_json, cached_at=excluded.cached_at",
-        (owner_id, kind, state, json.dumps(orders), time.time()),
+        text("INSERT INTO market_orders_cache"
+             " (owner_id, owner_kind, state, data_json, cached_at)"
+             " VALUES (:owner_id, :kind, :state, :data, :cached_at)"
+             " ON CONFLICT (owner_id, owner_kind, state) DO UPDATE SET"
+             " data_json=excluded.data_json, cached_at=excluded.cached_at"),
+        {"owner_id": owner_id, "kind": kind, "state": state,
+         "data": json.dumps(orders), "cached_at": time.time()},
     )
 
 
@@ -95,7 +102,7 @@ async def _get_all(client: httpx.AsyncClient, url: str, token: str,
 
 
 async def fetch_orders(client, char_id: int, token: str,
-                       conn: sqlite3.Connection | None = None) -> list[dict] | None:
+                       conn: Connection | None = None) -> list[dict] | None:
     """Active orders of a character (single page).
 
     Returns None when the fetch could not run, so the worker can leave the last
@@ -116,7 +123,7 @@ async def fetch_orders(client, char_id: int, token: str,
 
 
 async def fetch_orders_history(client, char_id: int, token: str,
-                               conn: sqlite3.Connection | None = None) -> list[dict] | None:
+                               conn: Connection | None = None) -> list[dict] | None:
     orders = await _get_all(
         client, f"{ESI_BASE}/characters/{char_id}/orders/history/", token)
     if orders is None:
@@ -127,7 +134,7 @@ async def fetch_orders_history(client, char_id: int, token: str,
 
 
 async def fetch_corp_orders(client, corp_id: int, token: str,
-                            conn: sqlite3.Connection | None = None
+                            conn: Connection | None = None
                             ) -> tuple[list[dict] | None, str | None]:
     try:
         r = await client.get(f"{ESI_BASE}/corporations/{corp_id}/orders/",
@@ -151,7 +158,7 @@ async def fetch_corp_orders(client, corp_id: int, token: str,
 
 
 async def fetch_corp_orders_history(client, corp_id: int, token: str,
-                                    conn: sqlite3.Connection | None = None
+                                    conn: Connection | None = None
                                     ) -> list[dict] | None:
     orders = await _get_all(
         client, f"{ESI_BASE}/corporations/{corp_id}/orders/history/", token)

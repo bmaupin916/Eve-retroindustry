@@ -34,7 +34,6 @@ from app.web.deps import (
     _valid_token_async,
     _tr,
     get_active_character_id,
-    get_conn,
 )
 
 router = APIRouter()
@@ -327,16 +326,17 @@ def _decorate_orders(orders: list[dict], type_names: dict[int, str],
 @router.get("/orders", response_class=HTMLResponse)
 async def orders_page(request: Request, char: str = "", scope: str = "personal",
                       state: str = "active"):
-    conn = get_conn()
+    conn = _connect()
     all_chars = (char == "all")
 
     def _type_names(type_ids: set[int]) -> dict[int, str]:
         type_ids = {t for t in type_ids if t}
         if not type_ids:
             return {}
-        ph = ",".join("?" * len(type_ids))
         return {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})", list(type_ids)
+            text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(type_ids)},
         ).fetchall()}
 
     # ── All characters: orders across all characters, tagged with "party" ──

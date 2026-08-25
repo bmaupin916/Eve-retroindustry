@@ -22,40 +22,44 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import time
 
 import pytest
 from sqlalchemy import text
 
 from app.character import orders as orders_api
-from app.db.schema import apply_schema
 
 
 @pytest.fixture
 def conn(tmp_path):
-    c = sqlite3.connect(str(tmp_path / "orders.db"))
-    apply_schema(c)
+    """An engine connection. Every module this file exercises — assets,
+    blueprints, contracts, wallet, orders, planets — is on the portable query
+    layer as of v0.9.65, so there is no longer a consumer for the raw sqlite3
+    handle this used to hand out."""
+    from sqlalchemy import create_engine
+    from app.db.migrate import upgrade_to_head
+
+    url = f"sqlite:///{tmp_path / 'orders.db'}"
+    upgrade_to_head(url)
+    eng = create_engine(url)
+    c = eng.connect()
     yield c
     c.close()
-
+    eng.dispose()
 
 
 def _engine_conn(conn):
-    """An engine connection onto the same file this raw `conn` is attached to.
+    """Vestigial: `conn` is already an engine connection.
 
-    `app/character/assets.py`, `app/character/blueprints.py` and
-    `app/character/contracts.py` are on the portable query layer; the fixture
-    above is shared with tests for modules that are not, so it keeps handing
-    out a sqlite3 handle and the tests that need the other kind ask for it
-    here.
+    It used to open one onto the same file, for the few tests whose module had
+    converted while the fixture still served ones that had not. Kept as a
+    `nullcontext` so the `with _engine_conn(conn) as ec:` blocks below stay as
+    they are; unwrapping those twelve blocks is a reindent with no behaviour in
+    it, and doing it in the same change as the conversion would bury the part
+    worth reading.
     """
     import contextlib
-    from sqlalchemy import create_engine
-    path = [r[2] for r in conn.execute("PRAGMA database_list")
-            if r[1] == "main"][0]
-    eng = create_engine(f"sqlite:///{path}")
-    return contextlib.closing(eng.connect())
+    return contextlib.nullcontext(conn)
 
 
 ALICE, BOB, CORP = 90_000_001, 90_000_002, 98_000_001
@@ -92,9 +96,11 @@ def test_a_corrupt_row_reads_as_unsynced_rather_than_raising(conn):
     """A half-written cache must not take the page down — and it must not read
     as an empty order book either."""
     conn.execute(
-        "INSERT INTO market_orders_cache"
-        " (owner_id, owner_kind, state, data_json, cached_at) VALUES (?,?,?,?,?)",
-        (ALICE, orders_api.CHARACTER, orders_api.ACTIVE, "{not json", 1.0))
+        text("INSERT INTO market_orders_cache"
+             " (owner_id, owner_kind, state, data_json, cached_at)"
+             " VALUES (:owner_id, :kind, :state, :data, :cached_at)"),
+        {"owner_id": ALICE, "kind": orders_api.CHARACTER,
+         "state": orders_api.ACTIVE, "data": "{not json", "cached_at": 1.0})
     conn.commit()
 
     orders, _at = orders_api.load_cached_orders(conn, ALICE)
@@ -157,7 +163,8 @@ def test_a_second_sync_replaces_rather_than_appending(conn):
     conn.commit()
 
     rows = conn.execute(
-        "SELECT data_json FROM market_orders_cache WHERE owner_id=?", (ALICE,)
+        text("SELECT data_json FROM market_orders_cache WHERE owner_id=:owner_id"),
+        {"owner_id": ALICE},
     ).fetchall()
 
     assert len(rows) == 1, f"{len(rows)} rows for one owner/kind/state"
@@ -349,132 +356,119 @@ def test_an_unsynced_character_is_told_so_rather_than_shown_zero(client):
 # ── /wallet, same shape ──────────────────────────────────────────────────────
 
 
-@pytest.fixture
-def wconn(conn):
-    """An engine connection onto the same database as `conn`.
-
-    `app/character/wallet.py` is on the portable query layer, so its readers and
-    writers take one of these. A fixture rather than a `with` block inside each
-    test: the assertions are the point, and eight extra levels of indentation
-    would bury them.
-    """
-    with _engine_conn(conn) as ec:
-        yield ec
-
-
 from app.character import wallet as wallet_api  # noqa: E402  (grouped with its tests)
 
 
-def test_an_unsynced_wallet_reads_as_none_not_an_empty_journal(wconn):
+def test_an_unsynced_wallet_reads_as_none_not_an_empty_journal(conn):
     """The same distinction as orders, and it matters more here: an empty
     journal reads as "no activity this month", which is a finding rather than
     a gap."""
-    rows, at = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.JOURNAL)
+    rows, at = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
 
     assert rows is None
     assert at == 0.0
 
 
-def test_a_wallet_ledger_round_trips(wconn):
-    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.JOURNAL,
+def test_a_wallet_ledger_round_trips(conn):
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL,
                                   [{"id": 1, "amount": -5.0}])
-    wconn.commit()
+    conn.commit()
 
-    rows, at = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.JOURNAL)
+    rows, at = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
 
     assert [r["id"] for r in rows] == [1]
     assert at > 0
 
 
-def test_the_journal_and_transactions_do_not_overwrite_each_other(wconn):
+def test_the_journal_and_transactions_do_not_overwrite_each_other(conn):
     """`ledger` is in the key. The worker writes both back to back, so a key
     that collapsed would leave whichever ran last in both tabs."""
-    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
-    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.TRANSACTIONS, [{"id": 2}])
-    wconn.commit()
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS, [{"id": 2}])
+    conn.commit()
 
-    journal, _ = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.JOURNAL)
-    txns, _ = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.TRANSACTIONS)
+    journal, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
+    txns, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS)
 
     assert [r["id"] for r in journal] == [1]
     assert [r["id"] for r in txns] == [2]
 
 
-def test_corporation_divisions_are_kept_apart(wconn):
+def test_corporation_divisions_are_kept_apart(conn):
     """Seven divisions, shown one at a time. Without `division` in the key the
     page would show division 1's ledger under every tab — and the numbers look
     plausible, which is the worst kind of wrong for a wallet."""
     for div in (1, 3):
-        wallet_api.save_cached_ledger(wconn, CORP, wallet_api.JOURNAL,
+        wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL,
                                       [{"id": div}], wallet_api.CORPORATION, div)
-    wconn.commit()
+    conn.commit()
 
     one, _ = wallet_api.load_cached_ledger(
-        wconn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 1)
+        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 1)
     three, _ = wallet_api.load_cached_ledger(
-        wconn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 3)
+        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 3)
 
     assert [r["id"] for r in one] == [1]
     assert [r["id"] for r in three] == [3]
 
 
-def test_a_character_and_a_corporation_do_not_share_division_zero(wconn):
+def test_a_character_and_a_corporation_do_not_share_division_zero(conn):
     """A character sits at division 0 and a corporation's balance list does
     too. `owner_kind` is what keeps them apart."""
-    wallet_api.save_cached_ledger(wconn, CORP, wallet_api.JOURNAL, [{"id": 1}])
-    wallet_api.save_cached_ledger(wconn, CORP, wallet_api.JOURNAL, [{"id": 2}],
+    wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL, [{"id": 1}])
+    wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL, [{"id": 2}],
                                   wallet_api.CORPORATION)
-    wconn.commit()
+    conn.commit()
 
-    personal, _ = wallet_api.load_cached_ledger(wconn, CORP, wallet_api.JOURNAL)
+    personal, _ = wallet_api.load_cached_ledger(conn, CORP, wallet_api.JOURNAL)
     corp, _ = wallet_api.load_cached_ledger(
-        wconn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION)
+        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION)
 
     assert [r["id"] for r in personal] == [1]
     assert [r["id"] for r in corp] == [2]
 
 
-def test_a_failed_journal_fetch_keeps_the_previous_month(wconn):
+def test_a_failed_journal_fetch_keeps_the_previous_month(conn):
     """`fetch_journal` returned `[]` on any failure. Cached, that erases a
     month of history and the next sync writes the erasure down."""
-    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
-    wconn.commit()
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
+    conn.commit()
 
     result = asyncio.run(
-        wallet_api.fetch_journal(_Client(_Resp(500)), ALICE, "tok", conn=wconn))
+        wallet_api.fetch_journal(_Client(_Resp(500)), ALICE, "tok", conn=conn))
 
     assert result is None, "a failed fetch reported an empty journal"
-    kept, _ = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.JOURNAL)
+    kept, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
     assert [r["id"] for r in kept] == [1], "the good cache was overwritten"
 
 
-def test_a_failed_transactions_fetch_writes_nothing(wconn):
-    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.TRANSACTIONS, [{"id": 1}])
-    wconn.commit()
+def test_a_failed_transactions_fetch_writes_nothing(conn):
+    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS, [{"id": 1}])
+    conn.commit()
 
     result = asyncio.run(
-        wallet_api.fetch_transactions(_Client(_Resp(500)), ALICE, "tok", conn=wconn))
+        wallet_api.fetch_transactions(_Client(_Resp(500)), ALICE, "tok", conn=conn))
 
     assert result is None
-    kept, _ = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.TRANSACTIONS)
+    kept, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS)
     assert [r["id"] for r in kept] == [1]
 
 
-def test_the_balance_lands_in_the_table_the_dashboard_reads(wconn):
+def test_the_balance_lands_in_the_table_the_dashboard_reads(conn):
     """Not the ledger table. `char_wallet_cache` has a second consumer in
     `app/web/main.py` that reads it with a five-minute TTL and fetches on a
     miss — writing it here is what stops that fetch happening at all."""
     asyncio.run(wallet_api.fetch_balance(
-        _Client(_Resp(200, 12_345.75)), ALICE, "tok", conn=wconn))
-    wconn.commit()
+        _Client(_Resp(200, 12_345.75)), ALICE, "tok", conn=conn))
+    conn.commit()
 
-    stored = wconn.execute(
+    stored = conn.execute(
         text("SELECT balance FROM char_wallet_cache WHERE character_id=:cid"),
         {"cid": ALICE}).fetchone()
 
     assert stored is not None, "the balance did not reach char_wallet_cache"
     assert stored[0] == pytest.approx(12_345.75)
-    assert wallet_api.load_cached_balance(wconn, ALICE)[0] == pytest.approx(12_345.75)
+    assert wallet_api.load_cached_balance(conn, ALICE)[0] == pytest.approx(12_345.75)
 
 
 def test_an_unsynced_wallet_page_says_so_rather_than_showing_zero(client):
@@ -597,11 +591,13 @@ def test_the_asset_reader_ignores_the_ttl(conn):
     """
     stale = time.time() - assets_api.CACHE_TTL - 3600      # an hour past expiry
     conn.execute(
-        "INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
-        " VALUES (?,?,?)",
-        (ALICE, json.dumps([{"item_id": 1, "type_id": 34, "location_id": 60003760,
-                             "quantity": 5, "is_singleton": False,
-                             "location_flag": "Hangar"}]), stale))
+        text("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :cached_at)"),
+        {"cid": ALICE,
+         "data": json.dumps([{"item_id": 1, "type_id": 34, "location_id": 60003760,
+                              "quantity": 5, "is_singleton": False,
+                              "location_flag": "Hangar"}]),
+         "cached_at": stale})
     conn.commit()
 
     with _engine_conn(conn) as ec:
@@ -618,12 +614,14 @@ def test_the_asset_reader_ignores_the_ttl(conn):
 def test_the_blueprint_reader_ignores_the_ttl(conn):
     stale = time.time() - bp_api.CACHE_TTL - 3600
     conn.execute(
-        "INSERT INTO char_blueprints_cache (character_id, data_json, cached_at)"
-        " VALUES (?,?,?)",
-        (ALICE, json.dumps([{"item_id": 9, "type_id": 999, "location_id": 60003760,
-                             "quantity": -1, "material_efficiency": 10,
-                             "time_efficiency": 20, "runs": -1,
-                             "location_flag": "Hangar"}]), stale))
+        text("INSERT INTO char_blueprints_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :cached_at)"),
+        {"cid": ALICE,
+         "data": json.dumps([{"item_id": 9, "type_id": 999, "location_id": 60003760,
+                              "quantity": -1, "material_efficiency": 10,
+                              "time_efficiency": 20, "runs": -1,
+                              "location_flag": "Hangar"}]),
+         "cached_at": stale})
     conn.commit()
 
     with _engine_conn(conn) as ec:
@@ -788,8 +786,10 @@ def test_a_failed_colony_list_leaves_the_previous_one(conn):
 def test_planet_names_are_read_without_fetching(conn):
     """They never change, so the worker resolves each one once, ever. The page
     reads whatever is known and falls back to the id for the rest."""
-    conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
-                 (4001, "Testworld IV"))
+    conn.execute(
+        text("INSERT INTO planet_name_cache (planet_id, name)"
+             " VALUES (:pid, :name)"),
+        {"pid": 4001, "name": "Testworld IV"})
     conn.commit()
 
     assert planets_api.load_planet_names(conn, [4001, 4002]) == {4001: "Testworld IV"}

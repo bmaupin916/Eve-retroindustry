@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.64. **1272 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.65. **1346 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -43,18 +43,21 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   matches the definition in `app/db/conn.py` and its docstring, so it answers
   **2** on a fully converted tree and reads like a regression. What remains is not
   crossings but modules still holding a raw `get_conn()` handle of their own:
-  `character/orders`, `character/planets`, then `media`, `contracts`,
-  `characters`, `planets`, `locations`, `prices`, `assets`, `plan`, and
-  finally `deps.py`, `main.py` and `app/db/schema.py`. `character/assets`
-  converted in v0.9.60, `character/blueprints` in v0.9.61,
-  `character/contracts` in v0.9.62, `character/wallet` in v0.9.64.
+  **`app/character/*` is done as of v0.9.65** — `assets` (v0.9.60),
+  `blueprints` (v0.9.61), `contracts` (v0.9.62), `wallet` (v0.9.64),
+  `orders` and `planets` (v0.9.65). What is left is the web layer:
+  `plan`, `prices`, `locations`, `assets`, `planets`, `media`, the
+  helpers beside them, and finally `deps.py`, `main.py` and
+  `app/db/schema.py`.
 
-  **A second measure, now that `dbapi()` has retired:** `grep -c "conn=raw"
-  app/sync/worker.py`. That variable exists only for the modules still on
-  `sqlite3`, so it falls as they convert — 13 before v0.9.62, 11 after, **5**
-  after v0.9.64. The five left are `orders` (four) and `planets` (one). When
-  it reaches zero the whole `raw = conn.connection.driver_connection` line
-  goes with it.
+  **The `conn=raw` measure has retired too** — it reached zero in v0.9.65
+  and the `raw = conn.connection.driver_connection` line went with it. It
+  ran 13 → 11 → 5 → 0 across v0.9.62–65.
+
+  **The measure from here is the count of raw `?`-parameter statements**, and
+  it has to be taken with an AST walk rather than a grep — see "Count
+  statements with an AST" below. **145** of them at v0.9.65, spread over 20
+  files; thirteen files still hold a raw `get_conn()` handle.
 
 To bring the Postgres tests back:
 
@@ -417,22 +420,49 @@ all **done**. What that left is below.
    `app/character/*`, one at a time: `contracts`, `wallet`, `orders`,
    `planets`. (`assets` converted in v0.9.60, `blueprints` in v0.9.61.)
 
-   **`orders` and `planets` are all that is left of `app/character/*`**, and
-   they are the cheapest of the six: two raw statements in `orders`, four in
-   `planets`, and `tests/test_orders_cache.py` already covers the character
-   paths of both. `orders` first — it owns four of the five remaining `conn=raw`
-   sites against `planets`' one.
+   **`app/character/*` is finished (v0.9.65). What is left is the web layer**,
+   and it converts by *router* rather than by module — the opposite of the rule
+   that ordered the six character modules, for a measured reason.
 
-   **The gap in both is the corporation half**, exactly as it was in `wallet`:
-   `fetch_orders_history`, `fetch_corp_orders` and `fetch_corp_orders_history`
-   have no test, and neither do `fetch_planet_names` or `fetch_planet_detail`.
-   That is the same shape that made `wallet` worth a net — the existing tests
-   exercise one owner kind and the untested fetchers are the ones that vary it.
+   `deps.py`'s three cache readers (`_load_assets_from_cache`,
+   `_load_blueprints_from_cache`, `_load_corp_assets_from_cache`) have **12 call
+   sites across five routers that are still on `get_conn()`**. Converting the
+   readers first makes every one of those open its own `connect()`, in code that
+   gets re-touched the moment its router converts — the same trap that put
+   `industry_helper` before `location_resolver` back at v0.9.56. The readers are
+   leaves and their callers own the connection, so the callers go first and the
+   readers come along free.
 
-   **Before switching any handler's connection, grep the handler for statements
-   of its own.** `conn.execute` inside a handler is the thing that broke
-   `/api/contracts/items` in v0.9.62 — see "A conversion broke a page". Do that
-   grep first, not after.
+   Sized, cheapest first — own raw statements / deps-reader sites / `get_conn()`
+   handles:
+
+   | unit | stmts | readers | handles |
+   | --- | --- | --- | --- |
+   | `routers/contracts.py` | **0** | 0 | 3 |
+   | `routers/assets.py` | 8 | 3 | 5 |
+   | `routers/locations.py` | 8 | 2 | 9 |
+   | `routers/planets.py` | 11 | 0 | 4 |
+   | `routers/plan.py` | 18 | 2 | 2 |
+   | `routers/prices.py` | 13 | 4 | 13 |
+
+   **`routers/contracts.py` first**: it has no raw statements left at all — its
+   one was converted in the v0.9.63 fix — and its three remaining `get_conn()`
+   handles are the public-contract handlers, which go through
+   `contracts_helper`. It is the cheapest complete unit and it closes a file
+   that is currently half-converted, which is worth finishing rather than
+   leaving in two states.
+
+   Then `assets` → `locations` → `planets` → `plan`, with the prices cluster
+   (`prices_helper` 15 + `routers/prices` 13 + `market/prices` 11 = 39) last as
+   its own project. **`deps.py` and `get_conn()` itself go at the very end** —
+   `get_conn()` has 59 call sites, so deleting it is the closing act rather
+   than a step along the way.
+
+   **Before switching any handler's connection, list the handler's own
+   statements — with an AST walk, not a grep.** A raw `conn.execute` inside a
+   handler is what broke `/api/contracts/items` in v0.9.62 (see "A conversion
+   broke a page"), and a grep under-reported the same thing by half in
+   `tests/test_orders_cache.py` (see "Count statements with an AST").
 
    **`raw = conn.connection.driver_connection` in `app/sync/worker.py` is the
    thermometer.** It exists only for the modules still on `sqlite3`, and every
@@ -1028,7 +1058,7 @@ Done for `test_character_caches_on_postgres.py` and
 and `test_sde_on_postgres` runs the importer, so those two need their cleared-
 table lists chosen with more care than the others.
 
-Full suite as of v0.9.64: **5m43s** with Postgres up and 1,274 tests, against
+Full suite as of v0.9.65: **5m51s** with Postgres up and 1,348 tests, against
 roughly three minutes before any cross-backend file existed. It peaked over ten
 minutes before the two biggest files went module-scoped.
 
@@ -1313,3 +1343,89 @@ mutation-verified against the `sqlite3` version first, as always — 31/32 from
 the new file alone, and 32/32 once `tests/test_orders_cache.py` is included,
 which already covered the balance writer — but unlike `blueprints` and
 `contracts` there is no separate tests-first commit to point at.
+
+
+## character/orders and character/planets converted (v0.9.65)
+
+The last two of the six, and `app/character/*` is now entirely on the portable
+query layer. `conn=raw` in the worker reached **zero**, and the
+`raw = conn.connection.driver_connection` line went with it — the comment that
+replaced it records why the property it protected (an event never announced
+before the data it describes) still holds with one connection rather than two
+views of one.
+
+`orders`: three-part key `(owner_id, owner_kind, state)`, 23/23 mutations. Its
+`orders_page` held one raw `sde_types` lookup, found by grepping the handler
+first — the step that was skipped in v0.9.62.
+
+`planets` was the awkward one, and not because of the module. Its **router** is
+heavily raw: about a dozen statements spread over `_load_pi_colonies`,
+`_pi_cache_age`, `_resolve_planet_names`, `_store_pi_cache_for_chars`,
+`_pi_refresh_alerts` and `_pi_alert_summary`. Converting it wholesale would have
+been a second change wearing the first one's clothes, so the four `planets_api`
+call sites take their own engine connection and the router keeps `get_conn()`
+for its own statements. `load_planet_names`' chunked `IN (...)` became an
+expanding bindparam, the same shape `assets` uses.
+
+## The test scaffolding came out with it
+
+`tests/test_orders_cache.py` exercises all six of these modules, so with the
+last one converted its `conn` fixture is now an **engine connection** and the
+raw sqlite3 handle it used to hand out has no consumer. The file no longer
+imports `sqlite3` at all.
+
+* `wconn`, the shim added for the wallet tests, is gone — 39 uses renamed back
+  to `conn`.
+* `_engine_conn` survives as a `nullcontext` so its twelve `with` blocks stay
+  as they are. Unwrapping them is a pure reindent with no behaviour in it, and
+  doing it inside the conversion commit would bury the part worth reading. It
+  is documented as vestigial rather than left looking load-bearing. **Worth
+  finishing** the next time that file is opened for another reason.
+
+## Count statements with an AST, not a grep
+
+`grep 'conn.execute("'` found **two** raw statements in
+`tests/test_orders_cache.py`. An AST walk found **four** — the two it missed
+were spread across lines, which is how most of them are written.
+
+That is the third instance of one failure mode today, after the `-k "[sqlite]"`
+filter that silently selected 37 of 45 tests and the bare `grep -rn "dbapi("`
+that answered 2 on a clean tree. **A selector that quietly under-reports looks
+exactly like a clean result.** The fix is the same each time: measure the
+selector, not just its output — count what it returned and compare it against
+what you expected to be there.
+
+The walk that gives the real number, and the one the count above uses:
+
+```python
+import ast, pathlib
+for f in pathlib.Path("app").rglob("*.py"):
+    for node in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("execute", "executemany") and node.args
+                and isinstance(node.args[0], (ast.Constant, ast.JoinedStr))):
+            print(f, node.lineno)
+```
+
+`ast.Constant` catches the plain strings and `ast.JoinedStr` the f-strings —
+which is where the `IN ({ph})` placeholder patterns live, and those are the ones
+that need an expanding bindparam rather than a mechanical rewrite.
+
+## Where the remaining 145 statements are
+
+| cluster | statements |
+| --- | --- |
+| `routers/plan.py` | 18 |
+| prices — `prices_helper`, `routers/prices`, `market/prices` | 39 |
+| PI — `routers/planets`, `pi_planner_helper` | 18 |
+| `main.py`, `deps.py` | 17 |
+| `routers/assets`, `routers/locations`, `contracts_helper` | 24 |
+| infrastructure — `bootstrap`, `security`, `schema`, `conn` | 19 |
+| the rest | 10 |
+
+**Take `deps.py` next, and not because it is biggest.** Three of the four
+conversions in this session tripped over *callers* rather than modules: dead
+`conn` parameters in `_finalize_contracts`, `_wallet_names`, `_decorate` and
+`_finalize_orders`, and the `/api/contracts/items` regression. `deps.py` is
+where `get_conn()` itself lives, so converting it forces those dead parameters
+out in one place instead of leaving them to be rediscovered router by router.

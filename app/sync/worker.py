@@ -277,12 +277,15 @@ class SyncWorker:
         corp_id: int | None = None
         try:
             with connect() as conn:
-                # The fetchers write their caches through the DBAPI connection
-                # underneath this one, so the events emitted below land after
-                # the data they describe on the same connection. A consumer is
-                # never told about a change it cannot read; the reverse — data
-                # visible before its event — is only a late announcement.
-                raw = conn.connection.driver_connection
+                # Every fetcher below takes this connection directly. Until
+                # v0.9.65 the ones still on `sqlite3` were handed
+                # `conn.connection.driver_connection` instead — the DBAPI handle
+                # underneath — which kept them on the same connection as the
+                # events emitted afterwards. That mattered for ordering: a
+                # consumer is never told about a change it cannot read, and the
+                # reverse, data visible before its event, is only a late
+                # announcement. The property still holds now that there is one
+                # connection rather than two views of it.
                 async with esi_client() as client:
                     # `force_refresh` on all three, like the jobs fetch below.
                     # Without it each consults the same TTL it is about to
@@ -325,14 +328,14 @@ class SyncWorker:
                     # one or the other and history is the expensive one — four
                     # paginated calls against ninety days that change once a
                     # trade closes.
-                    orders = await fetch_orders(client, char_id, token, conn=raw)
+                    orders = await fetch_orders(client, char_id, token, conn=conn)
                     changed += self._diff(char_id, "orders", orders)
 
                     # No event for history: a closed order is not news the
                     # way a new one is, and the page that reads it is a ledger
                     # rather than a monitor. It writes nothing when the fetch
                     # fails, so the previous cache stays the best answer.
-                    await fetch_orders_history(client, char_id, token, conn=raw)
+                    await fetch_orders_history(client, char_id, token, conn=conn)
 
                     # /wallet reads these. The balance goes to the table the
                     # dashboard already polls, so that read stops falling
@@ -358,7 +361,7 @@ class SyncWorker:
                     # from it is an extractor expiry, which is a fixed future
                     # timestamp until somebody resets the program.
                     colonies = await fetch_colonies(client, char_id, token,
-                                                    conn=raw)
+                                                    conn=conn)
                     if isinstance(colonies, tuple):
                         changed += self._diff(char_id, "colonies", colonies[0])
 
@@ -378,12 +381,12 @@ class SyncWorker:
                             # best-effort handling: a 403 returns an error
                             # string rather than raising, and writes nothing.
                             corp_orders, _err = await fetch_corp_orders(
-                                client, corp_id, token, conn=raw)
+                                client, corp_id, token, conn=conn)
                             changed += self._diff(
                                 char_id, "corp_orders", corp_orders,
                                 corporation_id=corp_id)
                             await fetch_corp_orders_history(
-                                client, corp_id, token, conn=raw)
+                                client, corp_id, token, conn=conn)
 
                             # Corporation wallets: one call lists every
                             # division's balance, then the ledgers are per

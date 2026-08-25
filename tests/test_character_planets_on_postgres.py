@@ -14,8 +14,10 @@ module's one chunked `IN (...)` — the pattern that has to become an expanding
 bindparam — and it is an upsert whose transaction boundary belongs to its
 caller.
 
-**These assertions are written against the `sqlite3` version on purpose**, so
-the conversion is judged by whether it preserves them.
+**These assertions are unchanged by the conversion.** They were written against
+the `sqlite3` version first, so the rewrite could be judged by whether it
+preserves them. Only the fixture underneath moved, and it now runs each of them
+on both backends.
 
 Three things here are conversion traps rather than ordinary behaviour:
 
@@ -36,12 +38,14 @@ Three things here are conversion traps rather than ordinary behaviour:
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from app.character import planets as planets_api
-from app.db.schema import apply_schema
+from tests.test_postgres_schema import URL as PG_URL, _reachable
+
+PG_SCHEMA = "pytest_character_planets"
 
 ALICE = 2_112_625_428
 
@@ -81,17 +85,72 @@ def _named(name: str) -> _Resp:
     return _Resp(200, {"name": name})
 
 
+@pytest.fixture(scope="module", params=["sqlite", "postgres"])
+def engine(request, tmp_path_factory):
+    """An engine per backend, built once for the module."""
+    from app.db.migrate import upgrade_to_head
+
+    if request.param == "sqlite":
+        url = f"sqlite:///{tmp_path_factory.mktemp('db') / 'eve_cache.db'}"
+        upgrade_to_head(url)
+        eng = create_engine(url)
+        yield eng
+        eng.dispose()
+        return
+
+    if not _reachable(PG_URL):
+        pytest.skip(f"no Postgres at {PG_URL} — see tests/test_postgres_schema.py")
+
+    admin = create_engine(PG_URL)
+    with admin.connect() as c:
+        c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
+        c.execute(text(f"CREATE SCHEMA {PG_SCHEMA}"))
+        c.commit()
+    admin.dispose()
+
+    scoped = PG_URL + ("&" if "?" in PG_URL else "?") +         f"options=-csearch_path%3D{PG_SCHEMA}"
+    upgrade_to_head(scoped)
+
+    eng = create_engine(scoped)
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _empty_tables(engine):
+    """Before, not after: a test that dies half-way must not leave its rows for
+    the next one to read."""
+    with engine.connect() as c:
+        c.execute(text("DELETE FROM planet_name_cache"))
+        c.commit()
+    yield
+
+
 @pytest.fixture
-def conn(tmp_path):
-    c = sqlite3.connect(str(tmp_path / "planets.db"))
-    apply_schema(c)
-    yield c
-    c.close()
+def conn(engine):
+    with engine.connect() as c:
+        yield c
+
+
+def _name_row(conn, planet_id: int, name):
+    conn.execute(
+        text("INSERT INTO planet_name_cache (planet_id, name)"
+             " VALUES (:pid, :name)"),
+        {"pid": planet_id, "name": name})
+    conn.commit()
 
 
 def _cached_names(conn) -> dict[int, str]:
     return {r[0]: r[1] for r in conn.execute(
-        "SELECT planet_id, name FROM planet_name_cache").fetchall()}
+        text("SELECT planet_id, name FROM planet_name_cache")).fetchall()}
+
+
+def test_both_backends_are_actually_exercised(conn):
+    """Without this a broken Postgres fixture reads as a passing file: the
+    SQLite half would carry it, and running on both is the entire point."""
+    assert conn.engine.dialect.name in ("sqlite", "postgresql")
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM planet_name_cache")).fetchone()[0] == 0
 
 
 # ── load_planet_names ────────────────────────────────────────────────────────
@@ -103,9 +162,7 @@ def test_no_ids_asks_nothing(conn):
 
 
 def test_only_known_names_come_back(conn):
-    conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
-                 (4001, "Testworld IV"))
-    conn.commit()
+    _name_row(conn, 4001, "Testworld IV")
 
     assert planets_api.load_planet_names(conn, [4001, 4002]) == {4001: "Testworld IV"}
 
@@ -114,9 +171,7 @@ def test_a_null_name_is_not_a_name(conn):
     """The column is nullable and the reader skips falsy values. A planet with
     a NULL name must read as unknown, so it renders as its id and can be
     resolved again — not as an empty string in the UI."""
-    conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
-                 (4001, None))
-    conn.commit()
+    _name_row(conn, 4001, None)
 
     assert planets_api.load_planet_names(conn, [4001]) == {}
 
@@ -124,9 +179,7 @@ def test_a_null_name_is_not_a_name(conn):
 def test_ids_are_coerced_from_strings(conn):
     """They arrive from JSON and from query strings. `int(p)` in the reader is
     what makes both work; without it a string id matches nothing."""
-    conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
-                 (4001, "Testworld IV"))
-    conn.commit()
+    _name_row(conn, 4001, "Testworld IV")
 
     assert planets_api.load_planet_names(conn, ["4001"]) == {4001: "Testworld IV"}
 
@@ -137,9 +190,10 @@ def test_more_ids_than_one_chunk(conn):
     parameter cap on builds where the cap is low — and an expanding bindparam
     still binds one parameter per id."""
     ids = list(range(5000, 5000 + 1500))
-    conn.executemany(
-        "INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
-        [(pid, f"P{pid}") for pid in ids])
+    conn.execute(
+        text("INSERT INTO planet_name_cache (planet_id, name)"
+             " VALUES (:pid, :name)"),
+        [{"pid": pid, "name": f"P{pid}"} for pid in ids])
     conn.commit()
 
     got = planets_api.load_planet_names(conn, ids)
@@ -155,9 +209,7 @@ def test_a_known_name_costs_no_round_trip(conn):
     """Names are permanent, so a name is fetched at most once per database
     ever. A rewrite that lost the cache-first check turns that into a call
     every tick, silently."""
-    conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
-                 (4001, "Testworld IV"))
-    conn.commit()
+    _name_row(conn, 4001, "Testworld IV")
     client = _Client({})
 
     got = asyncio.run(planets_api.fetch_planet_names(client, conn, [4001]))
@@ -167,9 +219,7 @@ def test_a_known_name_costs_no_round_trip(conn):
 
 
 def test_only_the_missing_ones_are_fetched(conn):
-    conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
-                 (4001, "Testworld IV"))
-    conn.commit()
+    _name_row(conn, 4001, "Testworld IV")
     client = _Client({4002: _named("Testworld V")})
 
     got = asyncio.run(planets_api.fetch_planet_names(client, conn, [4001, 4002]))
@@ -239,38 +289,30 @@ def test_one_planet_failing_does_not_lose_the_others(conn):
     assert _cached_names(conn) == {4001: "Testworld IV", 4003: "Testworld VI"}
 
 
-def test_the_name_writer_does_not_commit(conn, tmp_path):
+def test_the_name_writer_does_not_commit(engine):
     """The caller owns the transaction boundary — `fetch_colonies` commits for
     it. Both halves matter: only the first would also pass if nothing had been
     written at all."""
     client = _Client({4002: _named("Testworld V")})
 
-    asyncio.run(planets_api.fetch_planet_names(client, conn, [4002]))
+    with engine.connect() as writer:
+        asyncio.run(planets_api.fetch_planet_names(client, writer, [4002]))
 
-    other = sqlite3.connect(str(tmp_path / "planets.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM planet_name_cache").fetchone()[0] == 0, (
-            "the writer committed — the caller's boundary moved into it")
-    finally:
-        other.close()
+        with engine.connect() as reader:
+            assert _cached_names(reader) == {}, (
+                "the writer committed — the caller's boundary moved into it")
 
-    conn.commit()
-    other = sqlite3.connect(str(tmp_path / "planets.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM planet_name_cache").fetchone()[0] == 1, (
+        writer.commit()
+
+    with engine.connect() as reader:
+        assert _cached_names(reader) == {4002: "Testworld V"}, (
             "the caller's commit did not land")
-    finally:
-        other.close()
 
 
 def test_a_renamed_planet_overwrites_rather_than_duplicating(conn):
     """`ON CONFLICT (planet_id) DO UPDATE`. Planets do not get renamed, but the
     upsert is what makes a re-run idempotent rather than a constraint error."""
-    conn.execute("INSERT INTO planet_name_cache (planet_id, name) VALUES (?,?)",
-                 (4002, None))
-    conn.commit()
+    _name_row(conn, 4002, None)
     client = _Client({4002: _named("Testworld V")})
 
     asyncio.run(planets_api.fetch_planet_names(client, conn, [4002]))
@@ -278,8 +320,8 @@ def test_a_renamed_planet_overwrites_rather_than_duplicating(conn):
 
     assert _cached_names(conn) == {4002: "Testworld V"}
     assert conn.execute(
-        "SELECT COUNT(*) FROM planet_name_cache WHERE planet_id=?",
-        (4002,)).fetchone()[0] == 1
+        text("SELECT COUNT(*) FROM planet_name_cache WHERE planet_id=:pid"),
+        {"pid": 4002}).fetchone()[0] == 1
 
 
 def test_no_ids_at_all_asks_nothing(conn):

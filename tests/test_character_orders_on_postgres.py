@@ -15,8 +15,10 @@ directly. `fetch_corp_orders` also paginates itself rather than using
 `_get_all`, because it needs the first response's status code to tell a missing
 role from an outage, and that hand-rolled loop is untested.
 
-**These assertions are written against the `sqlite3` version on purpose**, so
-the conversion is judged by whether it preserves them.
+**These assertions are unchanged by the conversion.** They were written against
+the `sqlite3` version first, so the rewrite could be judged by whether it
+preserves them. Only the fixture underneath moved, and it now runs each of them
+on both backends.
 
 Two things here are conversion traps rather than ordinary behaviour:
 
@@ -29,12 +31,14 @@ Two things here are conversion traps rather than ordinary behaviour:
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from app.character import orders as orders_api
-from app.db.schema import apply_schema
+from tests.test_postgres_schema import URL as PG_URL, _reachable
+
+PG_SCHEMA = "pytest_character_orders"
 
 ALICE = 2_112_625_428
 CORP = 98_000_001
@@ -77,18 +81,65 @@ def _order(order_id, type_id=34):
     return {"order_id": order_id, "type_id": type_id, "price": 5.0}
 
 
+@pytest.fixture(scope="module", params=["sqlite", "postgres"])
+def engine(request, tmp_path_factory):
+    """An engine per backend, built once for the module."""
+    from app.db.migrate import upgrade_to_head
+
+    if request.param == "sqlite":
+        url = f"sqlite:///{tmp_path_factory.mktemp('db') / 'eve_cache.db'}"
+        upgrade_to_head(url)
+        eng = create_engine(url)
+        yield eng
+        eng.dispose()
+        return
+
+    if not _reachable(PG_URL):
+        pytest.skip(f"no Postgres at {PG_URL} — see tests/test_postgres_schema.py")
+
+    admin = create_engine(PG_URL)
+    with admin.connect() as c:
+        c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
+        c.execute(text(f"CREATE SCHEMA {PG_SCHEMA}"))
+        c.commit()
+    admin.dispose()
+
+    scoped = PG_URL + ("&" if "?" in PG_URL else "?") +         f"options=-csearch_path%3D{PG_SCHEMA}"
+    upgrade_to_head(scoped)
+
+    eng = create_engine(scoped)
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _empty_tables(engine):
+    """Before, not after: a test that dies half-way must not leave its rows for
+    the next one to read."""
+    with engine.connect() as c:
+        c.execute(text("DELETE FROM market_orders_cache"))
+        c.commit()
+    yield
+
+
 @pytest.fixture
-def conn(tmp_path):
-    c = sqlite3.connect(str(tmp_path / "orders.db"))
-    apply_schema(c)
-    yield c
-    c.close()
+def conn(engine):
+    with engine.connect() as c:
+        yield c
 
 
 def _rows(conn, owner_id: int) -> int:
     return conn.execute(
-        "SELECT COUNT(*) FROM market_orders_cache WHERE owner_id=?",
-        (owner_id,)).fetchone()[0]
+        text("SELECT COUNT(*) FROM market_orders_cache WHERE owner_id=:owner_id"),
+        {"owner_id": owner_id}).fetchone()[0]
+
+
+def test_both_backends_are_actually_exercised(conn):
+    """Without this a broken Postgres fixture reads as a passing file: the
+    SQLite half would carry it, and running on both is the entire point."""
+    assert conn.engine.dialect.name in ("sqlite", "postgresql")
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM market_orders_cache")).fetchone()[0] == 0
 
 
 # ── the writer's transaction boundary ────────────────────────────────────────
@@ -105,8 +156,8 @@ def test_the_second_save_moves_the_age_forward(conn):
     _, first = orders_api.load_cached_orders(conn, ALICE)
 
     conn.execute(
-        "UPDATE market_orders_cache SET cached_at=? WHERE owner_id=?",
-        (first - 3600, ALICE))
+        text("UPDATE market_orders_cache SET cached_at=:at WHERE owner_id=:owner_id"),
+        {"at": first - 3600, "owner_id": ALICE})
     conn.commit()
     assert orders_api.load_cached_orders(conn, ALICE)[1] == pytest.approx(first - 3600), (
         "the backdate did not take — this test would pass vacuously")
@@ -119,28 +170,20 @@ def test_the_second_save_moves_the_age_forward(conn):
     assert second > first - 3600, "the upsert kept the old timestamp"
 
 
-def test_the_writer_does_not_commit(conn, tmp_path):
+def test_the_writer_does_not_commit(engine):
     """Both halves matter — only the first would also pass if the writer never
     wrote anything at all."""
-    orders_api.save_cached_orders(conn, ALICE, [_order(1)])
+    with engine.connect() as writer:
+        orders_api.save_cached_orders(writer, ALICE, [_order(1)])
 
-    other = sqlite3.connect(str(tmp_path / "orders.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM market_orders_cache WHERE owner_id=?",
-            (ALICE,)).fetchone()[0] == 0, (
-            "the writer committed — the caller's boundary moved into it")
-    finally:
-        other.close()
+        with engine.connect() as reader:
+            assert _rows(reader, ALICE) == 0, (
+                "the writer committed — the caller's boundary moved into it")
 
-    conn.commit()
-    other = sqlite3.connect(str(tmp_path / "orders.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM market_orders_cache WHERE owner_id=?",
-            (ALICE,)).fetchone()[0] == 1, "the caller's commit did not land"
-    finally:
-        other.close()
+        writer.commit()
+
+    with engine.connect() as reader:
+        assert _rows(reader, ALICE) == 1, "the caller's commit did not land"
 
 
 # ── fetch_corp_orders: answers with a reason ─────────────────────────────────

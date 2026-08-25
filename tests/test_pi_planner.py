@@ -477,6 +477,8 @@ def stub_pi(app_module, monkeypatch):
         conn.close()
 
     def install(colonies_by_planet, forbidden=False):
+        from app.db.conn import connect as _connect
+
         conn = app_module.get_conn()
         try:
             # Planet names, as a real install has them: the worker resolves
@@ -485,32 +487,32 @@ def stub_pi(app_module, monkeypatch):
                 conn.execute(
                     "INSERT OR REPLACE INTO planet_name_cache (planet_id, name) VALUES (?,?)",
                     (planet_id, f"Testworld {planet_id}"))
+            conn.commit()
+        finally:
+            conn.close()
 
+        # `token_store` and `app/character/planets.py` are both on the portable
+        # query layer now, so everything below asks through the engine. The raw
+        # handle above stays only for `INSERT OR REPLACE`, which is SQLite's
+        # own spelling and has no portable equivalent worth introducing here.
+        with _connect() as ec:
             if forbidden:
                 planets_api.save_cached_colonies(
-                    conn, PI_CHAR, [], [], planets_api.FORBIDDEN)
+                    ec, PI_CHAR, [], [], planets_api.FORBIDDEN)
             else:
                 colonies = [{"planet_id": pid, "planet_type": "barren",
                              "upgrade_level": 5, "num_pins": len(pins)}
                             for pid, pins in colonies_by_planet.items()]
                 details = [{"pins": pins, "links": [], "routes": []}
                            for _pid, pins in colonies_by_planet.items()]
-                planets_api.save_cached_colonies(conn, PI_CHAR, colonies, details)
+                planets_api.save_cached_colonies(ec, PI_CHAR, colonies, details)
 
             # The other seeded character has no PI — synced, and empty, which is
             # a different thing from never synced and has to be said so.
-            # `token_store` is on the portable query layer now, so this asks
-            # through the engine rather than handing it the raw handle the rest
-            # of this fixture uses.
-            from app.db.conn import connect as _connect
-            with _connect() as _tc:
-                _seeded = app_module.list_characters(_tc)
-            for cid, _name in _seeded:
+            for cid, _name in app_module.list_characters(ec):
                 if cid != PI_CHAR:
-                    planets_api.save_cached_colonies(conn, cid, [], [])
-            conn.commit()
-        finally:
-            conn.close()
+                    planets_api.save_cached_colonies(ec, cid, [], [])
+            ec.commit()
     return install
 
 
