@@ -42,13 +42,20 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   and not with the bare `grep -rn "dbapi(" app/` written here before: that also
   matches the definition in `app/db/conn.py` and its docstring, so it answers
   **2** on a fully converted tree and reads like a regression. What remains is not
-  crossings but modules still holding a raw `get_conn()` handle of their own:
+  crossings but modules still holding raw `?`-parameter statements of their own.
+
   **`app/character/*` is done as of v0.9.65** — `assets` (v0.9.60),
   `blueprints` (v0.9.61), `contracts` (v0.9.62), `wallet` (v0.9.64),
-  `orders` and `planets` (v0.9.65). What is left is the web layer:
-  `plan`, `prices`, `locations`, `assets`, `planets`, `media`, the
-  helpers beside them, and finally `deps.py`, `main.py` and
-  `app/db/schema.py`.
+  `orders` and `planets` (v0.9.65). In the web layer,
+  `contracts_helper` + `routers/contracts` went at v0.9.66 and
+  `routers/assets` at v0.9.68.
+
+  The list of what is left is taken from the AST scan rather than from memory,
+  because the version of this sentence before v0.9.68 named `media` — which has
+  **zero** raw statements and has had none for some time — while omitting
+  `security`, `bootstrap`, `schematics`, `type_resolver`, `esi_oauth` and
+  `manufacturing/planner`, which do. See the table further down; it is
+  regenerated from the scan.
 
   **The `conn=raw` measure has retired too** — it reached zero in v0.9.65
   and the `raw = conn.connection.driver_connection` line went with it. It
