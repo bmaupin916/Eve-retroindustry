@@ -349,7 +349,7 @@ class SyncWorker:
                     # with fifty contracts would otherwise cost fifty calls a
                     # tick to store something most of which is never opened.
                     contracts = await fetch_character_contracts(
-                        client, char_id, token, conn=raw)
+                        client, char_id, token, conn=conn)
                     changed += self._diff(char_id, "contracts", contracts)
 
                     # Colonies: one list call plus one per planet. Expensive
@@ -403,7 +403,7 @@ class SyncWorker:
                                     client, corp_id, div, token, conn=raw)
 
                             corp_contracts, _cerr = await fetch_corp_contracts(
-                                client, corp_id, token, conn=raw)
+                                client, corp_id, token, conn=conn)
                             changed += self._diff(
                                 char_id, "corp_contracts", corp_contracts,
                                 corporation_id=corp_id)

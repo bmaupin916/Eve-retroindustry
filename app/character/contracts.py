@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import time
 
 import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 ESI_BASE = "https://esi.evetech.net/latest"
 
@@ -63,7 +64,7 @@ CHARACTER, CORPORATION = "character", "corporation"
 
 # ── cache ─────────────────────────────────────────────────────────────────────
 
-def load_cached_contracts(conn: sqlite3.Connection, owner_id: int,
+def load_cached_contracts(conn: Connection, owner_id: int,
                           kind: str = CHARACTER) -> tuple[list[dict] | None, float]:
     """(contracts, cached_at), or (None, 0) when never synced.
 
@@ -73,8 +74,9 @@ def load_cached_contracts(conn: sqlite3.Connection, owner_id: int,
     expiring courier contract is exactly the thing you check this page for.
     """
     row = conn.execute(
-        "SELECT data_json, cached_at FROM contracts_cache"
-        " WHERE owner_id=? AND owner_kind=?", (owner_id, kind)).fetchone()
+        text("SELECT data_json, cached_at FROM contracts_cache"
+             " WHERE owner_id=:owner_id AND owner_kind=:kind"),
+        {"owner_id": owner_id, "kind": kind}).fetchone()
     if not row:
         return None, 0.0
     try:
@@ -83,17 +85,23 @@ def load_cached_contracts(conn: sqlite3.Connection, owner_id: int,
         return None, 0.0
 
 
-def save_cached_contracts(conn: sqlite3.Connection, owner_id: int,
+def save_cached_contracts(conn: Connection, owner_id: int,
                           contracts: list[dict], kind: str = CHARACTER) -> None:
+    # No commit, deliberately: the caller owns the transaction boundary. The
+    # conflict target is the *composite* primary key — get it wrong and this
+    # does not raise, it inserts a second row and the owner quietly has two
+    # contract lists with nothing to choose between them.
     conn.execute(
-        "INSERT INTO contracts_cache (owner_id, owner_kind, data_json, cached_at)"
-        " VALUES (?,?,?,?) ON CONFLICT (owner_id, owner_kind) DO UPDATE SET"
-        " data_json=excluded.data_json, cached_at=excluded.cached_at",
-        (owner_id, kind, json.dumps(contracts), time.time()),
+        text("INSERT INTO contracts_cache (owner_id, owner_kind, data_json, cached_at)"
+             " VALUES (:owner_id, :kind, :data, :cached_at)"
+             " ON CONFLICT (owner_id, owner_kind) DO UPDATE SET"
+             " data_json=excluded.data_json, cached_at=excluded.cached_at"),
+        {"owner_id": owner_id, "kind": kind,
+         "data": json.dumps(contracts), "cached_at": time.time()},
     )
 
 
-def load_cached_contract_items(conn: sqlite3.Connection,
+def load_cached_contract_items(conn: Connection,
                                contract_id: int) -> list[dict] | None:
     """A contract's contents, which never change once it exists.
 
@@ -102,8 +110,9 @@ def load_cached_contract_items(conn: sqlite3.Connection,
     creation.
     """
     row = conn.execute(
-        "SELECT data_json FROM contract_items_cache WHERE contract_id=?",
-        (contract_id,)).fetchone()
+        text("SELECT data_json FROM contract_items_cache"
+             " WHERE contract_id=:contract_id"),
+        {"contract_id": contract_id}).fetchone()
     if not row:
         return None
     try:
@@ -112,13 +121,19 @@ def load_cached_contract_items(conn: sqlite3.Connection,
         return None
 
 
-def save_cached_contract_items(conn: sqlite3.Connection, contract_id: int,
+def save_cached_contract_items(conn: Connection, contract_id: int,
                                items: list[dict]) -> None:
+    # No commit here either. Nothing ever refreshes this cache — no TTL, and
+    # the worker does not prefetch it — so the failure paths above must not
+    # reach here at all: an `[]` written for a contract that simply failed to
+    # load would show it as empty for as long as the database lives.
     conn.execute(
-        "INSERT INTO contract_items_cache (contract_id, data_json, cached_at)"
-        " VALUES (?,?,?) ON CONFLICT (contract_id) DO UPDATE SET"
-        " data_json=excluded.data_json, cached_at=excluded.cached_at",
-        (contract_id, json.dumps(items), time.time()),
+        text("INSERT INTO contract_items_cache (contract_id, data_json, cached_at)"
+             " VALUES (:contract_id, :data, :cached_at)"
+             " ON CONFLICT (contract_id) DO UPDATE SET"
+             " data_json=excluded.data_json, cached_at=excluded.cached_at"),
+        {"contract_id": contract_id, "data": json.dumps(items),
+         "cached_at": time.time()},
     )
 
 
@@ -152,7 +167,7 @@ async def _get_all_pages(client: httpx.AsyncClient, url: str, token: str | None 
 
 
 async def fetch_character_contracts(client, char_id: int, token: str,
-                                    conn: sqlite3.Connection | None = None
+                                    conn: Connection | None = None
                                     ) -> list[dict] | None:
     out = await _get_all_pages(
         client, f"{ESI_BASE}/characters/{char_id}/contracts/", token)
@@ -162,7 +177,7 @@ async def fetch_character_contracts(client, char_id: int, token: str,
 
 
 async def fetch_corp_contracts(client, corp_id: int, token: str,
-                               conn: sqlite3.Connection | None = None
+                               conn: Connection | None = None
                                ) -> tuple[list[dict] | None, str | None]:
     try:
         r = await client.get(f"{ESI_BASE}/corporations/{corp_id}/contracts/",
@@ -190,7 +205,7 @@ async def fetch_corp_contracts(client, corp_id: int, token: str,
 
 async def fetch_character_contract_items(client, char_id: int, contract_id: int,
                                          token: str,
-                                         conn: sqlite3.Connection | None = None
+                                         conn: Connection | None = None
                                          ) -> list[dict] | None:
     try:
         r = await client.get(
@@ -208,7 +223,7 @@ async def fetch_character_contract_items(client, char_id: int, contract_id: int,
 
 async def fetch_corp_contract_items(client, corp_id: int, contract_id: int,
                                     token: str,
-                                    conn: sqlite3.Connection | None = None
+                                    conn: Connection | None = None
                                     ) -> list[dict] | None:
     try:
         r = await client.get(

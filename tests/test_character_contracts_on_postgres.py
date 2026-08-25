@@ -13,9 +13,10 @@ write through it — what the conversion can break. The public-contract function
 reach them; they are a real coverage gap but a separate one, and testing them
 here would be scope disguised as diligence. Same for the two label maps.
 
-**These assertions are written against the `sqlite3` version on purpose.** They
-have to exist before the rewrite so the rewrite can be judged by whether it
-preserves them.
+**These assertions are unchanged by the conversion.** They were written against
+the `sqlite3` version first, so the rewrite could be judged by whether it
+preserves them. Only the fixture underneath moved, and it now runs each of them
+on both backends.
 
 Four things here are conversion traps rather than ordinary behaviour:
 
@@ -39,13 +40,15 @@ Four things here are conversion traps rather than ordinary behaviour:
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import time
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from app.character import contracts as contracts_api
-from app.db.schema import apply_schema
+from tests.test_postgres_schema import URL as PG_URL, _reachable
+
+PG_SCHEMA = "pytest_character_contracts"
 
 ALICE = 2_112_625_428
 CORP = 98_000_001
@@ -99,24 +102,88 @@ def _contract(cid, type_="item_exchange", status="outstanding"):
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(scope="module", params=["sqlite", "postgres"])
+def engine(request, tmp_path_factory):
+    """An engine per backend, built once for the module.
+
+    Function scope here would drop and rebuild a Postgres schema — every
+    migration — for each test in the file; clearing the two tables between
+    tests is the same isolation for a fraction of the cost.
+    """
+    from app.db.migrate import upgrade_to_head
+
+    if request.param == "sqlite":
+        url = f"sqlite:///{tmp_path_factory.mktemp('db') / 'eve_cache.db'}"
+        upgrade_to_head(url)
+        eng = create_engine(url)
+        yield eng
+        eng.dispose()
+        return
+
+    if not _reachable(PG_URL):
+        pytest.skip(f"no Postgres at {PG_URL} — see tests/test_postgres_schema.py")
+
+    admin = create_engine(PG_URL)
+    with admin.connect() as c:
+        c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
+        c.execute(text(f"CREATE SCHEMA {PG_SCHEMA}"))
+        c.commit()
+    admin.dispose()
+
+    scoped = PG_URL + ("&" if "?" in PG_URL else "?") + \
+        f"options=-csearch_path%3D{PG_SCHEMA}"
+    upgrade_to_head(scoped)
+
+    eng = create_engine(scoped)
+    yield eng
+    eng.dispose()
+
+
+#: Emptied before every test, so one module-scoped schema can serve them all.
+_CLEARED = ("contracts_cache", "contract_items_cache")
+
+
+@pytest.fixture(autouse=True)
+def _empty_tables(engine):
+    """Before, not after: a test that dies half-way must not leave its rows for
+    the next one to read."""
+    with engine.connect() as c:
+        for table in _CLEARED:
+            c.execute(text(f"DELETE FROM {table}"))
+        c.commit()
+    yield
+
+
 @pytest.fixture
-def conn(tmp_path):
-    c = sqlite3.connect(str(tmp_path / "contracts.db"))
-    apply_schema(c)
-    yield c
-    c.close()
+def conn(engine):
+    with engine.connect() as c:
+        yield c
+
+
+def _backend(conn) -> str:
+    return conn.engine.dialect.name
 
 
 def _owner_rows(conn, owner_id: int) -> int:
     return conn.execute(
-        "SELECT COUNT(*) FROM contracts_cache WHERE owner_id=?",
-        (owner_id,)).fetchone()[0]
+        text("SELECT COUNT(*) FROM contracts_cache WHERE owner_id=:owner_id"),
+        {"owner_id": owner_id}).fetchone()[0]
 
 
 def _item_rows(conn, contract_id: int) -> int:
     return conn.execute(
-        "SELECT COUNT(*) FROM contract_items_cache WHERE contract_id=?",
-        (contract_id,)).fetchone()[0]
+        text("SELECT COUNT(*) FROM contract_items_cache"
+             " WHERE contract_id=:contract_id"),
+        {"contract_id": contract_id}).fetchone()[0]
+
+
+def test_both_backends_are_actually_exercised(conn):
+    """Without this a broken Postgres fixture reads as a passing file: the
+    SQLite half would carry it, and running on both is the entire point."""
+    assert _backend(conn) in ("sqlite", "postgresql")
+    for table in _CLEARED:
+        assert conn.execute(
+            text(f"SELECT COUNT(*) FROM {table}")).fetchone()[0] == 0
 
 
 # ── the contracts cache ──────────────────────────────────────────────────────
@@ -151,8 +218,9 @@ def test_the_second_save_moves_the_age_forward(conn):
     conn.commit()
     _, first = contracts_api.load_cached_contracts(conn, ALICE)
 
-    conn.execute("UPDATE contracts_cache SET cached_at=? WHERE owner_id=?",
-                 (first - 3600, ALICE))
+    conn.execute(
+        text("UPDATE contracts_cache SET cached_at=:at WHERE owner_id=:owner_id"),
+        {"at": first - 3600, "owner_id": ALICE})
     conn.commit()
 
     contracts_api.save_cached_contracts(conn, ALICE, [_contract(2)])
@@ -178,28 +246,24 @@ def test_owner_kind_is_part_of_the_key(conn):
     assert [c["contract_id"] for c in corp] == [2]
 
 
-def test_the_writer_does_not_commit(conn, tmp_path):
-    """The caller owns the transaction boundary. A separate connection must not
-    see the row until that caller commits."""
-    contracts_api.save_cached_contracts(conn, ALICE, [_contract(1)])
+def test_the_writer_does_not_commit(engine):
+    """The caller owns the transaction boundary. A **separate** connection must
+    not see the row until that caller commits — and must see it once it does.
 
-    other = sqlite3.connect(str(tmp_path / "contracts.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM contracts_cache WHERE owner_id=?",
-            (ALICE,)).fetchone()[0] == 0, (
-            "the writer committed — the caller's boundary moved into it")
-    finally:
-        other.close()
+    Both halves matter. Only the first would also pass if the writer never
+    wrote anything at all.
+    """
+    with engine.connect() as writer:
+        contracts_api.save_cached_contracts(writer, ALICE, [_contract(1)])
 
-    conn.commit()
-    other = sqlite3.connect(str(tmp_path / "contracts.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM contracts_cache WHERE owner_id=?",
-            (ALICE,)).fetchone()[0] == 1, "the caller's commit did not land"
-    finally:
-        other.close()
+        with engine.connect() as reader:
+            assert _owner_rows(reader, ALICE) == 0, (
+                "the writer committed — the caller's boundary moved into it")
+
+        writer.commit()
+
+    with engine.connect() as reader:
+        assert _owner_rows(reader, ALICE) == 1, "the caller's commit did not land"
 
 
 def test_an_empty_contract_list_is_still_a_sync(conn):
@@ -215,8 +279,10 @@ def test_an_empty_contract_list_is_still_a_sync(conn):
 
 def test_a_corrupt_contracts_cache_reads_as_never_synced(conn):
     conn.execute(
-        "INSERT INTO contracts_cache (owner_id, owner_kind, data_json, cached_at)"
-        " VALUES (?,?,?,?)", (ALICE, contracts_api.CHARACTER, "{not json", time.time()))
+        text("INSERT INTO contracts_cache (owner_id, owner_kind, data_json, cached_at)"
+             " VALUES (:owner_id, :kind, :data, :cached_at)"),
+        {"owner_id": ALICE, "kind": contracts_api.CHARACTER,
+         "data": "{not json", "cached_at": time.time()})
     conn.commit()
 
     assert contracts_api.load_cached_contracts(conn, ALICE) == (None, 0.0)
@@ -233,9 +299,16 @@ def test_cached_at_cannot_be_null(conn):
     conn.commit()
 
     with pytest.raises(Exception) as exc:
-        conn.execute("UPDATE contracts_cache SET cached_at=NULL WHERE owner_id=?",
-                     (ALICE,))
-    assert "NOT NULL" in str(exc.value).upper() or "null value" in str(exc.value)
+        conn.execute(
+            text("UPDATE contracts_cache SET cached_at=NULL"
+                 " WHERE owner_id=:owner_id"), {"owner_id": ALICE})
+
+    # SQLite says "NOT NULL constraint failed", Postgres says "null value in
+    # column ... violates not-null constraint". Matching on the shared word
+    # rather than either wording.
+    assert "not-null" in str(exc.value).lower() or \
+        "not null" in str(exc.value).lower()
+    conn.rollback()
 
 
 # ── the contract-items cache ─────────────────────────────────────────────────
@@ -263,16 +336,17 @@ def test_saving_items_twice_replaces_rather_than_duplicating(conn):
             contracts_api.load_cached_contract_items(conn, CONTRACT)] == [35]
 
 
-def test_the_items_writer_does_not_commit(conn, tmp_path):
-    contracts_api.save_cached_contract_items(conn, CONTRACT, [{"type_id": 34}])
+def test_the_items_writer_does_not_commit(engine):
+    with engine.connect() as writer:
+        contracts_api.save_cached_contract_items(writer, CONTRACT, [{"type_id": 34}])
 
-    other = sqlite3.connect(str(tmp_path / "contracts.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM contract_items_cache WHERE contract_id=?",
-            (CONTRACT,)).fetchone()[0] == 0
-    finally:
-        other.close()
+        with engine.connect() as reader:
+            assert _item_rows(reader, CONTRACT) == 0
+
+        writer.commit()
+
+    with engine.connect() as reader:
+        assert _item_rows(reader, CONTRACT) == 1, "the caller's commit did not land"
 
 
 def test_an_empty_item_list_is_distinguishable_from_never_expanded(conn):
@@ -286,8 +360,9 @@ def test_an_empty_item_list_is_distinguishable_from_never_expanded(conn):
 
 def test_a_corrupt_items_cache_reads_as_never_fetched(conn):
     conn.execute(
-        "INSERT INTO contract_items_cache (contract_id, data_json, cached_at)"
-        " VALUES (?,?,?)", (CONTRACT, "{not json", time.time()))
+        text("INSERT INTO contract_items_cache (contract_id, data_json, cached_at)"
+             " VALUES (:contract_id, :data, :cached_at)"),
+        {"contract_id": CONTRACT, "data": "{not json", "cached_at": time.time()})
     conn.commit()
 
     assert contracts_api.load_cached_contract_items(conn, CONTRACT) is None

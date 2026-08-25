@@ -43,10 +43,11 @@ def conn(tmp_path):
 def _engine_conn(conn):
     """An engine connection onto the same file this raw `conn` is attached to.
 
-    `app/character/assets.py` and `app/character/blueprints.py` are on the
-    portable query layer; the fixture above is shared with tests for modules
-    that are not, so it keeps handing out a sqlite3 handle and the tests that
-    need the other kind ask for it here.
+    `app/character/assets.py`, `app/character/blueprints.py` and
+    `app/character/contracts.py` are on the portable query layer; the fixture
+    above is shared with tests for modules that are not, so it keeps handing
+    out a sqlite3 handle and the tests that need the other kind ask for it
+    here.
     """
     import contextlib
     from sqlalchemy import create_engine
@@ -478,21 +479,23 @@ from app.character import contracts as contracts_api  # noqa: E402
 def test_unsynced_contracts_read_as_none_not_an_empty_list(conn):
     """An expiring courier contract is exactly what this page is checked for.
     Showing none because nobody looked is the failure that costs collateral."""
-    rows, at = contracts_api.load_cached_contracts(conn, ALICE)
+    with _engine_conn(conn) as ec:
+        rows, at = contracts_api.load_cached_contracts(ec, ALICE)
 
     assert rows is None
     assert at == 0.0
 
 
 def test_contracts_round_trip_and_keep_owners_apart(conn):
-    contracts_api.save_cached_contracts(conn, ALICE, [{"contract_id": 1}])
-    contracts_api.save_cached_contracts(conn, CORP, [{"contract_id": 2}],
-                                        contracts_api.CORPORATION)
-    conn.commit()
+    with _engine_conn(conn) as ec:
+        contracts_api.save_cached_contracts(ec, ALICE, [{"contract_id": 1}])
+        contracts_api.save_cached_contracts(ec, CORP, [{"contract_id": 2}],
+                                            contracts_api.CORPORATION)
+        ec.commit()
 
-    mine, _ = contracts_api.load_cached_contracts(conn, ALICE)
-    theirs, _ = contracts_api.load_cached_contracts(
-        conn, CORP, contracts_api.CORPORATION)
+        mine, _ = contracts_api.load_cached_contracts(ec, ALICE)
+        theirs, _ = contracts_api.load_cached_contracts(
+            ec, CORP, contracts_api.CORPORATION)
 
     assert [c["contract_id"] for c in mine] == [1]
     assert [c["contract_id"] for c in theirs] == [2]
@@ -500,28 +503,30 @@ def test_contracts_round_trip_and_keep_owners_apart(conn):
 
 def test_a_character_and_a_corporation_with_one_id_stay_apart(conn):
     """`owner_kind` is in the key for the same reason as everywhere else."""
-    contracts_api.save_cached_contracts(conn, CORP, [{"contract_id": 1}])
-    contracts_api.save_cached_contracts(conn, CORP, [{"contract_id": 2}],
-                                        contracts_api.CORPORATION)
-    conn.commit()
+    with _engine_conn(conn) as ec:
+        contracts_api.save_cached_contracts(ec, CORP, [{"contract_id": 1}])
+        contracts_api.save_cached_contracts(ec, CORP, [{"contract_id": 2}],
+                                            contracts_api.CORPORATION)
+        ec.commit()
 
-    personal, _ = contracts_api.load_cached_contracts(conn, CORP)
-    corp, _ = contracts_api.load_cached_contracts(
-        conn, CORP, contracts_api.CORPORATION)
+        personal, _ = contracts_api.load_cached_contracts(ec, CORP)
+        corp, _ = contracts_api.load_cached_contracts(
+            ec, CORP, contracts_api.CORPORATION)
 
     assert [c["contract_id"] for c in personal] == [1]
     assert [c["contract_id"] for c in corp] == [2]
 
 
 def test_a_failed_contracts_fetch_keeps_the_previous_list(conn):
-    contracts_api.save_cached_contracts(conn, ALICE, [{"contract_id": 1}])
-    conn.commit()
+    with _engine_conn(conn) as ec:
+        contracts_api.save_cached_contracts(ec, ALICE, [{"contract_id": 1}])
+        ec.commit()
 
-    result = asyncio.run(contracts_api.fetch_character_contracts(
-        _Client(_Resp(500)), ALICE, "tok", conn=conn))
+        result = asyncio.run(contracts_api.fetch_character_contracts(
+            _Client(_Resp(500)), ALICE, "tok", conn=ec))
 
-    assert result is None, "a failed fetch reported an empty contract list"
-    kept, _ = contracts_api.load_cached_contracts(conn, ALICE)
+        assert result is None, "a failed fetch reported an empty contract list"
+        kept, _ = contracts_api.load_cached_contracts(ec, ALICE)
     assert [c["contract_id"] for c in kept] == [1]
 
 
@@ -529,25 +534,27 @@ def test_contract_items_are_cached_without_an_age(conn):
     """The one cache here that cannot go stale: a contract's contents are fixed
     when it is created. So this returns the items alone, with no timestamp to
     judge — offering one would invite a staleness check that means nothing."""
-    assert contracts_api.load_cached_contract_items(conn, 555) is None
+    with _engine_conn(conn) as ec:
+        assert contracts_api.load_cached_contract_items(ec, 555) is None
 
-    contracts_api.save_cached_contract_items(conn, 555, [{"type_id": 34}])
-    conn.commit()
+        contracts_api.save_cached_contract_items(ec, 555, [{"type_id": 34}])
+        ec.commit()
 
-    items = contracts_api.load_cached_contract_items(conn, 555)
+        items = contracts_api.load_cached_contract_items(ec, 555)
     assert [i["type_id"] for i in items] == [34]
 
 
 def test_a_failed_item_fetch_is_not_cached_as_an_empty_contract(conn):
     """Caching `[]` here would be permanent — nothing ever refreshes it — so a
     single failed expand would show that contract as empty forever."""
-    result = asyncio.run(contracts_api.fetch_character_contract_items(
-        _Client(_Resp(500)), ALICE, 777, "tok", conn=conn))
-    conn.commit()
+    with _engine_conn(conn) as ec:
+        result = asyncio.run(contracts_api.fetch_character_contract_items(
+            _Client(_Resp(500)), ALICE, 777, "tok", conn=ec))
+        ec.commit()
 
-    assert result is None
-    assert contracts_api.load_cached_contract_items(conn, 777) is None, (
-        "a failed fetch was cached permanently as an empty contract")
+        assert result is None
+        assert contracts_api.load_cached_contract_items(ec, 777) is None, (
+            "a failed fetch was cached permanently as an empty contract")
 
 
 def test_the_contracts_page_reads_the_cache(client, monkeypatch):

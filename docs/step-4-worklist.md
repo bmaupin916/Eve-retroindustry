@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.61. **1104 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.62. **1194 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -43,11 +43,17 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   matches the definition in `app/db/conn.py` and its docstring, so it answers
   **2** on a fully converted tree and reads like a regression. What remains is not
   crossings but modules still holding a raw `get_conn()` handle of their own:
-  `character/contracts`, `character/wallet`, `character/orders`,
-  `character/planets`, then `media`, `contracts`, `characters`, `planets`,
-  `locations`, `prices`, `assets`, `plan`, and finally `deps.py`, `main.py` and
-  `app/db/schema.py`. `character/assets` converted in v0.9.60,
-  `character/blueprints` in v0.9.61.
+  `character/wallet`, `character/orders`, `character/planets`, then `media`,
+  `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`,
+  `plan`, and finally `deps.py`, `main.py` and `app/db/schema.py`.
+  `character/assets` converted in v0.9.60, `character/blueprints` in v0.9.61,
+  `character/contracts` in v0.9.62.
+
+  **A second measure, now that `dbapi()` has retired:** `grep -c "conn=raw"
+  app/sync/worker.py`. That variable exists only for the modules still on
+  `sqlite3`, so it falls as they convert — 13 before v0.9.62, **11** after.
+  When it reaches zero the whole `raw = conn.connection.driver_connection` line
+  goes with it.
 
 To bring the Postgres tests back:
 
@@ -119,8 +125,8 @@ Order — `projects`, `industry`, `app_defaults`, `industry_helper`,
 `projects` did not.
 
 **The `dbapi()` count is zero from v0.9.59**, so the metric that drove the order
-so far has retired. What is left is the rest of `app/character/*` (`contracts`,
-`wallet`, `orders`, `planets` — `assets` and `blueprints` are done), then
+so far has retired. What is left is the rest of `app/character/*` (`wallet`,
+`orders`, `planets` — `assets`, `blueprints` and `contracts` are done), then
 `media`, `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`,
 `plan`, and finally `deps.py`, `main.py` and `app/db/schema.py` itself. None of them
 blocks another, so take them one at a time and let the coverage probe pick the
@@ -410,16 +416,21 @@ all **done**. What that left is below.
    `app/character/*`, one at a time: `contracts`, `wallet`, `orders`,
    `planets`. (`assets` converted in v0.9.60, `blueprints` in v0.9.61.)
 
-   **`contracts` is the natural next one**: the biggest remaining coverage gap
-   at six functions the probe never sees executed. `orders` and `planets` are
-   already well covered by `tests/test_orders_cache.py`, so they are conversions
-   with a net already under them rather than conversions needing one written
-   first.
+   **`wallet` is the natural next one** now that `contracts` has gone
+   (v0.9.62). It holds the most `conn=raw` call sites left in the worker —
+   balance, journal, transactions, and the corporation variants of each — so it
+   is where the second measure moves most.
+
+   `orders` and `planets` are already well covered by
+   `tests/test_orders_cache.py`, so they are conversions with a net already
+   under them rather than conversions needing one written first. Take them last
+   of the four, on the grounds that they are the cheapest.
 
    **`raw = conn.connection.driver_connection` in `app/sync/worker.py` is the
    thermometer.** It exists only for the modules still on `sqlite3`, and every
-   conversion removes call sites from it. When `grep -n "conn=raw" app/sync/
-   worker.py` comes back empty, that whole area is done and the line can go.
+   conversion removes call sites from it — 13 before v0.9.62, 11 after. When
+   `grep -c "conn=raw" app/sync/worker.py` reaches zero, that whole area is
+   done and the line goes with it.
 
    **Run the coverage probe first and let it confirm.** It is twenty lines, and
    it has to rebind wrappers into modules that already did `from … import X` —
@@ -1009,7 +1020,7 @@ Done for `test_character_caches_on_postgres.py` and
 and `test_sde_on_postgres` runs the importer, so those two need their cleared-
 table lists chosen with more care than the others.
 
-Full suite as of v0.9.61: **3m56s** with Postgres up and 1,106 tests, against
+Full suite as of v0.9.62: **3m56s** with Postgres up and 1,196 tests, against
 roughly three minutes before any cross-backend file existed. It peaked over ten
 minutes before the two biggest files went module-scoped.
 
@@ -1152,3 +1163,71 @@ outside Alembic, so anything relying on that path has to be found first. Left in
 place, converted with the dialect guard like the rest. **Worth doing once the
 conversion is finished**, together with the other dead imports pyflakes lists in
 `main.py`.
+
+
+## character/contracts converted (v0.9.62)
+
+290 lines but only **four SQL statements** — the public-contract half of the
+module talks to ESI and never to a database, and `app/web/contracts_helper.py`
+uses only those public fetchers, so it is untouched by this.
+
+The traps, all pinned before the rewrite:
+
+* **Both writers are upserts**, not DELETE-then-INSERT, and `contracts_cache`
+  conflicts on the **composite** key `(owner_id, owner_kind)`. A wrong conflict
+  target does not raise — it inserts a second row, and one owner quietly has
+  two contract lists with nothing to choose between them.
+* **Neither writer commits.** The caller owns the boundary.
+* **`_get_all_pages` tells "ESI is down" from "no contracts"**: page one failing
+  returns `None`, a later page failing returns what already arrived. That is
+  what stops a transport blip being cached as an empty contract list.
+* **`contract_items_cache` has no expiry and nothing refreshes it**, so an `[]`
+  written after a failed expand shows that contract as empty permanently.
+
+Call sites: `routers/contracts.py` in two handlers, and the worker's two
+fetches. The router change was one word each — `connect()` returns a
+`Connection` that supports `.close()`, so it drops straight into handlers built
+around `conn = get_conn()` and their four `conn.close()` paths, with no
+reindentation. The three *public* handlers still use `get_conn()`; they go
+through `contracts_helper`, which is a separate module on the later list.
+
+**Worth knowing for the handlers that convert next:** in `contracts_page`,
+`load_cached_contracts` was the only real consumer of `conn`.
+`_finalize_contracts(conn, ...)` never touches its `conn` — it opens its own
+`_connect()` — and `get_active_character_id` documents that it accepts and
+ignores one. That dead `_finalize_contracts` parameter is worth removing when
+`routers/contracts.py` itself converts.
+
+## Splitting a mutation battery by backend with `-k` does not work
+
+Both spellings are wrong, and both produced a wrong answer before being caught:
+
+* `-k sqlite` matches the word anywhere, including in a **test name**, so a
+  "sqlite only" run silently includes Postgres cases. (Found at v0.9.60.)
+* `-k "[sqlite]"` is a literal substring **including the closing bracket**. It
+  matches `test_x[sqlite]` but not `test_x[sqlite-second_param]` — so any test
+  parametrized on a second axis drops out of **both** halves and runs in
+  neither.
+
+The second one cost a real result here. Eight item-fetcher cases in
+`test_character_contracts_on_postgres.py` never ran, and the mutation written
+to catch them — "the character item fetcher stops writing the cache" —
+reported as caught by nothing. It looked like a missing assertion. The
+assertion existed and was being skipped.
+
+The same filter had been used on the `blueprints` battery one commit earlier,
+where it selected 33 of 39 tests per backend. That battery's "8/8" was measured
+on 66 of 78 cases and has been re-run.
+
+**Run the file once and classify each `FAILED` line** by whether its id
+contains `[sqlite` or `[postgres`, with no closing bracket. No blind spot, and
+one pytest invocation instead of two. Then assert every failure matched one of
+the two — a failure matching neither means the id format has moved and the
+classifier is lying rather than reporting zero, which is the same class of
+silent-zero this whole note is about.
+
+**The general form, and it is the third instance today:** a filter that selects
+nothing looks exactly like a check that finds nothing. `-k`, a grep with an
+over-tight anchor, and a `--collect-only` count all fail this way. When a
+selector decides what gets measured, measure the selector — count what it
+returned and compare it against what you expected to be there.

@@ -101,7 +101,7 @@ _NOT_SYNCED = ("Not synced yet — the background worker fills this within a few
 
 @router.get("/contracts", response_class=HTMLResponse)
 async def contracts_page(request: Request, char: str = "", scope: str = "personal"):
-    conn = get_conn()
+    conn = _connect()
     all_chars = (char == "all")
     ctx: dict = {
         "scope": scope, "contracts_char_id": None, "all_chars": all_chars,
@@ -214,7 +214,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
 async def api_contract_items(request: Request, contract_id: int,
                              char_id: int = 0, corp_id: int = 0):
     """Lazy fetch of a contract's items (on expand). Returns resolved names from the SDE."""
-    conn = get_conn()
+    conn = _connect()
     try:
         # A contract's contents are fixed when it is created, so a hit here is
         # permanently correct and there is no age to check. That is also why the
