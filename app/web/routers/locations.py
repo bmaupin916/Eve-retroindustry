@@ -21,6 +21,7 @@ from app.market.prices import (
     fetch_structure_market,
 )
 from app.web import contracts_helper
+from app.db.conn import connect as _connect
 from app.web.deps import (
     _load_assets_from_cache,
     _load_blueprints_from_cache,
@@ -534,11 +535,16 @@ async def api_plan_contract_price(request: Request, location_id: int, type_id: i
         region_id = await _region_for(location_id, token)
         if not region_id:
             return {"ok": False, "error": "Could not determine the station's region."}
-        status = contracts_helper.get_index_status(conn, region_id)
-        if not status:
-            return {"ok": False, "not_indexed": True, "region_id": region_id,
-                    "error": "The contract region is not indexed — index it in the Public browser."}
-        best = contracts_helper.best_contract_price(conn, region_id, type_id)
+        # Its own connection: `contracts_helper` is on the portable query layer
+        # while this router is not, so `conn` here is still a raw sqlite3
+        # handle for the statements below. Same database either way, and both
+        # of these come along free when this router converts.
+        with _connect() as _ch:
+            status = contracts_helper.get_index_status(_ch, region_id)
+            if not status:
+                return {"ok": False, "not_indexed": True, "region_id": region_id,
+                        "error": "The contract region is not indexed — index it in the Public browser."}
+            best = contracts_helper.best_contract_price(_ch, region_id, type_id)
         if not best:
             return {"ok": False, "error": "No public contract with this product in the region.",
                     "region_id": region_id, "indexed_at": status.get("indexed_at")}

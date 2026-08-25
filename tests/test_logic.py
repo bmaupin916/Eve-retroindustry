@@ -1,5 +1,5 @@
 """Unit tests for pure calculation logic (no DB / no network)."""
-import sqlite3
+from sqlalchemy import text
 
 
 # ── planner ────────────────────────────────────────────────────────────────
@@ -79,20 +79,33 @@ def test_security_multiplier():
 
 # ── external-link allowlist ──────────────────────────────────────────────────
 def _contracts_db():
+    """An engine connection onto an in-memory SQLite database.
+
+    `app/web/contracts_helper.py` is on the portable query layer, so its
+    readers take one of these. `ensure_public_contract_tables` is a no-op away
+    from SQLite, and on SQLite it forwards to the schema builder — which is
+    what creates the two tables in a fresh `:memory:` database.
+    """
+    from sqlalchemy import create_engine
     from app.web import contracts_helper
-    conn = sqlite3.connect(":memory:")
+
+    eng = create_engine("sqlite://")          # :memory:, one connection
+    conn = eng.connect()
     contracts_helper.ensure_public_contract_tables(conn)
     return conn, contracts_helper
 
 
 def _add_contract(conn, cid, price, items):
     conn.execute(
-        "INSERT INTO public_contracts (contract_id, region_id, type, price) "
-        "VALUES (?,?, 'item_exchange', ?)", (cid, 10000002, price))
+        text("INSERT INTO public_contracts (contract_id, region_id, type, price)"
+             " VALUES (:cid, :region, 'item_exchange', :price)"),
+        {"cid": cid, "region": 10000002, "price": price})
     for type_id, qty, incl in items:
         conn.execute(
-            "INSERT INTO public_contract_items (contract_id, type_id, quantity, is_included) "
-            "VALUES (?,?,?,?)", (cid, type_id, qty, incl))
+            text("INSERT INTO public_contract_items"
+                 " (contract_id, type_id, quantity, is_included)"
+                 " VALUES (:cid, :type_id, :qty, :incl)"),
+            {"cid": cid, "type_id": type_id, "qty": qty, "incl": incl})
     conn.commit()
 
 def test_best_contract_price_prefers_single():

@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.65. **1346 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.66. **1432 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -56,8 +56,8 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
   **The measure from here is the count of raw `?`-parameter statements**, and
   it has to be taken with an AST walk rather than a grep — see "Count
-  statements with an AST" below. **145** of them at v0.9.65, spread over 20
-  files; thirteen files still hold a raw `get_conn()` handle.
+  statements with an AST" below. **137** of them at v0.9.66, down from 145 at
+  v0.9.65; twelve files still hold a raw `get_conn()` handle.
 
 To bring the Postgres tests back:
 
@@ -445,12 +445,9 @@ all **done**. What that left is below.
    | `routers/plan.py` | 18 | 2 | 2 |
    | `routers/prices.py` | 13 | 4 | 13 |
 
-   **`routers/contracts.py` first**: it has no raw statements left at all — its
-   one was converted in the v0.9.63 fix — and its three remaining `get_conn()`
-   handles are the public-contract handlers, which go through
-   `contracts_helper`. It is the cheapest complete unit and it closes a file
-   that is currently half-converted, which is worth finishing rather than
-   leaving in two states.
+   ~~**`routers/contracts.py` first**~~ — **done in v0.9.66**, together with
+   `contracts_helper.py`, which is where its SQL actually lived. `assets` is
+   next.
 
    Then `assets` → `locations` → `planets` → `plan`, with the prices cluster
    (`prices_helper` 15 + `routers/prices` 13 + `market/prices` 11 = 39) last as
@@ -1058,7 +1055,7 @@ Done for `test_character_caches_on_postgres.py` and
 and `test_sde_on_postgres` runs the importer, so those two need their cleared-
 table lists chosen with more care than the others.
 
-Full suite as of v0.9.65: **5m51s** with Postgres up and 1,348 tests, against
+Full suite as of v0.9.66: **4m30s** with Postgres up and 1,434 tests, against
 roughly three minutes before any cross-backend file existed. It peaked over ten
 minutes before the two biggest files went module-scoped.
 
@@ -1411,7 +1408,7 @@ for f in pathlib.Path("app").rglob("*.py"):
 which is where the `IN ({ph})` placeholder patterns live, and those are the ones
 that need an expanding bindparam rather than a mechanical rewrite.
 
-## Where the remaining 145 statements are
+## Where the remaining statements are (145 at v0.9.65, 137 after v0.9.66)
 
 | cluster | statements |
 | --- | --- |
@@ -1429,3 +1426,73 @@ conversions in this session tripped over *callers* rather than modules: dead
 `_finalize_orders`, and the `/api/contracts/items` regression. `deps.py` is
 where `get_conn()` itself lives, so converting it forces those dead parameters
 out in one place instead of leaving them to be rediscovered router by router.
+
+
+## contracts_helper and routers/contracts converted (v0.9.66)
+
+The first unit of the web layer, and it confirmed the ordering rule: the router
+had **zero** raw statements of its own — its one was converted in the v0.9.63
+fix — because the SQL all lives in `app/web/contracts_helper.py` behind it. The
+unit is helper + router, not router alone.
+
+**The risk in this file was never SQL dialect. It was parameter order.**
+`search_public_contracts` builds its WHERE clauses conditionally and used to
+append each value to a positional list as its clause fired, with the `LIKE`
+first, then the type, then the price, and the `LIMIT` last. The binding order
+was therefore a property of the *branch* order, and a mispairing returns
+**plausible rows rather than an error** — the failure mode with no symptom. The
+values now go into a dict keyed by name, which makes that class of bug
+unrepresentable.
+
+That is also why the test net went in first with one test per filter *and* one
+with all three on, over a fixture where exactly one contract legitimately
+matches all three. A mispaired parameter widens that result visibly.
+
+The battery found two gaps in the net before the conversion, both mine:
+
+* `get_contract_items` ignoring its `WHERE` was invisible, because every test
+  in that section stored exactly **one** contract with items. Two contracts is
+  the smallest fixture that can tell "the right items" from "all the items".
+* A zero-quantity contract line, treated as one unit rather than skipped,
+  becomes the cheapest thing in the region and wins every price comparison.
+  ESI does return zero-quantity lines. `price / qty` also raises on it.
+
+30/30 on the pre-conversion battery, 12/12 in shape on the conversion one.
+
+## The SDE tables are not in the migration history, on purpose
+
+Worth knowing before writing any cross-backend fixture that touches them:
+`0001_baseline` deliberately excludes `sde_*` and says so — CCP drops and
+rebuilds the static data wholesale on every SDE build, so it is created by
+`apply_sde_schema()` and kept out of the history.
+
+The consequence for tests is that `upgrade_to_head` alone gives a database with
+no `sde_types`, and `search_public_contracts` joins it while
+`get_contract_items` LEFT JOINs it for the `#id` fallback — so a fixture with
+only the migrations silently loses both behaviours rather than failing loudly.
+
+`apply_sde_schema()` is no use on Postgres either: it compiles its DDL against
+the SQLite dialect explicitly. Going through the metadata gives the same tables
+in whichever dialect the engine is bound to:
+
+```python
+from app.db.schema import metadata, SDE_TABLES
+metadata.create_all(eng, tables=[metadata.tables[n] for n in sorted(SDE_TABLES)])
+```
+
+`tests/test_contracts_helper_on_postgres.py::_build_sde_tables` is the worked
+example.
+
+## contract_id is two widths, deliberately
+
+`public_contracts.contract_id` is `Integer` while
+`contract_items_cache.contract_id` is `BigInteger` — the same identifier at two
+widths, which reads like an oversight and is not. The v0.9.57 int64 audit
+measured the largest real contract id at **234,465,667, or 10.9%** of the int32
+ceiling, against `character_id` at 98.9% which is why *that* one was widened.
+
+`test_public_contract_ids_are_int32_on_purpose` carries the reasoning so the
+next person to notice finds it attached rather than re-deriving it. If contract
+ids ever approach 2**31 both columns move together — and note the asymmetry
+runs in the safe direction: the character-side cache already accepts values the
+public-contract side would reject.

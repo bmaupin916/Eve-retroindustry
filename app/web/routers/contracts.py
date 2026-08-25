@@ -316,7 +316,7 @@ async def _resolve_region_id(name_or_id: str) -> tuple[int | None, str]:
 @router.get("/contracts/public", response_class=HTMLResponse)
 async def public_contracts_page(request: Request, region: str = "", item: str = "",
                                 ctype: str = "", max_price: str = ""):
-    conn = get_conn()
+    conn = _connect()
     ctx: dict = {
         "region_name": region, "region_id": None, "status": None, "results": [],
         "item": item, "ctype": ctype, "max_price": max_price, "error": None,
@@ -366,7 +366,7 @@ async def public_contracts_page(request: Request, region: str = "", item: str = 
 async def api_public_index(request: Request, region_id: int):
     """SSE stream: indexes a region (listing + items) into the cache."""
     async def gen():
-        conn = get_conn()
+        conn = _connect()
         try:
             async for chunk in contracts_helper.stream_public_index(conn, region_id):
                 yield chunk
@@ -381,7 +381,7 @@ async def api_public_index(request: Request, region_id: int):
 
 @router.get("/api/contracts/public/items")
 async def api_public_contract_items(request: Request, contract_id: int):
-    conn = get_conn()
+    conn = _connect()
     try:
         return {"items": contracts_helper.get_contract_items(conn, contract_id)}
     finally:
