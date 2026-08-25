@@ -720,3 +720,312 @@ def test_planner_does_not_fetch_planet_names_it_already_has(client, stub_pi, app
     assert next(r for r in view["rows"] if r["name"] == "Coolant")["sources"] == [
         "Test Pilot Alpha — Testworld 4001"
     ]
+
+
+# ── the SQL underneath /planets and the alert cache ──────────────────────────
+#
+# Added before the query conversion, because mutating the eighteen statements in
+# `routers/planets.py` and `pi_planner_helper.py` against the net above caught
+# **6 of 15**. What follows closes the gaps that were real.
+#
+# Two survivors were *not* gaps, and are recorded here rather than given a test
+# that would pass for the wrong reason:
+#
+# * **The schematic lookup's `IN` list is a size filter.** Dropping it returns
+#   every schematic in the SDE, and the extras are never rendered — the page
+#   only reads `schematics[sid]` for ids its own pins name. A superset cannot
+#   change the output, so no assertion can see it.
+# * **`AND sell_price IS NOT NULL` on the price map is redundant.** Both readers
+#   guard with `if out_price` / `if p0`, and a `None` value is exactly as falsy
+#   as a missing key.
+#
+# Same finding as the assets router in v0.9.68, and worth stating twice: an `IN`
+# list that only ever narrows a lookup the caller then indexes by key is a
+# performance filter, not a correctness one.
+
+def _planets_view(client) -> dict:
+    """The `/planets` template context, captured through the real route."""
+    captured = {}
+    original = planets_router._tr
+
+    def spy(name, request, context):
+        captured["view"] = context
+        return original(name, request, context)
+
+    planets_router._tr = spy
+    try:
+        assert client.get("/planets").status_code == 200
+    finally:
+        planets_router._tr = original
+    return captured["view"]
+
+
+def _only_colony(view: dict) -> dict:
+    """The single colony in the view.
+
+    Both seeded characters appear in `groups` — the second one synced and empty,
+    which the page deliberately distinguishes from never synced — so this picks
+    the group that actually has colonies rather than assuming there is one.
+    """
+    with_colonies = [g for g in view["groups"] if g["colonies"]]
+    assert len(with_colonies) == 1, (
+        f"expected exactly one character with colonies: "
+        f"{[(g['char_id'], len(g['colonies'])) for g in view['groups']]}")
+    colonies = with_colonies[0]["colonies"]
+    assert len(colonies) == 1, f"expected one colony: {colonies}"
+    return colonies[0]
+
+
+def test_a_production_chain_lists_the_inputs_its_schematic_consumes(client, stub_pi):
+    """`sde_planet_schematic_materials`, which nothing reached before.
+
+    A Coolant factory consumes Water and Electrolytes. Without the materials
+    query the chain still renders — output, cycle time and count all come from
+    the *other* schematic table — so it degrades into a production chain saying
+    the colony makes Coolant out of nothing.
+    """
+    stub_pi({4001: [_factory_pin(COOLANT_SCHEMATIC)]})
+
+    colony = _only_colony(_planets_view(client))
+
+    chain = next(p for p in colony["production"] if p["output"] == "Coolant")
+    inputs = {i["name"] for i in chain["inputs"]}
+    assert inputs, "the production chain lists no inputs at all"
+    assert "Water" in inputs, f"Coolant is refined from Water: {inputs}"
+
+
+def test_a_colony_is_valued_from_the_cached_sell_prices(client, stub_pi, app_module):
+    """`market_price_cache` feeds the est. output-value/day hint.
+
+    The figure is `price × output_qty × count × cycles_per_day`, so a lookup
+    that came back empty shows a colony worth **0** rather than raising — the
+    shape of failure this section exists to catch.
+    """
+    import time as _t
+
+    stub_pi({4001: [_factory_pin(COOLANT_SCHEMATIC)]})
+
+    conn = app_module.get_conn()
+    try:
+        coolant = conn.execute(
+            "SELECT output_type_id FROM sde_planet_schematics WHERE schematic_id=?",
+            (COOLANT_SCHEMATIC,)).fetchone()[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO market_price_cache"
+            " (type_id, sell_price, buy_price, cached_at) VALUES (?,?,?,?)",
+            (coolant, 1200.0, 1000.0, _t.time()))
+        conn.commit()
+    finally:
+        conn.close()
+
+    colony = _only_colony(_planets_view(client))
+
+    assert colony["value_day"] > 0, (
+        "a colony producing a priced commodity was valued at zero — the price "
+        "lookup returned nothing")
+
+
+# ── pi_extractor_cache: the per-character replace ────────────────────────────
+
+def _cached_rows(app_module) -> list[tuple]:
+    conn = app_module.get_conn()
+    try:
+        return conn.execute(
+            "SELECT char_id, planet_id, product_id, expiry_iso"
+            " FROM pi_extractor_cache ORDER BY planet_id, product_id").fetchall()
+    finally:
+        conn.close()
+
+
+def test_an_extractor_that_stopped_is_removed_from_the_cache(client, stub_pi, app_module):
+    """The `DELETE ... WHERE char_id IN (…)` that runs before the insert.
+
+    The write is a *replace* per character, not an upsert: an extractor the
+    character has since torn down has no new row to overwrite it, so without the
+    delete it stays cached forever and the dashboard keeps counting an expiry
+    that will never arrive.
+
+    Two planets down to one is the smallest fixture that can show it — with a
+    single planet, "replaced" and "upserted" are the same observation.
+    """
+    stub_pi({
+        4001: [_extractor_pin(AQUEOUS_LIQUIDS, _in(5))],
+        4002: [_extractor_pin(AQUEOUS_LIQUIDS, _in(6))],
+    })
+    _planets_view(client)
+    assert {r[1] for r in _cached_rows(app_module)} == {4001, 4002}
+
+    stub_pi({4001: [_extractor_pin(AQUEOUS_LIQUIDS, _in(5))]})
+    _planets_view(client)
+
+    assert {r[1] for r in _cached_rows(app_module)} == {4001}, (
+        "a planet the character no longer extracts from is still cached")
+
+
+def test_two_extractors_on_one_planet_collapse_to_a_single_row(client, stub_pi, app_module):
+    """`ON CONFLICT (char_id, planet_id, product_id) DO UPDATE`, reached the only
+    way it *can* be reached.
+
+    **The first version of this test was wrong about why it passed.** It stored
+    one extractor, then stored it again with a later expiry, and claimed the
+    upsert was what moved the time. It is not: `_store_pi_cache_for_chars`
+    issues `DELETE ... WHERE char_id IN (…)` before the insert, and every entry's
+    character is in that list — so across two calls there is nothing left to
+    conflict with, and the mutation battery said so by not catching a mutation
+    that gutted the `DO UPDATE` clause.
+
+    The clause is reachable **within a single batch**: two extractor pins on the
+    same planet pulling the same P0 produce two rows with the same key, and the
+    second conflicts with the first. That is an ordinary colony layout, not a
+    corner case.
+
+    Note what this pins, because it is a decision rather than an inevitability:
+    the surviving row carries the **last** pin's expiry, not the soonest. The
+    dashboard therefore counts down to one of the two heads. Worth revisiting —
+    an alert probably wants the earlier one — but it is pre-existing behaviour
+    and not something a query conversion should quietly change.
+    """
+    early, late = _in(2), _in(40)
+    stub_pi({4001: [
+        dict(_extractor_pin(AQUEOUS_LIQUIDS, early), pin_id=21),
+        dict(_extractor_pin(AQUEOUS_LIQUIDS, late), pin_id=22),
+    ]})
+
+    _planets_view(client)
+    rows = _cached_rows(app_module)
+
+    assert len(rows) == 1, (
+        f"two extractors on one planet should share one cache row: {rows}")
+    assert rows[0][3] == late, (
+        "the conflicting insert did not update the expiry — the DO UPDATE "
+        "clause is not doing anything")
+
+
+# ── the alert summary the dashboard tile reads ───────────────────────────────
+
+def test_the_alert_names_the_product_and_the_planet(client, stub_pi):
+    """`sde_types` and `planet_name_cache` inside `_pi_refresh_alerts`, each
+    looked up by an `IN` list.
+
+    Neither is load-bearing for the alert *count*, which is why the existing net
+    missed both: the fallbacks are `#2268` and `Planet #4001`, so a lookup that
+    returns nothing still produces a perfectly well-formed alert — one naming an
+    item by its type id and a world by its number.
+
+    **`force=1` is doing real work here.** Rendering `/planets` writes the
+    extractor cache itself, with names resolved by the *page's* lookups — so a
+    plain call to this endpoint finds the cache fresh, skips
+    `_pi_refresh_alerts` entirely, and asserts on rows the rebuild never
+    touched. The first version of this test did exactly that and could not see
+    either lookup break. Forcing the refresh is what puts the two statements
+    under test on the path.
+    """
+    stub_pi({4001: [_extractor_pin(AQUEOUS_LIQUIDS, _in(3))]})
+    _planets_view(client)
+
+    body = client.get("/api/dashboard/pi-alerts?force=1").json()
+
+    assert body["items"], f"no alert for an extractor due in 3h: {body}"
+    item = body["items"][0]
+    assert item["product"] == "Aqueous Liquids", (
+        f"the product fell back to its type id: {item['product']}")
+    assert item["planet"] == "Testworld 4001", (
+        f"the planet fell back to its id: {item['planet']}")
+
+
+# ── pi_planner_helper: the two SDE lookups behind the target box ─────────────
+
+def test_the_target_box_is_offered_things_pi_can_actually_make(client):
+    """`target_choices` — a UNION of every PI schematic output and every
+    blueprint product with a PI commodity in its bill of materials.
+
+    It had **no assertion at all**. The pre-conversion battery appeared to catch
+    a mutation here, but only because that mutation renamed the function and
+    every test died on the `NameError` — a crash is not coverage. Blanking the
+    return value instead was caught by nothing.
+
+    Two members, chosen from opposite arms of the UNION: Water is a schematic
+    output, and a fuel block is a manufactured item that consumes PI. A query
+    that lost either arm still returns a long plausible list.
+    """
+    from app.db.location import database_path
+
+    from app.web import pi_planner_helper as helper
+
+    view = helper.build_view_model(database_path())
+    choices = view["target_choices"]
+
+    assert choices, "the target box was offered nothing at all"
+    assert "Water" in choices, "a PI schematic output is missing from the list"
+    assert "Nitrogen Fuel Block" in choices, (
+        "a manufactured item that consumes PI is missing — the second arm of "
+        "the UNION returned nothing")
+
+
+def test_a_partial_target_resolves_to_the_shortest_match(client):
+    """`ORDER BY LENGTH(name) LIMIT 1` on the prefix fallback.
+
+    **The search term here is load-bearing and the first one I picked was not.**
+    "hobgoblin" matches five types and the shortest, *Hobgoblin I*, is also the
+    one SQLite happens to return first — so dropping the `ORDER BY` changed
+    nothing and the mutation survived. A test whose expected value coincides
+    with the unordered answer proves only that a row came back.
+
+    "nitrogen" separates them. Three types match, and without the ordering
+    SQLite yields **Nitrogen Fuel Block** (19 characters) before **Nitrogen
+    Isotopes** (17) — so the assertion below fails the moment the `ORDER BY`
+    goes. It is also the realistic complaint: typing a partial name and being
+    handed the longer, less likely item.
+
+    The two backends are under no obligation to agree on unordered row order,
+    which is exactly the class of difference a conversion must not introduce.
+
+    Note the exact-name lookup above it is *not* pinned, deliberately: if a type
+    is named exactly what you typed then it is also the shortest prefix match,
+    so the fast path and the fallback cannot disagree. Removing it changes
+    nothing observable, and a test claiming otherwise would describe something
+    that is not true.
+    """
+    from app.db.conn import connect
+
+    from app.web import pi_planner_helper as helper
+
+    with connect() as c:
+        row = helper._find_target(c, "nitrogen")
+
+    assert row is not None, "a prefix that matches three types resolved to nothing"
+    assert row[1] == "Nitrogen Isotopes", (
+        f"expected the shortest match, got {row[1]!r} — the ORDER BY LENGTH is "
+        f"not being applied")
+
+
+def test_a_target_typed_as_an_id_resolves_to_that_type(client):
+    """The `isdigit()` branch, which nothing else reaches."""
+    from app.db.conn import connect
+
+    from app.web import pi_planner_helper as helper
+
+    with connect() as c:
+        row = helper._find_target(c, "2454")
+
+    assert row is not None and row[0] == 2454
+    assert row[1] == "Hobgoblin I"
+
+
+def test_a_fresh_alert_cache_is_served_without_rebuilding(client, stub_pi):
+    """`SELECT MAX(cached_at)` is what makes the dashboard tile cache-first.
+
+    `age` decides `fresh`, and `fresh` decides whether the summary is rebuilt
+    from the colony cache on every poll. An age that always came back `None`
+    reads as "nothing cached yet", so the rebuild would run every time — no
+    error and no wrong number, just work on a timer nobody asked for.
+    """
+    stub_pi({4001: [_extractor_pin(AQUEOUS_LIQUIDS, _in(3))]})
+    _planets_view(client)
+
+    body = client.get("/api/dashboard/pi-alerts").json()
+
+    assert body.get("from_cache") is True, (
+        "the tile rebuilt the alert cache although it had just been written — "
+        "the cache age is not being read")
+    assert body["age"] is not None

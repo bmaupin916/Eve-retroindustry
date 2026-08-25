@@ -22,7 +22,10 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 
+from sqlalchemy import bindparam, text
+
 from app.bom.resolver import BOMResolver
+from app.db.conn import NO_SUCH_TABLE, connect, connect_to_path
 from app.planetary.colonies import DEFAULT_CCU_LEVEL, DEFAULT_DERATE, plan_colonies
 from app.planetary.schematics import PIResolver, split_pi_leaves, whole_units
 
@@ -94,7 +97,7 @@ def target_choices(conn: sqlite3.Connection) -> list[str]:
     in its BOM would produce an empty page. Free text still works for anything
     else; this list is a convenience, not a whitelist.
     """
-    rows = conn.execute("""
+    rows = conn.execute(text("""
         SELECT t.name FROM sde_types t
         WHERE t.type_id IN (SELECT output_type_id FROM sde_planet_schematics)
         UNION
@@ -106,28 +109,37 @@ def target_choices(conn: sqlite3.Connection) -> list[str]:
         WHERE p.activity IN ('manufacturing', 'reaction')
           AND m.material_type_id IN (SELECT output_type_id FROM sde_planet_schematics)
         ORDER BY 1
-    """).fetchall()
+    """)).fetchall()
     return [r[0] for r in rows]
 
 
-def _find_target(conn: sqlite3.Connection, target: str) -> sqlite3.Row | None:
+def _find_target(conn, target: str):
     """Resolves the typed target to a type. Exact name first, then a prefix
-    match, so "nitrogen fuel" finds the block without a full type-ahead."""
-    text = target.strip()
-    if not text:
+    match, so "nitrogen fuel" finds the block without a full type-ahead.
+
+    Returns a row of `(type_id, name)`. The caller unpacks it positionally: a
+    `sqlite3.Row` supports `row["type_id"]` and a SQLAlchemy `Row` does not, so
+    subscripting by name is the one way to read this that breaks on exactly one
+    backend.
+    """
+    typed = target.strip()
+    if not typed:
         return None
-    if text.isdigit():
+    if typed.isdigit():
         return conn.execute(
-            "SELECT type_id, name FROM sde_types WHERE type_id=?", (int(text),)
+            text("SELECT type_id, name FROM sde_types WHERE type_id=:tid"),
+            {"tid": int(typed)},
         ).fetchone()
     row = conn.execute(
-        "SELECT type_id, name FROM sde_types WHERE LOWER(name)=?", (text.lower(),)
+        text("SELECT type_id, name FROM sde_types WHERE LOWER(name)=:name"),
+        {"name": typed.lower()},
     ).fetchone()
     if row:
         return row
     return conn.execute(
-        "SELECT type_id, name FROM sde_types WHERE LOWER(name) LIKE ? ORDER BY LENGTH(name) LIMIT 1",
-        (text.lower() + "%",),
+        text("SELECT type_id, name FROM sde_types WHERE LOWER(name) LIKE :prefix"
+             " ORDER BY LENGTH(name) LIMIT 1"),
+        {"prefix": typed.lower() + "%"},
     ).fetchone()
 
 
@@ -197,45 +209,68 @@ def _remaining(expiry_iso: str, now: dt.datetime) -> tuple[str, int | None]:
             + f"{rest // 60}m"), secs
 
 
-def _schematic_outputs(conn: sqlite3.Connection, schematic_ids: set[int]) -> dict[int, int]:
+# These three used to take the caller's connection. They open their own now,
+# which is what made `build_plan_vs_actual`'s `conn` parameter dead — it existed
+# only to be handed down to them.
+
+def _schematic_outputs(schematic_ids: set[int]) -> dict[int, int]:
     """schematic_id → output type_id, straight from the SDE."""
     if not schematic_ids:
         return {}
-    placeholders = ",".join("?" * len(schematic_ids))
-    return {r[0]: r[1] for r in conn.execute(
-        f"SELECT schematic_id, output_type_id FROM sde_planet_schematics "
-        f"WHERE schematic_id IN ({placeholders})", list(schematic_ids)
-    ).fetchall()}
+    with connect() as c:
+        return {r[0]: r[1] for r in c.execute(
+            text("SELECT schematic_id, output_type_id FROM sde_planet_schematics"
+                 " WHERE schematic_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(schematic_ids)},
+        ).fetchall()}
 
 
-def _planet_names(conn: sqlite3.Connection, planet_ids: set[int]) -> dict[int, str]:
+def _planet_names(planet_ids: set[int]) -> dict[int, str]:
     """Names from the cache /planets already fills. Deliberately does not fetch:
-    a planet this app has never rendered simply shows as its id."""
+    a planet this app has never rendered simply shows as its id.
+
+    **In practice this is a fallback with no live caller.** `build_plan_vs_actual`
+    runs `names.update(planet_names or {})` immediately afterwards, and the one
+    route that calls it always passes `planet_names=` — resolved from the same
+    `planet_name_cache` table this reads. So every value here is overwritten by
+    an identical value, which is why breaking this query is invisible to the
+    suite. Kept because the parameter is optional and a caller that omits it
+    would otherwise get bare ids; noted so the next person does not mistake the
+    silence for coverage.
+    """
     if not planet_ids:
         return {}
     try:
-        placeholders = ",".join("?" * len(planet_ids))
-        return {r[0]: r[1] for r in conn.execute(
-            f"SELECT planet_id, name FROM planet_name_cache "
-            f"WHERE planet_id IN ({placeholders})", list(planet_ids)
-        ).fetchall() if r[1]}
-    except sqlite3.OperationalError:
-        return {}          # cache table not created yet (never visited /planets)
+        with connect() as c:
+            return {r[0]: r[1] for r in c.execute(
+                text("SELECT planet_id, name FROM planet_name_cache"
+                     " WHERE planet_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": list(planet_ids)},
+            ).fetchall() if r[1]}
+    except NO_SUCH_TABLE:
+        # Cache table not created yet (never visited /planets). Caught as the
+        # portable pair rather than `sqlite3.OperationalError`: Postgres raises
+        # ProgrammingError for the same condition, so the driver-specific except
+        # would stop catching the moment the backend changed.
+        return {}
 
 
-def _type_names(conn: sqlite3.Connection, type_ids: set[int]) -> dict[int, str]:
+def _type_names(type_ids: set[int]) -> dict[int, str]:
     """Batch name lookup — one query instead of one per extractor."""
     ids = {t for t in type_ids if t}
     if not ids:
         return {}
-    placeholders = ",".join("?" * len(ids))
-    return {r[0]: r[1] for r in conn.execute(
-        f"SELECT type_id, name FROM sde_types WHERE type_id IN ({placeholders})", list(ids)
-    ).fetchall()}
+    with connect() as c:
+        return {r[0]: r[1] for r in c.execute(
+            text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(ids)},
+        ).fetchall()}
 
 
 def build_plan_vs_actual(
-    conn: sqlite3.Connection,
     results: list,
     char_names: dict[int, str],
     colonies_plan: list[dict],
@@ -313,11 +348,16 @@ def build_plan_vs_actual(
                 extractor = pin.get("extractor_details")
                 if extractor:
                     expiry = pin.get("expiry_time") or ""
-                    text, secs = _remaining(expiry, now)
+                    # Not `text` — this module now imports SQLAlchemy's `text()`
+                    # at module level, and a local of the same name shadows it
+                    # for the whole function. Harmless today (nothing here
+                    # builds SQL) and an `UnboundLocalError` waiting for whoever
+                    # adds a query to this function later.
+                    remaining, secs = _remaining(expiry, now)
                     extractors.append({
                         "product_id": extractor.get("product_type_id"),
                         "expiry_iso": expiry,
-                        "remaining": text,
+                        "remaining": remaining,
                         "secs": secs,
                     })
             raw_colonies.append({
@@ -326,10 +366,10 @@ def build_plan_vs_actual(
                 "facilities": facilities, "extractors": extractors,
             })
 
-    outputs = _schematic_outputs(conn, schematic_ids)
-    names = dict(_planet_names(conn, planet_ids))
+    outputs = _schematic_outputs(schematic_ids)
+    names = dict(_planet_names(planet_ids))
     names.update({k: v for k, v in (planet_names or {}).items() if v})
-    product_names = _type_names(conn, {
+    product_names = _type_names({
         e["product_id"] for c in raw_colonies for e in c["extractors"]
     })
 
@@ -409,7 +449,7 @@ def build_plan_vs_actual(
         "total_needed": sum(r["needed"] for r in rows),
         "matched_colonies": matched,
         "unplanned": sorted(
-            _type_names(conn, {t for t in have if t not in planned}).values()
+            _type_names({t for t in have if t not in planned}).values()
         ),
     }
 
@@ -448,19 +488,24 @@ def build_view_model(
 
     pi = PIResolver(db_path)
     bom: BOMResolver | None = None
+    # One connection for everything that reads the SDE here: the two lookups
+    # below and the BOMResolver. Opened before the try so the `finally` always
+    # has something to close — the old code created it half way down and closed
+    # it only `if bom is not None`, which leaked on any path that got the
+    # connection but not the resolver.
+    sde = connect_to_path(db_path)
     try:
-        view["target_choices"] = target_choices(pi.conn)
+        view["target_choices"] = target_choices(sde)
         if not target.strip():
             return view
 
-        row = _find_target(pi.conn, target)
+        row = _find_target(sde, target)
         if row is None:
             view["error"] = f"No type named “{target}”."
             return view
 
-        type_id, name = row["type_id"], row["name"]
-        from app.db.conn import connect_to_path
-        sde = connect_to_path(db_path)                 # for the converted BOMResolver
+        # Positional, not `row["type_id"]` — see `_find_target`.
+        type_id, name = row[0], row[1]
         bom = BOMResolver(sde, runs_per_job=None)
         blueprint = bom.find_blueprint(type_id)
         is_pi = pi.is_pi_commodity(type_id)
@@ -540,6 +585,5 @@ def build_view_model(
         }
         return view
     finally:
-        if bom is not None:
-            sde.close()
+        sde.close()
         pi.close()

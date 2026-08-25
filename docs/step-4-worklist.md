@@ -63,9 +63,9 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
   **The measure from here is the count of raw `?`-parameter statements**, and
   it has to be taken with an AST walk rather than a grep — see "Count
-  statements with an AST" below. **121** of them at v0.9.69, down from 137 at
+  statements with an AST" below. **103** of them at v0.9.70, down from 137 at
   v0.9.66 and 145 at v0.9.65; **twelve** files still hold a raw `get_conn()`
-  handle — still twelve after v0.9.69, because `routers/assets.py` has zero raw
+  handle — still twelve after v0.9.70, because `routers/assets.py` has zero raw
   statements of its own and *still* opens one: `get_active_character`,
   `get_active_token` and the `_load_*_from_cache` helpers in `deps.py` all take
   a `sqlite3.Connection`. The two counts measure different things and only the
@@ -1421,7 +1421,7 @@ for f in pathlib.Path("app").rglob("*.py"):
 which is where the `IN ({ph})` placeholder patterns live, and those are the ones
 that need an expanding bindparam rather than a mechanical rewrite.
 
-## Where the remaining statements are (145 at v0.9.65, 137 after v0.9.66, 129 after v0.9.68, 121 after v0.9.69)
+## Where the remaining statements are (145 at v0.9.65 → 103 after v0.9.70)
 
 Regenerated from the AST scan rather than edited by hand, because the previous
 version of this table had drifted from what the scan actually reported.
@@ -1430,13 +1430,13 @@ version of this table had drifted from what the scan actually reported.
 | --- | --- | --- |
 | prices — `prices_helper` 15, `routers/prices` 13, `market/prices` 11 | 39 | 3 |
 | `routers/plan.py` | 18 | 1 |
-| PI — `routers/planets` 11, `pi_planner_helper` 7 | 18 | 2 |
-| `main.py` 9, `deps.py` 8 | 17 | 2 |
 | infrastructure — `security` 7, `bootstrap` 7, `conn` 4, `schema` 1 | 19 | 4 |
+| `main.py` 9, `deps.py` 8 | 17 | 2 |
 | the rest — `schematics` 4, `type_resolver` 2, `esi_oauth` 2, `routers/auth` 1, `planner` 1 | 10 | 5 |
 
-`routers/assets.py`, `contracts_helper.py` and `routers/locations.py` have left
-this table entirely.
+Gone from this table: `contracts_helper` + `routers/contracts` (v0.9.66),
+`routers/assets` (v0.9.68), `routers/locations` (v0.9.69), and the PI pair
+`routers/planets` + `pi_planner_helper` (v0.9.70).
 
 **`deps.py` is last, not next — this paragraph used to say the opposite.**
 
@@ -1453,9 +1453,9 @@ along for free. `contracts_helper` + `routers/contracts` (v0.9.66) and
 `routers/assets` (v0.9.68) both went that way. `get_conn()` itself, with its 59
 call sites, is the closing act.
 
-Next by that rule: `routers/locations.py` (8), then PI — `routers/planets` and
-`pi_planner_helper` (18 between them) — then `routers/plan.py` (18), then the
-prices cluster (39 across three files, the largest single unit left).
+Next by that rule: `routers/plan.py` (18), then the prices cluster (39 across
+three files, the largest single unit left), then the infrastructure files, and
+finally `main.py` + `deps.py` — where `get_conn()` itself lives.
 
 
 ## The route-jump chunk was twice the size it could be (v0.9.67)

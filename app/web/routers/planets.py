@@ -20,6 +20,8 @@ from app.sync import worker as sync_worker
 from app.web import pi_planner_helper
 from app.db.location import database_path
 from app.db.schema import ensure_schema as ensure_db_schema
+from sqlalchemy import bindparam, inspect as sa_inspect, text
+
 from app.db.conn import connect as _connect
 from app.web.deps import _tr, all_characters, get_conn
 
@@ -110,42 +112,57 @@ async def planets_page(request: Request):
     # startup SDE-refresh won't have it yet, so degrade gracefully (colonies
     # still render, just without production chains) instead of 500-ing.
     schematics: dict[int, dict] = {}
-    _has_schematics = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='sde_planet_schematics'"
-    ).fetchone() is not None
-    if schematic_ids and _has_schematics:
-        sph = ",".join("?" * len(schematic_ids))
-        for sid, nm, cyc, out_tid, out_qty in conn.execute(
-            f"SELECT schematic_id, name, cycle_time, output_type_id, output_qty "
-            f"FROM sde_planet_schematics WHERE schematic_id IN ({sph})", list(schematic_ids)
-        ).fetchall():
-            schematics[sid] = {"name": nm, "cycle_time": cyc or 0,
-                               "output_id": out_tid, "output_qty": out_qty or 0, "inputs": []}
-            if out_tid:
-                type_ids.add(out_tid)
-        for sid, tid, qty in conn.execute(
-            f"SELECT schematic_id, type_id, quantity FROM sde_planet_schematic_materials "
-            f"WHERE schematic_id IN ({sph})", list(schematic_ids)
-        ).fetchall():
-            if sid in schematics:
-                schematics[sid]["inputs"].append({"type_id": tid, "qty": qty})
-                type_ids.add(tid)
+    if schematic_ids:
+        with _connect() as _sc:
+            # `SELECT name FROM sqlite_master` was the last use of SQLite's own
+            # catalog table in the app, and it is not a table Postgres has. The
+            # inspector answers the same question on either backend.
+            if sa_inspect(_sc).has_table("sde_planet_schematics"):
+                ids = list(schematic_ids)
+                for sid, nm, cyc, out_tid, out_qty in _sc.execute(
+                    text("SELECT schematic_id, name, cycle_time, output_type_id,"
+                         " output_qty FROM sde_planet_schematics"
+                         " WHERE schematic_id IN :ids")
+                    .bindparams(bindparam("ids", expanding=True)),
+                    {"ids": ids},
+                ).fetchall():
+                    schematics[sid] = {"name": nm, "cycle_time": cyc or 0,
+                                       "output_id": out_tid, "output_qty": out_qty or 0,
+                                       "inputs": []}
+                    if out_tid:
+                        type_ids.add(out_tid)
+                for sid, tid, qty in _sc.execute(
+                    text("SELECT schematic_id, type_id, quantity"
+                         " FROM sde_planet_schematic_materials"
+                         " WHERE schematic_id IN :ids")
+                    .bindparams(bindparam("ids", expanding=True)),
+                    {"ids": ids},
+                ).fetchall():
+                    if sid in schematics:
+                        schematics[sid]["inputs"].append({"type_id": tid, "qty": qty})
+                        type_ids.add(tid)
 
     type_names: dict[int, str] = {}
-    if type_ids:
-        ph = ",".join("?" * len(type_ids))
-        type_names = {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})", list(type_ids)
-        ).fetchall()}
-
-    # Sell prices (for the est. output-value/day hint) — the Jita cache.
     price_map: dict[int, float] = {}
     if type_ids:
-        ph = ",".join("?" * len(type_ids))
-        price_map = {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, sell_price FROM market_price_cache "
-            f"WHERE type_id IN ({ph}) AND sell_price IS NOT NULL", list(type_ids)
-        ).fetchall()}
+        ids = list(type_ids)
+        with _connect() as _tc:
+            type_names = {r[0]: r[1] for r in _tc.execute(
+                text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": ids},
+            ).fetchall()}
+            # Sell prices (for the est. output-value/day hint) — the Jita cache.
+            # `sell_price IS NOT NULL` is belt and braces: both readers below
+            # guard with `if out_price` / `if p0`, and a None value is exactly as
+            # falsy as a missing key. Kept because it costs nothing, but no test
+            # can pin it and none pretends to.
+            price_map = {r[0]: r[1] for r in _tc.execute(
+                text("SELECT type_id, sell_price FROM market_price_cache"
+                     " WHERE type_id IN :ids AND sell_price IS NOT NULL")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": ids},
+            ).fetchall()}
 
     # Planet names ("Jita IV", already includes the system). Resolved through the
     # shared cache: names never change, so only ids we've never seen cost an ESI
@@ -323,7 +340,7 @@ async def pi_planner_page(
                           for c in res[0]}
             planet_names = _resolve_planet_names(conn, planet_ids) if planet_ids else {}
             view["actual"] = pi_planner_helper.build_plan_vs_actual(
-                conn, results, dict(chars), view["result"]["colonies"],
+                results, dict(chars), view["result"]["colonies"],
                 planet_names=planet_names)
             view["signed_in"] = bool(chars)
             # Refresh the shared PI alert cache from this (freshest) view, exactly
@@ -377,17 +394,36 @@ def _store_pi_cache_for_chars(conn: sqlite3.Connection, char_ids, entries) -> No
     _ensure_pi_cache_tables(conn)
     if not char_ids:
         return
-    ph = ",".join("?" * len(char_ids))
-    conn.execute(f"DELETE FROM pi_extractor_cache WHERE char_id IN ({ph})", list(char_ids))
-    if entries:
-        now = _time.time()
-        conn.executemany(
-            "INSERT INTO pi_extractor_cache "
-            "(char_id,char_name,planet_id,planet_name,product_id,product,expiry_iso,cached_at) "
-            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (char_id, planet_id, product_id) DO UPDATE SET char_name=excluded.char_name, planet_name=excluded.planet_name, product=excluded.product, expiry_iso=excluded.expiry_iso, cached_at=excluded.cached_at",
-            [(e["char_id"], e["char_name"], e["planet_id"], e["planet_name"],
-              e["product_id"], e["product"], e["expiry_iso"], now) for e in entries])
-    conn.commit()
+    with _connect() as _pc:
+        _pc.execute(
+            text("DELETE FROM pi_extractor_cache WHERE char_id IN :cids")
+            .bindparams(bindparam("cids", expanding=True)),
+            {"cids": list(char_ids)},
+        )
+        if entries:
+            now = _time.time()
+            # The DELETE above means the ON CONFLICT can never fire *across*
+            # calls — every entry's character is in `char_ids`. It fires within
+            # one batch: two extractor pins on the same planet pulling the same
+            # P0 collide on the key, and the later row wins.
+            _pc.execute(
+                text("INSERT INTO pi_extractor_cache"
+                     " (char_id, char_name, planet_id, planet_name,"
+                     "  product_id, product, expiry_iso, cached_at)"
+                     " VALUES (:char_id, :char_name, :planet_id, :planet_name,"
+                     "  :product_id, :product, :expiry_iso, :cached_at)"
+                     " ON CONFLICT (char_id, planet_id, product_id) DO UPDATE SET"
+                     " char_name=excluded.char_name,"
+                     " planet_name=excluded.planet_name,"
+                     " product=excluded.product,"
+                     " expiry_iso=excluded.expiry_iso,"
+                     " cached_at=excluded.cached_at"),
+                [{"char_id": e["char_id"], "char_name": e["char_name"],
+                  "planet_id": e["planet_id"], "planet_name": e["planet_name"],
+                  "product_id": e["product_id"], "product": e["product"],
+                  "expiry_iso": e["expiry_iso"], "cached_at": now} for e in entries],
+            )
+        _pc.commit()
 
 
 def _pi_refresh_alerts(conn: sqlite3.Connection, chars) -> None:
@@ -432,18 +468,19 @@ def _pi_refresh_alerts(conn: sqlite3.Connection, chars) -> None:
                     type_ids.add(ed["product_type_id"])
 
     type_names: dict[int, str] = {}
-    if type_ids:
-        ph = ",".join("?" * len(type_ids))
-        type_names = {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})",
-            list(type_ids))}
-
     planet_names: dict[int, str] = {}
-    if planet_ids:
-        pph = ",".join("?" * len(planet_ids))
-        planet_names = {r[0]: r[1] for r in conn.execute(
-            f"SELECT planet_id, name FROM planet_name_cache WHERE planet_id IN ({pph})",
-            list(planet_ids))}
+    with _connect() as _nc:
+        if type_ids:
+            type_names = {r[0]: r[1] for r in _nc.execute(
+                text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": list(type_ids)})}
+        if planet_ids:
+            planet_names = {r[0]: r[1] for r in _nc.execute(
+                text("SELECT planet_id, name FROM planet_name_cache"
+                     " WHERE planet_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": list(planet_ids)})}
 
     entries = [{
         "char_id": cid, "char_name": char_name.get(cid, str(cid)),
@@ -460,12 +497,14 @@ def _pi_alert_summary(conn: sqlite3.Connection, limit: int = 8) -> dict:
     _ensure_pi_cache_tables(conn)
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc)
-    rows = conn.execute(
-        "SELECT char_name, planet_name, product, expiry_iso FROM pi_extractor_cache"
-    ).fetchall()
-    # Age of the cache itself, so callers can decide whether an ESI refresh is
-    # worth it (None = nothing cached yet).
-    _age_row = conn.execute("SELECT MAX(cached_at) FROM pi_extractor_cache").fetchone()
+    with _connect() as _ac:
+        rows = _ac.execute(text(
+            "SELECT char_name, planet_name, product, expiry_iso"
+            " FROM pi_extractor_cache")).fetchall()
+        # Age of the cache itself, so callers can decide whether an ESI refresh
+        # is worth it (None = nothing cached yet).
+        _age_row = _ac.execute(
+            text("SELECT MAX(cached_at) FROM pi_extractor_cache")).fetchone()
     cache_age = (_time.time() - _age_row[0]) if (_age_row and _age_row[0]) else None
     items = []
     n_soon = n_expired = 0
