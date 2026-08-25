@@ -11,6 +11,7 @@ import asyncio
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
+from sqlalchemy import bindparam, text
 
 from app.auth.token_store import get_character_row, list_characters
 from app.character import contracts as contracts_api
@@ -26,6 +27,7 @@ from app.web.deps import (
     get_active_character_id,
     get_conn,
 )
+
 from app.db.conn import connect as _connect
 from app.web.location_resolver import (
     load_location_names_from_db,
@@ -244,9 +246,10 @@ async def api_contract_items(request: Request, contract_id: int,
         tids = {it.get("type_id") for it in items if it.get("type_id")}
         names: dict[int, str] = {}
         if tids:
-            ph = ",".join("?" * len(tids))
             names = {r[0]: r[1] for r in conn.execute(
-                f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})", list(tids)
+                text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": list(tids)},
             ).fetchall()}
         out = [{
             "type_id":  it.get("type_id"),
