@@ -26,6 +26,7 @@ import sqlite3
 import time
 
 import pytest
+from sqlalchemy import text
 
 from app.character import orders as orders_api
 from app.db.schema import apply_schema
@@ -347,119 +348,133 @@ def test_an_unsynced_character_is_told_so_rather_than_shown_zero(client):
 
 # ── /wallet, same shape ──────────────────────────────────────────────────────
 
+
+@pytest.fixture
+def wconn(conn):
+    """An engine connection onto the same database as `conn`.
+
+    `app/character/wallet.py` is on the portable query layer, so its readers and
+    writers take one of these. A fixture rather than a `with` block inside each
+    test: the assertions are the point, and eight extra levels of indentation
+    would bury them.
+    """
+    with _engine_conn(conn) as ec:
+        yield ec
+
+
 from app.character import wallet as wallet_api  # noqa: E402  (grouped with its tests)
 
 
-def test_an_unsynced_wallet_reads_as_none_not_an_empty_journal(conn):
+def test_an_unsynced_wallet_reads_as_none_not_an_empty_journal(wconn):
     """The same distinction as orders, and it matters more here: an empty
     journal reads as "no activity this month", which is a finding rather than
     a gap."""
-    rows, at = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
+    rows, at = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.JOURNAL)
 
     assert rows is None
     assert at == 0.0
 
 
-def test_a_wallet_ledger_round_trips(conn):
-    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL,
+def test_a_wallet_ledger_round_trips(wconn):
+    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.JOURNAL,
                                   [{"id": 1, "amount": -5.0}])
-    conn.commit()
+    wconn.commit()
 
-    rows, at = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
+    rows, at = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.JOURNAL)
 
     assert [r["id"] for r in rows] == [1]
     assert at > 0
 
 
-def test_the_journal_and_transactions_do_not_overwrite_each_other(conn):
+def test_the_journal_and_transactions_do_not_overwrite_each_other(wconn):
     """`ledger` is in the key. The worker writes both back to back, so a key
     that collapsed would leave whichever ran last in both tabs."""
-    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
-    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS, [{"id": 2}])
-    conn.commit()
+    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
+    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.TRANSACTIONS, [{"id": 2}])
+    wconn.commit()
 
-    journal, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
-    txns, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS)
+    journal, _ = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.JOURNAL)
+    txns, _ = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.TRANSACTIONS)
 
     assert [r["id"] for r in journal] == [1]
     assert [r["id"] for r in txns] == [2]
 
 
-def test_corporation_divisions_are_kept_apart(conn):
+def test_corporation_divisions_are_kept_apart(wconn):
     """Seven divisions, shown one at a time. Without `division` in the key the
     page would show division 1's ledger under every tab — and the numbers look
     plausible, which is the worst kind of wrong for a wallet."""
     for div in (1, 3):
-        wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL,
+        wallet_api.save_cached_ledger(wconn, CORP, wallet_api.JOURNAL,
                                       [{"id": div}], wallet_api.CORPORATION, div)
-    conn.commit()
+    wconn.commit()
 
     one, _ = wallet_api.load_cached_ledger(
-        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 1)
+        wconn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 1)
     three, _ = wallet_api.load_cached_ledger(
-        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 3)
+        wconn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION, 3)
 
     assert [r["id"] for r in one] == [1]
     assert [r["id"] for r in three] == [3]
 
 
-def test_a_character_and_a_corporation_do_not_share_division_zero(conn):
+def test_a_character_and_a_corporation_do_not_share_division_zero(wconn):
     """A character sits at division 0 and a corporation's balance list does
     too. `owner_kind` is what keeps them apart."""
-    wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL, [{"id": 1}])
-    wallet_api.save_cached_ledger(conn, CORP, wallet_api.JOURNAL, [{"id": 2}],
+    wallet_api.save_cached_ledger(wconn, CORP, wallet_api.JOURNAL, [{"id": 1}])
+    wallet_api.save_cached_ledger(wconn, CORP, wallet_api.JOURNAL, [{"id": 2}],
                                   wallet_api.CORPORATION)
-    conn.commit()
+    wconn.commit()
 
-    personal, _ = wallet_api.load_cached_ledger(conn, CORP, wallet_api.JOURNAL)
+    personal, _ = wallet_api.load_cached_ledger(wconn, CORP, wallet_api.JOURNAL)
     corp, _ = wallet_api.load_cached_ledger(
-        conn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION)
+        wconn, CORP, wallet_api.JOURNAL, wallet_api.CORPORATION)
 
     assert [r["id"] for r in personal] == [1]
     assert [r["id"] for r in corp] == [2]
 
 
-def test_a_failed_journal_fetch_keeps_the_previous_month(conn):
+def test_a_failed_journal_fetch_keeps_the_previous_month(wconn):
     """`fetch_journal` returned `[]` on any failure. Cached, that erases a
     month of history and the next sync writes the erasure down."""
-    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
-    conn.commit()
+    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.JOURNAL, [{"id": 1}])
+    wconn.commit()
 
     result = asyncio.run(
-        wallet_api.fetch_journal(_Client(_Resp(500)), ALICE, "tok", conn=conn))
+        wallet_api.fetch_journal(_Client(_Resp(500)), ALICE, "tok", conn=wconn))
 
     assert result is None, "a failed fetch reported an empty journal"
-    kept, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.JOURNAL)
+    kept, _ = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.JOURNAL)
     assert [r["id"] for r in kept] == [1], "the good cache was overwritten"
 
 
-def test_a_failed_transactions_fetch_writes_nothing(conn):
-    wallet_api.save_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS, [{"id": 1}])
-    conn.commit()
+def test_a_failed_transactions_fetch_writes_nothing(wconn):
+    wallet_api.save_cached_ledger(wconn, ALICE, wallet_api.TRANSACTIONS, [{"id": 1}])
+    wconn.commit()
 
     result = asyncio.run(
-        wallet_api.fetch_transactions(_Client(_Resp(500)), ALICE, "tok", conn=conn))
+        wallet_api.fetch_transactions(_Client(_Resp(500)), ALICE, "tok", conn=wconn))
 
     assert result is None
-    kept, _ = wallet_api.load_cached_ledger(conn, ALICE, wallet_api.TRANSACTIONS)
+    kept, _ = wallet_api.load_cached_ledger(wconn, ALICE, wallet_api.TRANSACTIONS)
     assert [r["id"] for r in kept] == [1]
 
 
-def test_the_balance_lands_in_the_table_the_dashboard_reads(conn):
+def test_the_balance_lands_in_the_table_the_dashboard_reads(wconn):
     """Not the ledger table. `char_wallet_cache` has a second consumer in
     `app/web/main.py` that reads it with a five-minute TTL and fetches on a
     miss — writing it here is what stops that fetch happening at all."""
     asyncio.run(wallet_api.fetch_balance(
-        _Client(_Resp(200, 12_345.75)), ALICE, "tok", conn=conn))
-    conn.commit()
+        _Client(_Resp(200, 12_345.75)), ALICE, "tok", conn=wconn))
+    wconn.commit()
 
-    stored = conn.execute(
-        "SELECT balance FROM char_wallet_cache WHERE character_id=?",
-        (ALICE,)).fetchone()
+    stored = wconn.execute(
+        text("SELECT balance FROM char_wallet_cache WHERE character_id=:cid"),
+        {"cid": ALICE}).fetchone()
 
     assert stored is not None, "the balance did not reach char_wallet_cache"
     assert stored[0] == pytest.approx(12_345.75)
-    assert wallet_api.load_cached_balance(conn, ALICE)[0] == pytest.approx(12_345.75)
+    assert wallet_api.load_cached_balance(wconn, ALICE)[0] == pytest.approx(12_345.75)
 
 
 def test_an_unsynced_wallet_page_says_so_rather_than_showing_zero(client):

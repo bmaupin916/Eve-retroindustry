@@ -14,6 +14,7 @@ import asyncio
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
+from sqlalchemy import bindparam, text
 
 from app.auth.token_store import get_character_row, list_characters
 from app.character import orders as orders_api
@@ -50,7 +51,7 @@ _CORP_DIVISION_NAMES = {
 @router.get("/wallet", response_class=HTMLResponse)
 async def wallet_page(request: Request, char: str = "", scope: str = "personal",
                       division: int = 1):
-    conn = get_conn()
+    conn = _connect()
     # Which character drives the page (?char= overrides the active cookie)
     plan_char_id: int | None = None
     if char.isdigit() and character_row(int(char)):
@@ -87,9 +88,10 @@ async def wallet_page(request: Request, char: str = "", scope: str = "personal",
         type_ids = {t for t in type_ids if t}
         if not type_ids:
             return {}
-        ph = ",".join("?" * len(type_ids))
         return {r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})", list(type_ids)
+            text("SELECT type_id, name FROM sde_types WHERE type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(type_ids)},
         ).fetchall()}
 
     try:

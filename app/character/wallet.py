@@ -17,10 +17,11 @@ Scopes: esi-wallet.read_character_wallet.v1, esi-wallet.read_corporation_wallets
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 
 import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 ESI_BASE = "https://esi.evetech.net/latest"
 
@@ -43,7 +44,7 @@ def _auth(token: str) -> dict:
 
 # ── cache ────────────────────────────────────────────────────────────────────
 
-def load_cached_ledger(conn: sqlite3.Connection, owner_id: int, ledger: str,
+def load_cached_ledger(conn: Connection, owner_id: int, ledger: str,
                        kind: str = CHARACTER,
                        division: int = NO_DIVISION) -> tuple[list | None, float]:
     """(rows, cached_at), or (None, 0) when this has never been synced.
@@ -54,9 +55,11 @@ def load_cached_ledger(conn: sqlite3.Connection, owner_id: int, ledger: str,
     which is a conclusion rather than a gap.
     """
     row = conn.execute(
-        "SELECT data_json, cached_at FROM wallet_ledger_cache"
-        " WHERE owner_id=? AND owner_kind=? AND division=? AND ledger=?",
-        (owner_id, kind, division, ledger),
+        text("SELECT data_json, cached_at FROM wallet_ledger_cache"
+             " WHERE owner_id=:owner_id AND owner_kind=:kind"
+             " AND division=:division AND ledger=:ledger"),
+        {"owner_id": owner_id, "kind": kind,
+         "division": division, "ledger": ledger},
     ).fetchone()
     if not row:
         return None, 0.0
@@ -66,20 +69,25 @@ def load_cached_ledger(conn: sqlite3.Connection, owner_id: int, ledger: str,
         return None, 0.0
 
 
-def save_cached_ledger(conn: sqlite3.Connection, owner_id: int, ledger: str,
+def save_cached_ledger(conn: Connection, owner_id: int, ledger: str,
                        rows: list, kind: str = CHARACTER,
                        division: int = NO_DIVISION) -> None:
+    # No commit, deliberately: the caller owns the transaction boundary. The
+    # conflict target is all four parts of the primary key — get any one of
+    # them wrong and this does not raise, it inserts a second row, and the
+    # failure surfaces as a wallet tab showing another division's money.
     conn.execute(
-        "INSERT INTO wallet_ledger_cache"
-        " (owner_id, owner_kind, division, ledger, data_json, cached_at)"
-        " VALUES (?,?,?,?,?,?)"
-        " ON CONFLICT (owner_id, owner_kind, division, ledger) DO UPDATE SET"
-        " data_json=excluded.data_json, cached_at=excluded.cached_at",
-        (owner_id, kind, division, ledger, json.dumps(rows), time.time()),
+        text("INSERT INTO wallet_ledger_cache"
+             " (owner_id, owner_kind, division, ledger, data_json, cached_at)"
+             " VALUES (:owner_id, :kind, :division, :ledger, :data, :cached_at)"
+             " ON CONFLICT (owner_id, owner_kind, division, ledger) DO UPDATE SET"
+             " data_json=excluded.data_json, cached_at=excluded.cached_at"),
+        {"owner_id": owner_id, "kind": kind, "division": division,
+         "ledger": ledger, "data": json.dumps(rows), "cached_at": time.time()},
     )
 
 
-def save_cached_balance(conn: sqlite3.Connection, char_id: int, balance: float) -> None:
+def save_cached_balance(conn: Connection, char_id: int, balance: float) -> None:
     """The character's ISK balance, in the table the dashboard already reads.
 
     Deliberately not the ledger table: `char_wallet_cache` predates it and has
@@ -88,24 +96,26 @@ def save_cached_balance(conn: sqlite3.Connection, char_id: int, balance: float) 
     happening — one number in one place, kept warm by the worker.
     """
     conn.execute(
-        "INSERT INTO char_wallet_cache (character_id, balance, cached_at)"
-        " VALUES (?,?,?) ON CONFLICT (character_id) DO UPDATE SET"
-        " balance=excluded.balance, cached_at=excluded.cached_at",
-        (char_id, balance, time.time()),
+        text("INSERT INTO char_wallet_cache (character_id, balance, cached_at)"
+             " VALUES (:cid, :balance, :cached_at)"
+             " ON CONFLICT (character_id) DO UPDATE SET"
+             " balance=excluded.balance, cached_at=excluded.cached_at"),
+        {"cid": char_id, "balance": balance, "cached_at": time.time()},
     )
 
 
-def load_cached_balance(conn: sqlite3.Connection, char_id: int) -> tuple[float | None, float]:
+def load_cached_balance(conn: Connection, char_id: int) -> tuple[float | None, float]:
     row = conn.execute(
-        "SELECT balance, cached_at FROM char_wallet_cache WHERE character_id=?",
-        (char_id,)).fetchone()
+        text("SELECT balance, cached_at FROM char_wallet_cache"
+             " WHERE character_id=:cid"),
+        {"cid": char_id}).fetchone()
     if not row:
         return None, 0.0
     return row[0], float(row[1] or 0.0)
 
 
 async def fetch_balance(client: httpx.AsyncClient, char_id: int, token: str,
-                        conn: sqlite3.Connection | None = None) -> float | None:
+                        conn: Connection | None = None) -> float | None:
     try:
         r = await client.get(f"{ESI_BASE}/characters/{char_id}/wallet/",
                              headers=_auth(token), timeout=10)
@@ -126,7 +136,7 @@ _MAX_JOURNAL_PAGES = 12
 
 async def fetch_journal(client: httpx.AsyncClient, char_id: int, token: str,
                         limit: int = 2500,
-                        conn: sqlite3.Connection | None = None) -> list[dict] | None:
+                        conn: Connection | None = None) -> list[dict] | None:
     """Wallet journal — newest first, up to `limit` entries.
 
     Keeps pulling pages until it has `limit` entries or ESI runs out, rather than
@@ -166,7 +176,7 @@ async def fetch_journal(client: httpx.AsyncClient, char_id: int, token: str,
 
 
 async def fetch_transactions(client: httpx.AsyncClient, char_id: int, token: str,
-                             conn: sqlite3.Connection | None = None
+                             conn: Connection | None = None
                              ) -> list[dict] | None:
     """The character's market transactions (ESI returns the last ~2500)."""
     try:
@@ -187,7 +197,7 @@ async def fetch_transactions(client: httpx.AsyncClient, char_id: int, token: str
 # ── Corporation ─────────────────────────────────────────────────────────────
 
 async def fetch_corp_wallets(client: httpx.AsyncClient, corp_id: int, token: str,
-                             conn: sqlite3.Connection | None = None
+                             conn: Connection | None = None
                              ) -> tuple[list[dict] | None, str | None]:
     """Returns ([{division, balance}], None) or (None, error_message).
     403 = the character lacks the Accountant/Junior Accountant role.
@@ -209,7 +219,7 @@ async def fetch_corp_wallets(client: httpx.AsyncClient, corp_id: int, token: str
 
 async def fetch_corp_journal(client: httpx.AsyncClient, corp_id: int, division: int,
                              token: str, limit: int = 2500,
-                             conn: sqlite3.Connection | None = None
+                             conn: Connection | None = None
                              ) -> list[dict] | None:
     """Corp division journal — same paging rules as the character journal."""
     out: list[dict] = []
@@ -240,7 +250,7 @@ async def fetch_corp_journal(client: httpx.AsyncClient, corp_id: int, division: 
 
 async def fetch_corp_transactions(client: httpx.AsyncClient, corp_id: int, division: int,
                                   token: str,
-                                  conn: sqlite3.Connection | None = None
+                                  conn: Connection | None = None
                                   ) -> list[dict] | None:
     try:
         r = await client.get(

@@ -38,8 +38,12 @@ def _wallet_html(client, app_module, journal, txns):
     subject and these tests are about the filter attributes on each row.
     """
     from app.character import wallet as wallet_api
+    from app.db.conn import connect
 
-    conn = app_module.get_conn()
+    # An engine connection rather than `get_conn()`: `app/character/wallet.py`
+    # is on the portable query layer, so its writers take one of these. Same
+    # database either way.
+    conn = connect()
     try:
         wallet_api.save_cached_balance(conn, CHAR_ID, 1_000_000.0)
         wallet_api.save_cached_ledger(conn, CHAR_ID, wallet_api.JOURNAL, journal)

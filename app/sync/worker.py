@@ -337,11 +337,11 @@ class SyncWorker:
                     # /wallet reads these. The balance goes to the table the
                     # dashboard already polls, so that read stops falling
                     # through to ESI as a side effect of this one.
-                    await fetch_balance(client, char_id, token, conn=raw)
+                    await fetch_balance(client, char_id, token, conn=conn)
                     journal = await fetch_journal(client, char_id, token,
-                                                  conn=raw)
+                                                  conn=conn)
                     changed += self._diff(char_id, "wallet", journal)
-                    await fetch_transactions(client, char_id, token, conn=raw)
+                    await fetch_transactions(client, char_id, token, conn=conn)
 
                     # /contracts reads this. Contract *items* are deliberately
                     # not prefetched: they never change once a contract exists,
@@ -392,15 +392,15 @@ class SyncWorker:
                             # corp that uses two spends ten paginated calls a
                             # tick to cache nothing.
                             wallets, _werr = await fetch_corp_wallets(
-                                client, corp_id, token, conn=raw)
+                                client, corp_id, token, conn=conn)
                             for wallet in wallets or []:
                                 div = wallet.get("division")
                                 if not div:
                                     continue
                                 await fetch_corp_journal(
-                                    client, corp_id, div, token, conn=raw)
+                                    client, corp_id, div, token, conn=conn)
                                 await fetch_corp_transactions(
-                                    client, corp_id, div, token, conn=raw)
+                                    client, corp_id, div, token, conn=conn)
 
                             corp_contracts, _cerr = await fetch_corp_contracts(
                                 client, corp_id, token, conn=conn)

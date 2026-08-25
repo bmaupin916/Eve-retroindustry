@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.62. **1194 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.64. **1272 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -43,16 +43,17 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   matches the definition in `app/db/conn.py` and its docstring, so it answers
   **2** on a fully converted tree and reads like a regression. What remains is not
   crossings but modules still holding a raw `get_conn()` handle of their own:
-  `character/wallet`, `character/orders`, `character/planets`, then `media`,
-  `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`,
-  `plan`, and finally `deps.py`, `main.py` and `app/db/schema.py`.
-  `character/assets` converted in v0.9.60, `character/blueprints` in v0.9.61,
-  `character/contracts` in v0.9.62.
+  `character/orders`, `character/planets`, then `media`, `contracts`,
+  `characters`, `planets`, `locations`, `prices`, `assets`, `plan`, and
+  finally `deps.py`, `main.py` and `app/db/schema.py`. `character/assets`
+  converted in v0.9.60, `character/blueprints` in v0.9.61,
+  `character/contracts` in v0.9.62, `character/wallet` in v0.9.64.
 
   **A second measure, now that `dbapi()` has retired:** `grep -c "conn=raw"
   app/sync/worker.py`. That variable exists only for the modules still on
-  `sqlite3`, so it falls as they convert — 13 before v0.9.62, **11** after.
-  When it reaches zero the whole `raw = conn.connection.driver_connection` line
+  `sqlite3`, so it falls as they convert — 13 before v0.9.62, 11 after, **5**
+  after v0.9.64. The five left are `orders` (four) and `planets` (one). When
+  it reaches zero the whole `raw = conn.connection.driver_connection` line
   goes with it.
 
 To bring the Postgres tests back:
@@ -125,8 +126,8 @@ Order — `projects`, `industry`, `app_defaults`, `industry_helper`,
 `projects` did not.
 
 **The `dbapi()` count is zero from v0.9.59**, so the metric that drove the order
-so far has retired. What is left is the rest of `app/character/*` (`wallet`,
-`orders`, `planets` — `assets`, `blueprints` and `contracts` are done), then
+so far has retired. What is left is the rest of `app/character/*` (`orders`
+and `planets` — `assets`, `blueprints`, `contracts` and `wallet` are done), then
 `media`, `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`,
 `plan`, and finally `deps.py`, `main.py` and `app/db/schema.py` itself. None of them
 blocks another, so take them one at a time and let the coverage probe pick the
@@ -416,21 +417,28 @@ all **done**. What that left is below.
    `app/character/*`, one at a time: `contracts`, `wallet`, `orders`,
    `planets`. (`assets` converted in v0.9.60, `blueprints` in v0.9.61.)
 
-   **`wallet` is the natural next one** now that `contracts` has gone
-   (v0.9.62). It holds the most `conn=raw` call sites left in the worker —
-   balance, journal, transactions, and the corporation variants of each — so it
-   is where the second measure moves most.
+   **`orders` and `planets` are all that is left of `app/character/*`**, and
+   they are the cheapest of the six: two raw statements in `orders`, four in
+   `planets`, and `tests/test_orders_cache.py` already covers the character
+   paths of both. `orders` first — it owns four of the five remaining `conn=raw`
+   sites against `planets`' one.
 
-   `orders` and `planets` are already well covered by
-   `tests/test_orders_cache.py`, so they are conversions with a net already
-   under them rather than conversions needing one written first. Take them last
-   of the four, on the grounds that they are the cheapest.
+   **The gap in both is the corporation half**, exactly as it was in `wallet`:
+   `fetch_orders_history`, `fetch_corp_orders` and `fetch_corp_orders_history`
+   have no test, and neither do `fetch_planet_names` or `fetch_planet_detail`.
+   That is the same shape that made `wallet` worth a net — the existing tests
+   exercise one owner kind and the untested fetchers are the ones that vary it.
+
+   **Before switching any handler's connection, grep the handler for statements
+   of its own.** `conn.execute` inside a handler is the thing that broke
+   `/api/contracts/items` in v0.9.62 — see "A conversion broke a page". Do that
+   grep first, not after.
 
    **`raw = conn.connection.driver_connection` in `app/sync/worker.py` is the
    thermometer.** It exists only for the modules still on `sqlite3`, and every
-   conversion removes call sites from it — 13 before v0.9.62, 11 after. When
-   `grep -c "conn=raw" app/sync/worker.py` reaches zero, that whole area is
-   done and the line goes with it.
+   conversion removes call sites from it — 13 before v0.9.62, 11 after, 5 after
+   v0.9.64. When `grep -c "conn=raw" app/sync/worker.py` reaches zero, that
+   whole area is done and the line goes with it.
 
    **Run the coverage probe first and let it confirm.** It is twenty lines, and
    it has to rebind wrappers into modules that already did `from … import X` —
@@ -1020,7 +1028,7 @@ Done for `test_character_caches_on_postgres.py` and
 and `test_sde_on_postgres` runs the importer, so those two need their cleared-
 table lists chosen with more care than the others.
 
-Full suite as of v0.9.62: **3m56s** with Postgres up and 1,196 tests, against
+Full suite as of v0.9.64: **5m43s** with Postgres up and 1,274 tests, against
 roughly three minutes before any cross-backend file existed. It peaked over ten
 minutes before the two biggest files went module-scoped.
 
@@ -1231,3 +1239,77 @@ nothing looks exactly like a check that finds nothing. `-k`, a grep with an
 over-tight anchor, and a `--collect-only` count all fail this way. When a
 selector decides what gets measured, measure the selector — count what it
 returned and compare it against what you expected to be there.
+
+
+## A conversion broke a page, and the tests did not notice (v0.9.63)
+
+v0.9.62 moved `api_contract_items` from `get_conn()` to `connect()` and left one
+raw statement behind it **in the router**:
+
+```python
+ph = ",".join("?" * len(tids))
+conn.execute(f"... WHERE type_id IN ({ph})", list(tids))
+```
+
+A SQLAlchemy connection rejects that with `ArgumentError: List argument must
+consist only of dictionaries`. `/api/contracts/items` raised for every contract
+that actually had items — the normal case — and it was pushed.
+
+**Why the suite stayed green.** The test net for that conversion covered
+`app/character/contracts.py`: 44 tests, 29/29 mutations. This code is in
+`app/web/routers/contracts.py`. The module was thoroughly tested and the handler
+calling it had no test at all; nothing in the suite requested
+`/api/contracts/items`.
+
+Three things worth carrying forward:
+
+* **Converting a module is not the risky part — converting its callers is.** A
+  caller can hold statements of its own that the module's tests never see.
+  Before switching a handler's connection, `grep -n "conn.execute" ` the handler
+  and convert what is there in the same change. That grep now happens *before*
+  the conversion rather than after it.
+* **A wrong parameter style fails more quietly than a wrong query.** It raises
+  only when the branch that binds parameters is entered. Here that needed a
+  contract with items rather than one that merely existed, so the empty-cache
+  path passed throughout.
+* **A converted handler needs one test that exercises its populated path.**
+  `tests/test_contract_items_route.py` is that test for contracts. `/wallet`
+  already had one — `tests/test_wallet_filter.py` renders the page over seeded
+  journal and transaction rows, which is what made the same class of bug
+  impossible to ship in v0.9.64.
+
+## character/wallet converted (v0.9.64)
+
+Four SQL statements, and the widest conflict target in the codebase:
+`ON CONFLICT (owner_id, owner_kind, division, ledger)`. Getting any one part
+wrong does not raise — it inserts a second row, and the failure surfaces as a
+wallet tab showing another division's money, which looks entirely plausible.
+
+The three corporation fetchers had **no test at all**, and they are the only
+callers that vary the half of the key the character paths never touch
+(`kind="corporation"`, `division` 1–7). The new file has one mutation per key
+part, each dropped on its own — a conflict target that breaks several rules at
+once only proves that at least one is enforced.
+
+Corporation *balances* break the division rule on purpose: ESI returns every
+division in one response, so they are stored once at `division=0` under
+`ledger="balances"` rather than split across seven rows that would all have to
+be written together to stay consistent. Division 0 is also the character's slot;
+`owner_kind` is what keeps those two apart, and that is now pinned.
+
+Call sites: six in the worker, and `wallet_page` in `routers/characters.py` —
+which held one raw `sde_types` lookup of its own, found by grepping the handler
+*before* converting it rather than after. `conn=raw` in the worker: 11 → **5**.
+
+Checked rather than assumed: `char_wallet_cache.balance` is `double precision`
+on Postgres and an 8-byte REAL on SQLite, so a trillion-ISK balance survives to
+the cent on both. There is a test that says so, because the failure mode of a
+column quietly becoming single precision is a number that still looks like a
+balance.
+
+**One departure from the usual discipline, noted rather than hidden:** the test
+net and the conversion share this commit. The tests were written and
+mutation-verified against the `sqlite3` version first, as always — 31/32 from
+the new file alone, and 32/32 once `tests/test_orders_cache.py` is included,
+which already covered the balance writer — but unlike `blueprints` and
+`contracts` there is no separate tests-first commit to point at.
