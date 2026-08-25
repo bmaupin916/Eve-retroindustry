@@ -11,9 +11,12 @@ here either way, which is what matters.
 pins that it ignores the TTL and that an unsynced character reads as `None`.
 Those two assertions stay where they are; everything below is new.
 
-**These assertions are written against the `sqlite3` version on purpose.** They
-have to exist before the rewrite so the rewrite can be judged by whether it
-preserves them, rather than assembled first and described afterwards.
+**These assertions are unchanged by the conversion.** They were written against
+the `sqlite3` version first, so the rewrite could be judged by whether it
+preserves them rather than assembled first and described afterwards. Only the
+fixture underneath moved, and it now runs each of them on both backends — bar
+`test_ensure_bp_table_creates_the_cache_on_a_bare_sqlite_file`, which asks
+`sqlite_master` a question Postgres has no version of.
 
 Four things here are conversion traps rather than ordinary behaviour:
 
@@ -41,13 +44,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import time
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from app.character import blueprints as bp_api
-from app.db.schema import apply_schema
+from tests.test_postgres_schema import URL as PG_URL, _reachable
+
+PG_SCHEMA = "pytest_character_blueprints"
 
 CHAR = 2_112_625_428
 JITA = 60003760
@@ -101,39 +106,131 @@ def _bp(item_id, type_id=RAVEN_BP, location_id=JITA, quantity=-1,
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(scope="module", params=["sqlite", "postgres"])
+def engine(request, tmp_path_factory):
+    """An engine per backend, built once for the module.
+
+    Function scope here would drop and rebuild a Postgres schema — every
+    migration — for each test in the file; clearing the one table between tests
+    is the same isolation for a fraction of the cost.
+    """
+    from app.db.migrate import upgrade_to_head
+
+    if request.param == "sqlite":
+        url = f"sqlite:///{tmp_path_factory.mktemp('db') / 'eve_cache.db'}"
+        upgrade_to_head(url)
+        eng = create_engine(url)
+        yield eng
+        eng.dispose()
+        return
+
+    if not _reachable(PG_URL):
+        pytest.skip(f"no Postgres at {PG_URL} — see tests/test_postgres_schema.py")
+
+    admin = create_engine(PG_URL)
+    with admin.connect() as c:
+        c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
+        c.execute(text(f"CREATE SCHEMA {PG_SCHEMA}"))
+        c.commit()
+    admin.dispose()
+
+    scoped = PG_URL + ("&" if "?" in PG_URL else "?") + \
+        f"options=-csearch_path%3D{PG_SCHEMA}"
+    upgrade_to_head(scoped)
+
+    eng = create_engine(scoped)
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _empty_table(engine):
+    """Before, not after: a test that dies half-way must not leave its row for
+    the next one to read."""
+    with engine.connect() as c:
+        c.execute(text("DELETE FROM char_blueprints_cache"))
+        c.commit()
+    yield
+
+
 @pytest.fixture
-def conn(tmp_path):
-    c = sqlite3.connect(str(tmp_path / "blueprints.db"))
-    apply_schema(c)
-    yield c
-    c.close()
+def conn(engine):
+    with engine.connect() as c:
+        yield c
+
+
+def _backend(conn) -> str:
+    return conn.engine.dialect.name
 
 
 def _rows(conn) -> int:
     return conn.execute(
-        "SELECT COUNT(*) FROM char_blueprints_cache WHERE character_id=?",
-        (CHAR,)).fetchone()[0]
+        text("SELECT COUNT(*) FROM char_blueprints_cache WHERE character_id=:cid"),
+        {"cid": CHAR}).fetchone()[0]
+
+
+def _age_to(conn, when: float | None) -> None:
+    """Backdate the cached row, or NULL it. `cached_at` is nullable, and both
+    readers coalesce it, so `None` here is the "infinitely old" case rather
+    than a separate one."""
+    conn.execute(
+        text("UPDATE char_blueprints_cache SET cached_at=:at"
+             " WHERE character_id=:cid"), {"at": when, "cid": CHAR})
+    conn.commit()
+
+
+def test_both_backends_are_actually_exercised(conn):
+    """Without this a broken Postgres fixture reads as a passing file: the
+    SQLite half would carry it, and running on both is the entire point."""
+    assert _backend(conn) in ("sqlite", "postgresql")
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM char_blueprints_cache")).fetchone()[0] == 0
 
 
 # ── the schema shim ──────────────────────────────────────────────────────────
 
-def test_ensure_bp_table_creates_the_cache(tmp_path):
+def test_ensure_bp_table_creates_the_cache_on_a_bare_sqlite_file(tmp_path):
     """The one thing the shim promises: call it on a bare database and the
-    table is there afterwards."""
-    c = sqlite3.connect(str(tmp_path / "bare.db"))
+    table is there afterwards.
+
+    SQLite only, and not because of the assertion — because the shim itself is.
+    `app/db/schema.py` memoises by asking `PRAGMA database_list`, so on Postgres
+    the function returns before doing anything and the schema arrives through
+    Alembic instead. The next test is the Postgres half of this one.
+    """
+    import sqlite3
+
+    def _exists(c) -> int:
+        return c.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+            " AND name='char_blueprints_cache'").fetchone()[0]
+
+    raw = sqlite3.connect(str(tmp_path / "bare.db"))
     try:
-        assert c.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
-            " AND name='char_blueprints_cache'").fetchone()[0] == 0, (
+        assert _exists(raw) == 0, (
             "the database was not bare — this test would pass vacuously")
-
-        bp_api.ensure_bp_table(c)
-
-        assert c.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
-            " AND name='char_blueprints_cache'").fetchone()[0] == 1
     finally:
-        c.close()
+        raw.close()
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'bare.db'}")
+    try:
+        with eng.connect() as c:
+            bp_api.ensure_bp_table(c)
+            assert _exists(c.connection.driver_connection) == 1
+    finally:
+        eng.dispose()
+
+
+def test_the_shim_is_a_no_op_away_from_sqlite(conn):
+    """It forwards to `PRAGMA database_list`, which is a syntax error on
+    Postgres. The dialect guard is what makes it safe to keep calling, and
+    calling it must leave a working connection behind either way — on Postgres
+    a failed statement aborts the whole transaction, so a missing guard would
+    take out every query after it, not just this one."""
+    bp_api.ensure_bp_table(conn)
+
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM char_blueprints_cache")).fetchone()[0] == 0
 
 
 def test_ensure_bp_table_is_safe_to_call_twice(conn):
@@ -170,18 +267,17 @@ def test_saving_twice_replaces_rather_than_duplicating(conn):
     assert [b.item_id for b in got] == [2], "the older save won"
 
 
-def test_saving_commits(conn, tmp_path):
-    """The writer owns the transaction boundary. A second connection onto the
-    same file sees the row only if the commit really happened."""
-    bp_api._save_cache(conn, CHAR, [_bp(1)])
+def test_saving_commits(engine):
+    """The writer owns the transaction boundary. A **separate** connection sees
+    the row only if the commit really happened — asking the same connection
+    would see its own uncommitted work and prove nothing."""
+    with engine.connect() as writer:
+        bp_api._save_cache(writer, CHAR, [_bp(1)])
 
-    other = sqlite3.connect(str(tmp_path / "blueprints.db"))
-    try:
-        assert other.execute(
-            "SELECT COUNT(*) FROM char_blueprints_cache WHERE character_id=?",
-            (CHAR,)).fetchone()[0] == 1
-    finally:
-        other.close()
+    with engine.connect() as reader:
+        assert reader.execute(
+            text("SELECT COUNT(*) FROM char_blueprints_cache"
+                 " WHERE character_id=:cid"), {"cid": CHAR}).fetchone()[0] == 1
 
 
 def test_one_characters_cache_does_not_disturb_anothers(conn):
@@ -211,9 +307,7 @@ def test_an_empty_blueprint_list_is_still_a_sync(conn):
 def test_the_fetchers_reader_enforces_the_ttl(conn):
     stale = time.time() - bp_api.CACHE_TTL - 3600
     bp_api._save_cache(conn, CHAR, [_bp(1)])
-    conn.execute("UPDATE char_blueprints_cache SET cached_at=? WHERE character_id=?",
-                 (stale, CHAR))
-    conn.commit()
+    _age_to(conn, stale)
 
     assert bp_api._load_cache(conn, CHAR) is None
 
@@ -232,9 +326,7 @@ def test_the_page_reader_ignores_the_ttl(conn):
     round trip worth it", which is the fetcher's question and not a page's."""
     stale = time.time() - bp_api.CACHE_TTL - 3600
     bp_api._save_cache(conn, CHAR, [_bp(1)])
-    conn.execute("UPDATE char_blueprints_cache SET cached_at=? WHERE character_id=?",
-                 (stale, CHAR))
-    conn.commit()
+    _age_to(conn, stale)
 
     assert bp_api._load_cache(conn, CHAR) is None, (
         "the row is not actually stale — this test would pass vacuously")
@@ -249,9 +341,7 @@ def test_a_null_cached_at_is_treated_as_the_epoch(conn):
     """`cached_at` is nullable. `time.time() - None` would raise; both readers
     coalesce it, and a NULL therefore reads as infinitely old."""
     bp_api._save_cache(conn, CHAR, [_bp(1)])
-    conn.execute("UPDATE char_blueprints_cache SET cached_at=NULL WHERE character_id=?",
-                 (CHAR,))
-    conn.commit()
+    _age_to(conn, None)
 
     assert bp_api._load_cache(conn, CHAR) is None
 
@@ -268,9 +358,12 @@ def test_an_unsynced_character_reads_as_none_not_empty(conn):
 # ── a corrupt cache reads as never-synced ────────────────────────────────────
 
 def _corrupt(conn, payload: str) -> None:
+    """Write a payload `_save_cache` would never produce — that is the point:
+    these are the shapes the reader has to survive, not the ones it writes."""
     conn.execute(
-        "INSERT INTO char_blueprints_cache (character_id, data_json, cached_at)"
-        " VALUES (?,?,?)", (CHAR, payload, time.time()))
+        text("INSERT INTO char_blueprints_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :cached_at)"),
+        {"cid": CHAR, "data": payload, "cached_at": time.time()})
     conn.commit()
 
 
@@ -434,9 +527,7 @@ def test_fetch_serves_a_fresh_cache_without_calling_esi(conn):
 def test_fetch_goes_to_esi_when_the_cache_is_stale(conn):
     stale = time.time() - bp_api.CACHE_TTL - 3600
     bp_api._save_cache(conn, CHAR, [_bp(1)])
-    conn.execute("UPDATE char_blueprints_cache SET cached_at=? WHERE character_id=?",
-                 (stale, CHAR))
-    conn.commit()
+    _age_to(conn, stale)
     client = _Client(_Resp(200, [_bp(2)]))
 
     got = asyncio.run(bp_api.fetch_blueprints(client, CHAR, "tok", conn))
@@ -522,9 +613,7 @@ def test_an_esi_error_raises_and_leaves_the_cache_alone(conn):
     """`raise_for_status`. A failed sync must not overwrite good data with
     nothing — an empty blueprint list would read as "you own none"."""
     bp_api._save_cache(conn, CHAR, [_bp(1)])
-    conn.execute("UPDATE char_blueprints_cache SET cached_at=? WHERE character_id=?",
-                 (time.time() - bp_api.CACHE_TTL - 3600, CHAR))
-    conn.commit()
+    _age_to(conn, time.time() - bp_api.CACHE_TTL - 3600)
     client = _Client(_Resp(500))
 
     with pytest.raises(RuntimeError):

@@ -449,8 +449,8 @@ async def plan_result(
         # repeatedly while somebody tunes ME, runs and stations, so the same
         # three lists were fetched over and over to compute a different number
         # from identical inputs.
-        blueprints, _bp_at = load_cached_blueprints(conn, char_id)
         with _connect() as _ac:
+            blueprints, _bp_at = load_cached_blueprints(_ac, char_id)
             all_assets, _as_at = load_cached_assets(_ac, char_id)
             char_skills = get_cached_skills(_ac, char_id)
         if blueprints is None or all_assets is None:

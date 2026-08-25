@@ -5,7 +5,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
 ## Where this session ended
 
-* Branch `docs/hosted-v2-design`, v0.9.60. **1026 tests green, 2 skipped** — and
+* Branch `docs/hosted-v2-design`, v0.9.61. **1104 tests green, 2 skipped** — and
   the skip is POSIX file modes on Windows, not a backend. The `sqlite_only`
   marker is gone: `location_resolver` converted, so the test that named it as
   the blocker now runs on both backends.
@@ -32,14 +32,22 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
   `industry_helper` (v0.9.56), `location_resolver` (v0.9.58), and
   `token_store`, `character/jobs`, `character/skills` (v0.9.59).
 
-  `grep -rn "dbapi(" app/` is the live measure and stands at **0** as of
-  v0.9.59 — there are no boundaries left to cross. What remains is not
+  The live measure is **0 callers** as of v0.9.59 — there are no boundaries
+  left to cross. Count them with
+
+  ```bash
+  grep -rn "dbapi(" app/ --include=*.py | grep -v "app/db/conn.py"
+  ```
+
+  and not with the bare `grep -rn "dbapi(" app/` written here before: that also
+  matches the definition in `app/db/conn.py` and its docstring, so it answers
+  **2** on a fully converted tree and reads like a regression. What remains is not
   crossings but modules still holding a raw `get_conn()` handle of their own:
-  `character/blueprints`, `character/contracts`, `character/wallet`,
-  `character/orders`, `character/planets`, then `media`, `contracts`,
-  `characters`, `planets`, `locations`, `prices`, `assets`, `plan`, and finally
-  `deps.py`, `main.py` and `app/db/schema.py`. `character/assets` converted in
-  v0.9.60.
+  `character/contracts`, `character/wallet`, `character/orders`,
+  `character/planets`, then `media`, `contracts`, `characters`, `planets`,
+  `locations`, `prices`, `assets`, `plan`, and finally `deps.py`, `main.py` and
+  `app/db/schema.py`. `character/assets` converted in v0.9.60,
+  `character/blueprints` in v0.9.61.
 
 To bring the Postgres tests back:
 
@@ -111,10 +119,10 @@ Order — `projects`, `industry`, `app_defaults`, `industry_helper`,
 `projects` did not.
 
 **The `dbapi()` count is zero from v0.9.59**, so the metric that drove the order
-so far has retired. What is left is the rest of `app/character/*` (`assets`,
-`blueprints`, `contracts`, `wallet`, `orders`, `planets`), then `media`,
-`contracts`, `characters`, `planets`, `locations`, `prices`, `assets`, `plan`,
-and finally `deps.py`, `main.py` and `app/db/schema.py` itself. None of them
+so far has retired. What is left is the rest of `app/character/*` (`contracts`,
+`wallet`, `orders`, `planets` — `assets` and `blueprints` are done), then
+`media`, `contracts`, `characters`, `planets`, `locations`, `prices`, `assets`,
+`plan`, and finally `deps.py`, `main.py` and `app/db/schema.py` itself. None of them
 blocks another, so take them one at a time and let the coverage probe pick the
 order — the untested ones are the ones that bite.
 
@@ -397,14 +405,21 @@ work, not a move, and the event model has to be decided before it is written.
 all **done**. What that left is below.
 
 1. **Pick up the conversion.** No boundary is forcing the order any more —
-   `grep -rn "dbapi(" app/` is zero from v0.9.59. Five modules left in
-   `app/character/*`, one at a time: `blueprints`, `contracts`, `wallet`,
-   `orders`, `planets`. (`assets` converted in v0.9.60.)
+   `dbapi()` has had no callers since v0.9.59 (count it with the grep at the
+   top of this file — the bare one answers 2 on a clean tree). Four modules left in
+   `app/character/*`, one at a time: `contracts`, `wallet`, `orders`,
+   `planets`. (`assets` converted in v0.9.60, `blueprints` in v0.9.61.)
 
-   **`blueprints` is the natural next one**: smallest of the five at 124 lines
-   and four statements, it sits beside `assets` on the same two pages, and the
-   probe found three of its functions untested including its cache writer.
-   `contracts` is the biggest remaining gap at six.
+   **`contracts` is the natural next one**: the biggest remaining coverage gap
+   at six functions the probe never sees executed. `orders` and `planets` are
+   already well covered by `tests/test_orders_cache.py`, so they are conversions
+   with a net already under them rather than conversions needing one written
+   first.
+
+   **`raw = conn.connection.driver_connection` in `app/sync/worker.py` is the
+   thermometer.** It exists only for the modules still on `sqlite3`, and every
+   conversion removes call sites from it. When `grep -n "conn=raw" app/sync/
+   worker.py` comes back empty, that whole area is done and the line can go.
 
    **Run the coverage probe first and let it confirm.** It is twenty lines, and
    it has to rebind wrappers into modules that already did `from … import X` —
@@ -994,7 +1009,7 @@ Done for `test_character_caches_on_postgres.py` and
 and `test_sde_on_postgres` runs the importer, so those two need their cleared-
 table lists chosen with more care than the others.
 
-Full suite as of v0.9.60: **3m28s** with Postgres up and 1,028 tests, against
+Full suite as of v0.9.61: **3m56s** with Postgres up and 1,106 tests, against
 roughly three minutes before any cross-backend file existed. It peaked over ten
 minutes before the two biggest files went module-scoped.
 
@@ -1060,3 +1075,80 @@ It cost nothing this time because the wrong answer was *more* alarming than the
 truth. It would cost a great deal in the other direction — a mutation that
 fails only Postgres, reported as failing both, looks like a portable bug rather
 than the backend difference it is.
+
+
+## character/blueprints converted (v0.9.61)
+
+Three of its functions had never been executed by the suite — `_save_cache`,
+`_load_cache` and `ensure_bp_table`, the cache writer among them. Tests first
+(37 of them), then the conversion, and the assertions came through unchanged
+onto the cross-backend fixture.
+
+The traps were the same family as `assets`, which is what made it quick:
+
+* `_save_cache` is **DELETE then INSERT**, and here the reason is visible in the
+  schema — `char_blueprints_cache` has no primary key and no
+  `UNIQUE(character_id)` to upsert against. Without the delete a second save
+  leaves two rows and `fetchone()` picks one by row order, which the two
+  backends need not agree on.
+* **Two readers of one table with opposite TTL rules**, exactly as in `assets`:
+  `_load_cache` enforces `CACHE_TTL` for the fetcher, `load_cached_blueprints`
+  ignores it for the pages.
+* `_save_cache` **commits**; `fetch_blueprints` does not commit separately.
+
+Call sites moved with it: `routers/assets.py` (two), `routers/plan.py`,
+`routers/auth.py`, and `sync/worker.py`, where the blueprints fetch stopped
+using `raw` and took the engine connection directly.
+
+Conversion mutations: **8/8 in the expected shape**, the dialect guard giving
+the asymmetric signature that matters — 2 Postgres failures, 0 SQLite.
+
+## A live crash path in load_cached_blueprints
+
+`load_cached_blueprints` catches `ValueError`/`TypeError`/`KeyError` and returns
+`(None, 0.0)`, so a corrupt cache reads as never-synced rather than as an empty
+hangar. Writing the test for that found a hole: a payload that **parses** and is
+not a list of dicts raises `AttributeError`, which the tuple does not catch. It
+escapes to `/assets`, `/blueprints` and `/plan` as a 500.
+
+The reason to believe it is an oversight rather than a decision:
+`app/web/margins_helper.py`, the only other caller of `_parse_blueprints`,
+already filters `isinstance(entries, list)` and `isinstance(e, dict)` before
+calling it. That path was hardened and this one was missed.
+
+Only reachable through a cache written by something other than `_save_cache`,
+which is why it has not been seen in the wild. **Pinned, not fixed** —
+`test_a_non_dict_entry_escapes_the_handler` asserts the current behaviour, so
+widening the tuple has to be a deliberate commit that updates the test rather
+than something smuggled into a conversion.
+
+## A test can be weaker than its own name
+
+The first mutation battery came back 26/27. The miss was the test, not the code:
+a mutation that changed `item["item_id"]` to `item.get("item_id", 0)` failed
+nothing, because the payload written as "an entry missing item_id" was also
+missing `location_id` — so it still raised `KeyError`, just from a different
+line, and the test still passed.
+
+Now there is one case per required key, each dropped **on its own**, and the
+three mutations that give each key a default are each caught by exactly the case
+that names it.
+
+**The general form:** a fixture that violates several rules at once only proves
+that *at least one* of them is enforced. If a test names one condition, the
+input should differ from a valid one in exactly that condition — otherwise the
+assertion is anchored to whichever rule happens to fire first, and that is not
+the one in the name.
+
+## The ensure_*_table shims have no callers
+
+Traced while converting: `ensure_bp_table`, `ensure_assets_table` and
+`ensure_corp_assets_table` are imported once each, in `app/web/main.py`, and
+never called. pyflakes has been reporting all three as unused imports.
+
+They are dead, but deleting them is its own change and it is not free —
+`ensure_bp_table` is the only thing that creates the table on a bare SQLite file
+outside Alembic, so anything relying on that path has to be found first. Left in
+place, converted with the dialect guard like the rest. **Worth doing once the
+conversion is finished**, together with the other dead imports pyflakes lists in
+`main.py`.

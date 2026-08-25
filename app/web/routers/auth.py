@@ -312,7 +312,8 @@ async def _bg_initial_sync():
                 any_token = token
                 try:
                     _sync_state["step"] = "blueprints"
-                    await fetch_blueprints(client, char_id, token, conn)
+                    with _connect() as _bc:
+                        await fetch_blueprints(client, char_id, token, _bc)
                     _sync_state["step"] = "assets"
                     with _connect() as _ac:
                         personal = await fetch_assets(client, char_id, token, _ac)

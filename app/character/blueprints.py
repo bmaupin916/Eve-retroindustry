@@ -6,9 +6,10 @@ Fetching a character's blueprints from ESI.
 from __future__ import annotations
 from dataclasses import dataclass
 import time
-import sqlite3
 import json
 import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE = "https://esi.evetech.net/latest"
@@ -27,31 +28,50 @@ class CharBlueprint:
     time_efficiency: int       # TE 0-20
 
 
-def ensure_bp_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_bp_table(conn: Connection) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees
+    it exists, and only on SQLite — `app/db/schema.py` memoises by asking
+    `PRAGMA database_list`, which is a syntax error on Postgres, where the
+    schema arrives through Alembic instead."""
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(conn.connection.driver_connection)
 
 
-def _load_cache(conn: sqlite3.Connection, character_id: int) -> list[dict] | None:
+def _load_cache(conn: Connection, character_id: int) -> list[dict] | None:
+    """The fetcher's reader, which enforces `CACHE_TTL`.
+
+    `load_cached_blueprints` below reads the same row and ignores the TTL. The
+    two are not redundant: the TTL answers "is another round trip worth it",
+    which is this caller's question and not a page's.
+    """
     row = conn.execute(
-        "SELECT data_json, cached_at FROM char_blueprints_cache WHERE character_id=?",
-        (character_id,)
+        text("SELECT data_json, cached_at FROM char_blueprints_cache"
+             " WHERE character_id=:cid"),
+        {"cid": character_id},
     ).fetchone()
     if row and (time.time() - (row[1] or 0)) < CACHE_TTL:
         return json.loads(row[0])
     return None
 
 
-def _save_cache(conn: sqlite3.Connection, character_id: int, data: list[dict]):
-    conn.execute("DELETE FROM char_blueprints_cache WHERE character_id=?", (character_id,))
+def _save_cache(conn: Connection, character_id: int, data: list[dict]):
+    # DELETE then INSERT rather than an upsert: char_blueprints_cache has no
+    # primary key and no UNIQUE(character_id) to conflict against. One row per
+    # character is the invariant, and without the delete a second save leaves
+    # two — after which which one a later `fetchone()` wins is a question about
+    # row order, and SQLite and Postgres need not answer it the same way.
+    conn.execute(text("DELETE FROM char_blueprints_cache WHERE character_id=:cid"),
+                 {"cid": character_id})
     conn.execute(
-        "INSERT INTO char_blueprints_cache (character_id, data_json, cached_at) VALUES (?,?,?)",
-        (character_id, json.dumps(data), time.time())
+        text("INSERT INTO char_blueprints_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :cached_at)"),
+        {"cid": character_id, "data": json.dumps(data), "cached_at": time.time()},
     )
     conn.commit()
 
 
-def load_cached_blueprints(conn: sqlite3.Connection,
+def load_cached_blueprints(conn: Connection,
                            character_id: int) -> tuple[list[CharBlueprint] | None, float]:
     """(blueprints, cached_at) at any age, or (None, 0) if never synced.
 
@@ -60,13 +80,17 @@ def load_cached_blueprints(conn: sqlite3.Connection,
     fetcher and not for a page that must not make round trips.
     """
     row = conn.execute(
-        "SELECT data_json, cached_at FROM char_blueprints_cache WHERE character_id=?",
-        (character_id,)).fetchone()
+        text("SELECT data_json, cached_at FROM char_blueprints_cache"
+             " WHERE character_id=:cid"),
+        {"cid": character_id},
+    ).fetchone()
     if not row:
         return None, 0.0
     try:
         return _parse_blueprints(json.loads(row[0])), float(row[1] or 0.0)
     except (ValueError, TypeError, KeyError):
+        # None, not [] — "never synced" and "owns none" are different answers
+        # and the pages act differently on them.
         return None, 0.0
 
 
@@ -74,7 +98,7 @@ async def fetch_blueprints(
     client: httpx.AsyncClient,
     character_id: int,
     access_token: str,
-    conn: sqlite3.Connection,
+    conn: Connection,
     force_refresh: bool = False,
 ) -> list[CharBlueprint]:
     """Fetch all of a character's blueprints (paginated), with caching."""

@@ -292,7 +292,7 @@ class SyncWorker:
                     # jitter. Assets' ten-minute TTL always lost the race and
                     # so always refreshed, which is why this never showed up as
                     # a stale asset list.
-                    blueprints = await fetch_blueprints(client, char_id, token, raw,
+                    blueprints = await fetch_blueprints(client, char_id, token, conn,
                                                         force_refresh=True)
                     changed += self._diff(char_id, "blueprints", blueprints)
 

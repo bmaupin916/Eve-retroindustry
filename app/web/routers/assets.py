@@ -114,6 +114,7 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
 
             with _connect() as _ac:
                 assets, at = load_cached_assets(_ac, cid)
+                bps, _bat = load_cached_blueprints(_ac, cid)
             if assets is None:
                 unsynced.append(_name or str(cid))
                 char_assets[cid] = []
@@ -121,7 +122,6 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
                 char_assets[cid] = assets
                 oldest.append(at)
 
-            bps, _bat = load_cached_blueprints(conn, cid)
             for bp in bps or []:
                 (bpc_item_ids if not bp.is_original else bpo_item_ids).add(bp.item_id)
                 all_bp_type_ids.add(bp.type_id)
@@ -966,7 +966,8 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
         for cid_sel, _name in selected_chars:
             tok = await _valid_token_async(cid_sel)
             primary_token = primary_token or tok
-            bps_for, bp_at = load_cached_blueprints(conn, cid_sel)
+            with _connect() as _bc:
+                bps_for, bp_at = load_cached_blueprints(_bc, cid_sel)
             if bps_for is None:
                 bp_unsynced.append(_name or str(cid_sel))
                 bps_for = []

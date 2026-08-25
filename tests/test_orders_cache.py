@@ -43,9 +43,10 @@ def conn(tmp_path):
 def _engine_conn(conn):
     """An engine connection onto the same file this raw `conn` is attached to.
 
-    `app/character/assets.py` is on the portable query layer; the fixture above
-    is shared with tests for modules that are not, so it keeps handing out a
-    sqlite3 handle and the few tests that need the other kind ask for it here.
+    `app/character/assets.py` and `app/character/blueprints.py` are on the
+    portable query layer; the fixture above is shared with tests for modules
+    that are not, so it keeps handing out a sqlite3 handle and the tests that
+    need the other kind ask for it here.
     """
     import contextlib
     from sqlalchemy import create_engine
@@ -603,8 +604,9 @@ def test_the_blueprint_reader_ignores_the_ttl(conn):
                              "location_flag": "Hangar"}]), stale))
     conn.commit()
 
-    assert bp_api._load_cache(conn, ALICE) is None
-    bps, at = bp_api.load_cached_blueprints(conn, ALICE)
+    with _engine_conn(conn) as ec:
+        assert bp_api._load_cache(ec, ALICE) is None
+        bps, at = bp_api.load_cached_blueprints(ec, ALICE)
 
     assert bps is not None and len(bps) == 1
     assert at == pytest.approx(stale)
@@ -614,7 +616,7 @@ def test_an_unsynced_character_has_no_assets_rather_than_none(conn):
     """Same distinction as everywhere else. An empty hangar is a statement."""
     with _engine_conn(conn) as ec:
         assert assets_api.load_cached_assets(ec, ALICE) == (None, 0.0)
-    assert bp_api.load_cached_blueprints(conn, ALICE) == (None, 0.0)
+        assert bp_api.load_cached_blueprints(ec, ALICE) == (None, 0.0)
 
 
 def test_container_ids_are_derived_from_containment(conn):
