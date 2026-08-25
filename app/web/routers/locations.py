@@ -11,7 +11,7 @@ import asyncio
 
 from fastapi import APIRouter, Form, Request
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from app.db.conn import connect
 from app.esi.client import esi_client
@@ -361,11 +361,16 @@ async def add_station(request: Request, raw: str = Form(...)):
     if not resolved_name:
         resolved_name = f"[Structure {structure_id}]"
 
-    conn.execute(
-        "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
-        (structure_id, resolved_name, sys_id),
-    )
-    conn.commit()
+    with _connect() as _lc:
+        _lc.execute(
+            text("INSERT INTO location_name_cache (location_id, name, solar_system_id)"
+                 " VALUES (:location_id, :name, :solar_system_id)"
+                 " ON CONFLICT (location_id) DO UPDATE SET"
+                 " name=excluded.name, solar_system_id=excluded.solar_system_id"),
+            {"location_id": structure_id, "name": resolved_name,
+             "solar_system_id": sys_id},
+        )
+        _lc.commit()
     conn.close()
     return {"location_id": structure_id, "name": resolved_name, "solar_system_id": sys_id}
 
@@ -380,11 +385,14 @@ async def location_rename(request: Request):
         return {"ok": False, "error": "Empty name"}
     conn = get_conn()
     ensure_schema(conn)
-    conn.execute(
-        "INSERT INTO location_name_cache (location_id, name) VALUES (?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name",
-        (location_id, name),
-    )
-    conn.commit()
+    with _connect() as _lc:
+        _lc.execute(
+            text("INSERT INTO location_name_cache (location_id, name)"
+                 " VALUES (:location_id, :name)"
+                 " ON CONFLICT (location_id) DO UPDATE SET name=excluded.name"),
+            {"location_id": location_id, "name": name},
+        )
+        _lc.commit()
     conn.close()
     from app.web.location_resolver import _cache
     _cache[location_id] = name
@@ -406,11 +414,16 @@ async def location_resolve(request: Request, location_id: int):
     resolved = name != str(location_id) and not name.startswith("[")
     if resolved:
         ensure_schema(conn)
-        conn.execute(
-            "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
-            (location_id, name, sys_id),
-        )
-        conn.commit()
+        with _connect() as _lc:
+            _lc.execute(
+                text("INSERT INTO location_name_cache (location_id, name, solar_system_id)"
+                     " VALUES (:location_id, :name, :solar_system_id)"
+                     " ON CONFLICT (location_id) DO UPDATE SET"
+                     " name=excluded.name, solar_system_id=excluded.solar_system_id"),
+                {"location_id": location_id, "name": name,
+                 "solar_system_id": sys_id},
+            )
+            _lc.commit()
     conn.close()
     return {"ok": resolved, "name": name, "solar_system_id": sys_id}
 
@@ -473,11 +486,16 @@ async def my_location(request: Request):
         except Exception:
             pass
 
-        conn.execute(
-            "INSERT INTO location_name_cache (location_id, name, solar_system_id) VALUES (?,?,?) ON CONFLICT (location_id) DO UPDATE SET name=excluded.name, solar_system_id=excluded.solar_system_id",
-            (structure_id, resolved_name, sys_id),
-        )
-        conn.commit()
+        with _connect() as _lc:
+            _lc.execute(
+                text("INSERT INTO location_name_cache (location_id, name, solar_system_id)"
+                     " VALUES (:location_id, :name, :solar_system_id)"
+                     " ON CONFLICT (location_id) DO UPDATE SET"
+                     " name=excluded.name, solar_system_id=excluded.solar_system_id"),
+                {"location_id": structure_id, "name": resolved_name,
+                 "solar_system_id": sys_id},
+            )
+            _lc.commit()
         conn.close()
         return {"location_id": structure_id, "name": resolved_name,
                 "solar_system_id": sys_id, "in_space": False}
@@ -494,10 +512,15 @@ async def fetch_plan_sell_price(request: Request, location_id: int, type_id: int
     ensure_price_table(conn)
 
     # Ensure the type_id is present in market_price_cache (the fetchers need it for filtering)
-    conn.execute(
-        "INSERT INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0) ON CONFLICT (type_id) DO NOTHING",
-        (type_id,),
-    )
+    with _connect() as _pc:
+        _pc.execute(
+            text("INSERT INTO market_price_cache"
+                 " (type_id, sell_price, buy_price, cached_at)"
+                 " VALUES (:type_id, NULL, NULL, 0)"
+                 " ON CONFLICT (type_id) DO NOTHING"),
+            {"type_id": type_id},
+        )
+        _pc.commit()
     conn.commit()
 
     region_id = await _region_for(location_id, token)
@@ -584,16 +607,19 @@ async def suggest(request: Request, q: str = ""):
                        (cur.get("quantity", 1) == -1, cur.get("material_efficiency", 0)):
                         bp_by_type[tid] = bp
 
-            ph = ",".join("?" * len(bp_type_ids))
-            rows = conn.execute(f"""
+            with _connect() as _sc:
+                rows = _sc.execute(
+                    text("""
                 SELECT sbp.blueprint_type_id, sbp.product_type_id, t.name
                 FROM sde_blueprint_products sbp
                 JOIN sde_types t ON t.type_id = sbp.product_type_id
-                WHERE sbp.blueprint_type_id IN ({ph})
+                WHERE sbp.blueprint_type_id IN :bp_ids
                   AND sbp.activity IN ('manufacturing', 'reaction')
-                  AND LOWER(t.name) LIKE ?
+                  AND LOWER(t.name) LIKE :pattern
                 ORDER BY t.name
-            """, bp_type_ids + [pattern]).fetchall()
+                    """).bindparams(bindparam("bp_ids", expanding=True)),
+                    {"bp_ids": bp_type_ids, "pattern": pattern},
+                ).fetchall()
 
             for bp_type_id, product_type_id, product_name in rows:
                 owned_product_ids.add(product_type_id)
@@ -611,25 +637,32 @@ async def suggest(request: Request, q: str = ""):
 
     # SDE — other blueprints (not owned)
     if owned_product_ids:
-        ph2 = ",".join("?" * len(owned_product_ids))
-        other_rows = conn.execute(f"""
+        with _connect() as _sc:
+            other_rows = _sc.execute(
+                text("""
             SELECT DISTINCT t.type_id, t.name
             FROM sde_types t
             JOIN sde_blueprint_products sbp ON sbp.product_type_id = t.type_id
-            WHERE LOWER(t.name) LIKE ?
+            WHERE LOWER(t.name) LIKE :pattern
               AND sbp.activity IN ('manufacturing', 'reaction')
-              AND t.type_id NOT IN ({ph2})
+              AND t.type_id NOT IN :owned
             ORDER BY t.name LIMIT 15
-        """, [pattern] + list(owned_product_ids)).fetchall()
+                """).bindparams(bindparam("owned", expanding=True)),
+                {"pattern": pattern, "owned": list(owned_product_ids)},
+            ).fetchall()
     else:
-        other_rows = conn.execute("""
+        with _connect() as _sc:
+            other_rows = _sc.execute(
+                text("""
             SELECT DISTINCT t.type_id, t.name
             FROM sde_types t
             JOIN sde_blueprint_products sbp ON sbp.product_type_id = t.type_id
-            WHERE LOWER(t.name) LIKE ?
+            WHERE LOWER(t.name) LIKE :pattern
               AND sbp.activity IN ('manufacturing', 'reaction')
             ORDER BY t.name LIMIT 15
-        """, [pattern]).fetchall()
+                """),
+                {"pattern": pattern},
+            ).fetchall()
 
     conn.close()
     return {
