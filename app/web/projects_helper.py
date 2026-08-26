@@ -23,7 +23,6 @@ from collections import defaultdict
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from app.db.schema import ensure_schema as ensure_db_schema
 
 
 def list_projects(conn: Connection) -> list[dict]:

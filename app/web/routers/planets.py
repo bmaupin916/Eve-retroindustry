@@ -14,7 +14,6 @@ import time as _time
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from app.auth.token_store import list_characters
 from app.character import planets as planets_api
 from app.sync import worker as sync_worker
 from app.web import pi_planner_helper

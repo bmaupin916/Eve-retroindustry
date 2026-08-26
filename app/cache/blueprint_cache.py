@@ -2,7 +2,7 @@ import json
 import time
 import httpx
 from sqlalchemy.orm import Session
-from app.db.database import TypeCache, BlueprintCache, get_session
+from app.db.database import TypeCache, BlueprintCache
 from app.esi.client import fetch_type_info, fetch_blueprint_data
 
 CACHE_TTL = 60 * 60 * 24 * 7  # 7 days — blueprints rarely change

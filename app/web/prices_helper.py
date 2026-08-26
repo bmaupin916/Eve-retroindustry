@@ -15,8 +15,6 @@ from app.esi.client import esi_client
 
 from app.market.prices import (
     fetch_adjusted_prices,
-    fetch_jita_price,
-    fetch_jita_prices_bulk,
     fetch_region_orders_bulk,
     ensure_price_table,
     PRICE_CACHE_TTL,
@@ -161,7 +159,6 @@ def get_all_price_items(
         params: tuple = ()
     else:
         # Always include everything with a custom_price
-        ph = ",".join("?" * len(relevant_ids)) if relevant_ids else "NULL"
         where_clause = (
             "WHERE m.type_id IN :ids OR c.price IS NOT NULL"
             if relevant_ids

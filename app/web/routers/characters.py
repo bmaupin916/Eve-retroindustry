@@ -16,7 +16,6 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import bindparam, text
 
-from app.auth.token_store import get_character_row, list_characters
 from app.character import orders as orders_api
 from app.character import wallet as wallet_api
 from app.market.prices import JITA_REGION, TRADE_HUBS
@@ -28,7 +27,6 @@ from app.web.location_resolver import (
 )
 from app.web.deps import (
     all_characters,
-    any_character,
     character_row,
     _resolve_party_names,
     _valid_token_async,

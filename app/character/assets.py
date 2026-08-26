@@ -9,7 +9,6 @@ import json
 import httpx
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
-from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE  = "https://esi.evetech.net/latest"
 CACHE_TTL = 60 * 10  # 10 minutes (assets change)

@@ -368,6 +368,70 @@ def test_search_by_item_is_a_substring_match(conn):
     assert len(helper.search_public_contracts(conn, JITA_REGION, item="rita")) == 1
 
 
+@pytest.mark.parametrize("typed", ["tritanium", "TRITANIUM", "TriTaNiUm",
+                                   "Tritanium"])
+def test_search_by_item_ignores_the_case_the_user_typed(conn, typed):
+    """Nobody types an EVE item name with CCP's capitalisation, and until
+    v0.9.78 whether that mattered depended on the backend: SQLite's `LIKE`
+    ignores ASCII case, Postgres' does not. On the deployment "tritanium"
+    matched nothing and "Tritanium" worked, silently.
+
+    The three tests around this one could not see it. Each searches a substring
+    that already matches the stored capitalisation — `"Tritanium"`, and `"rita"`,
+    which is lowercase in the source too (T**rita**nium). They pin the join and
+    the substring behaviour, and they pass on both backends whether or not the
+    case fold is there, which is the whole reason this parametrisation spells
+    out four spellings instead of trusting the neighbours.
+    """
+    helper._store(conn, JITA_REGION, [_contract(1), _contract(2)],
+                  {1: [_item(TRITANIUM)], 2: [_item(PYERITE)]})
+
+    got = helper.search_public_contracts(conn, JITA_REGION, item=typed)
+
+    assert [c["contract_id"] for c in got] == [1]
+
+
+def test_the_cheapest_contract_comes_first(conn):
+    """The ordering users actually get, on the values `_store` actually
+    writes."""
+    helper._store(conn, JITA_REGION, [
+        _contract(1, price=None), _contract(2, price=30.0),
+        _contract(3, price=10.0),
+    ], {})
+
+    got = helper.search_public_contracts(conn, JITA_REGION)
+
+    assert [c["contract_id"] for c in got] == [1, 3, 2]     # 0.0, 10, 30
+
+
+def test_a_null_price_sorts_last_on_both_backends(conn):
+    """`ORDER BY c.price ASC NULLS LAST` — the one assertion in this file that
+    deliberately reaches around the helper it is testing.
+
+    A NULL cannot get into this column through `_store`, which binds
+    `c.get("price") or 0` and is the only writer — that is already pinned by
+    `test_missing_numeric_fields_become_zero_not_null` above. So writing one
+    here requires a direct INSERT, and that is the point: the
+    clause exists so the ordering does not depend on that coercion staying as
+    it is, and an assertion that went through `_store` could not tell whether
+    the clause was there at all. SQLite sorts NULLs first on ASC and Postgres
+    sorts them last, so without it this call answers differently per backend —
+    and with a `LIMIT` that is a difference in *which* rows come back, not just
+    their order.
+    """
+    helper._store(conn, JITA_REGION, [_contract(1, price=10.0)], {})
+    conn.execute(text(
+        "INSERT INTO public_contracts (contract_id, region_id, type, price,"
+        " reward, collateral, buyout, volume, date_expired, title,"
+        " start_location_id, end_location_id, issuer_id)"
+        " VALUES (2, :r, 'courier', NULL, 0, 0, 0, 1.0, 'z', '', 1, NULL, 1)"),
+        {"r": JITA_REGION})
+
+    got = helper.search_public_contracts(conn, JITA_REGION)
+
+    assert [c["contract_id"] for c in got] == [1, 2]
+
+
 def test_an_item_match_returns_each_contract_once(conn):
     """`SELECT DISTINCT`. The join multiplies by matching items, so a contract
     holding two matching lines would otherwise appear twice."""

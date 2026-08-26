@@ -13,7 +13,7 @@ import httpx
 from app.esi.client import esi_client
 from sqlalchemy import text
 
-from app.db.conn import connect as _connect, dbapi
+from app.db.conn import dbapi
 from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE = "https://esi.evetech.net/latest"

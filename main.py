@@ -56,7 +56,7 @@ async def find_type_id(query: str) -> tuple[int, str] | None:
             if name.lower() == query.lower():
                 return tid, name
 
-        console.print(f"\n[bold]Types found:[/]")
+        console.print("\n[bold]Types found:[/]")
         for i, (tid, name) in enumerate(zip(top, names)):
             console.print(f"  [{i+1}] {name}  [dim](ID: {tid})[/]")
 
@@ -134,13 +134,13 @@ async def main():
         type_id, type_name = result
 
     price_mode = "Jita live" if args.jita else "ESI adjusted avg"
-    console.print(f"\n[bold]EVE Retroindustry BOM Calculator[/]")
+    console.print("\n[bold]EVE Retroindustry BOM Calculator[/]")
     console.print(f"  Product   : [cyan]{type_name}[/] (ID: {type_id})")
     console.print(f"  Quantity  : {args.qty:,}")
     console.print(f"  ME        : {args.me:.0f}")
     console.print(f"  Prices    : {price_mode}")
     if args.optimize:
-        console.print(f"  Mode      : [bold green]Make vs. Buy optimization[/]")
+        console.print("  Mode      : [bold green]Make vs. Buy optimization[/]")
 
     # BOM tree
     resolver = BOMResolver(DB_ABS)

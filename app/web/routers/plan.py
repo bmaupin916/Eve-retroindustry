@@ -20,7 +20,6 @@ from fastapi.responses import HTMLResponse
 
 from sqlalchemy import bindparam, text
 
-from app.auth.token_store import get_character_row
 from app.bom.resolver import BOMResolver
 from app.cache.blueprint_cache import resolve_type
 from app.character.assets import load_cached_assets
@@ -42,8 +41,6 @@ from app.market.taxes import selling_costs
 from app.web import app_defaults
 from app.db.location import database_path
 from app.web.deps import (
-    all_characters,
-    any_character,
     character_row,
     _load_assets_from_cache,
     _valid_token_async,

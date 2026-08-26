@@ -12,7 +12,6 @@ import asyncio
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from app.auth.token_store import list_characters
 from app.esi.client import esi_client
 from app.market.prices import (
     JITA_REGION,
@@ -25,14 +24,11 @@ from app.market.prices import (
 )
 from app.web.deps import (
     all_characters,
-    any_character,
-    character_row,
     _ensure_groups_populated,
     _load_assets_from_cache,
     _load_blueprints_from_cache,
     _tr,
     get_active_token,
-    get_conn,
 )
 from sqlalchemy import bindparam, text
 

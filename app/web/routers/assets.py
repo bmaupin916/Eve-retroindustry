@@ -22,7 +22,6 @@ from sqlalchemy.engine import Connection
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from app.auth.token_store import get_character_row, list_characters
 from app.character.assets import (
     load_cached_assets,
     load_cached_container_names,
@@ -34,7 +33,6 @@ from app.db.type_resolver import resolve_names_bulk
 from app.esi.client import esi_client
 from app.web.deps import (
     all_characters,
-    any_character,
     character_row,
     _container_display_name,
     _valid_token_async,
@@ -1034,11 +1032,6 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
         bp_list.sort(key=lambda x: x["name"])
 
     token = primary_token
-    char = selected_chars[0] if selected_chars else None
-    char_id = char[0] if char else 0
-
-    from collections import defaultdict
-
     # Aggregate assets across selected chars for container detection
     assets: list[dict] = []
     assets_by_char: dict[int, list[dict]] = {}

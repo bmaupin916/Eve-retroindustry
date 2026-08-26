@@ -1,7 +1,6 @@
 """Helpers for computing EVE Online manufacturing fees."""
 from __future__ import annotations
 import time
-import httpx
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 from app.esi.client import esi_client

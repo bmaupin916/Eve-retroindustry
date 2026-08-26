@@ -35,7 +35,7 @@ from app.auth.token_store import (
     get_character_row,
     get_valid_token as _get_valid_token_for,
 )
-from app.db.location import app_dir, database_path
+from app.db.location import database_path
 from app.db.schema import (
     ensure_schema as ensure_db_schema,
     ensure_sde_schema,

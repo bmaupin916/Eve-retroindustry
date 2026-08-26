@@ -13,7 +13,7 @@ from sqlalchemy import text
 from typing import Literal
 
 from app.bom.resolver import (
-    BOMResolver, BOMNode, InventionParams, StationFacility, total_invention_cost,
+    BOMResolver, InventionParams, StationFacility, total_invention_cost,
 )
 from app.bom.optimizer import optimize, get_shopping_list
 from app.character.blueprints import CharBlueprint

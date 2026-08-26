@@ -6,7 +6,6 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from app.db.conn import NO_SUCH_TABLE, recover_from_missing_table
-from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE  = "https://esi.evetech.net/latest"
 CACHE_TTL = 3600  # 1 hour

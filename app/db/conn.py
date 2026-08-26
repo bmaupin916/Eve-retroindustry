@@ -39,7 +39,7 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.pool import NullPool
 
-from app.db.location import database_url, is_sqlite
+from app.db.location import database_url
 
 _engine: Engine | None = None
 _engine_url: str | None = None

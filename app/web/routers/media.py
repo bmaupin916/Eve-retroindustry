@@ -14,7 +14,6 @@ import asyncio
 import os
 import time as _time
 
-import httpx
 
 from fastapi import APIRouter
 

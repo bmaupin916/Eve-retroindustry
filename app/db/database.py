@@ -1,7 +1,6 @@
 from sqlalchemy import create_engine, Column, Integer, String, Text, Float
 from sqlalchemy.orm import DeclarativeBase, Session
 from sqlalchemy.pool import NullPool
-import json
 import os
 
 # Where the database lives is now answered in one place, because Alembic needs

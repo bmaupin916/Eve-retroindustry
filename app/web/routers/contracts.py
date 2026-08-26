@@ -13,19 +13,16 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy import bindparam, text
 
-from app.auth.token_store import get_character_row, list_characters
 from app.character import contracts as contracts_api
 from app.esi.client import esi_client
 from app.web import contracts_helper
 from app.web.deps import (
     all_characters,
-    any_character,
     character_row,
     _resolve_party_names,
     _valid_token_async,
     _tr,
     get_active_character_id,
-    get_conn,
 )
 
 from app.db.conn import connect as _connect

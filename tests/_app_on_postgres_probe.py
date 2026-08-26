@@ -28,6 +28,7 @@ failed to serve.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import sqlite3
 import sys
@@ -59,6 +60,51 @@ PAGES = [
 SERVED = {"200", "303", "307", "401", "404"}
 
 
+def _drop_schema() -> None:
+    """Remove this process's schema. Safe to call twice — the normal teardown
+    calls it and so does `atexit`, and the second one finds nothing."""
+    try:
+        from sqlalchemy import create_engine, text
+
+        from tests.test_postgres_schema import URL as PG_URL
+
+        admin = create_engine(PG_URL)
+        with admin.connect() as c:
+            c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
+            c.commit()
+        admin.dispose()
+    except Exception:                       # noqa: BLE001 — best effort teardown
+        pass
+
+
+def _sweep_orphans(c) -> None:
+    """Drop `pytest_app_pages_*` schemas left by runs that never tore down.
+
+    Belt as well as braces: `atexit` covers an exception or a clean exit, and
+    nothing covers a `SIGKILL`. Sweeping at *setup* is what makes the leak
+    self-healing rather than permanent.
+
+    A concurrent run holds its own schema, and `DROP ... CASCADE` would block
+    on it rather than fail — so this sets a short `lock_timeout` and moves on.
+    Skipping is the right answer there: that schema has a live owner who will
+    drop it.
+    """
+    from sqlalchemy import text
+
+    rows = c.execute(text(
+        "SELECT nspname FROM pg_namespace"
+        " WHERE nspname LIKE 'pytest\\_app\\_pages%' AND nspname <> :mine"),
+        {"mine": PG_SCHEMA}).fetchall()
+    for (name,) in rows:
+        try:
+            c.execute(text("SET LOCAL lock_timeout = '2s'"))
+            c.execute(text(f'DROP SCHEMA IF EXISTS "{name}" CASCADE'))
+            c.commit()
+            print(f"swept orphaned schema {name}")
+        except Exception:                   # noqa: BLE001 — in use by a live run
+            c.rollback()
+
+
 def main() -> int:
     from sqlalchemy import create_engine, text
 
@@ -70,10 +116,19 @@ def main() -> int:
 
     admin = create_engine(PG_URL)
     with admin.connect() as c:
+        _sweep_orphans(c)
         c.execute(text(f"DROP SCHEMA IF EXISTS {PG_SCHEMA} CASCADE"))
         c.execute(text(f"CREATE SCHEMA {PG_SCHEMA}"))
         c.commit()
     admin.dispose()
+
+    # The teardown at the bottom of this function is the normal path; this is
+    # the one that runs when there is no normal path — an exception in the
+    # middle, or the process killed outright. Without it a schema holding a
+    # full copy of the SDE (22 MB) is orphaned, and because the name carries
+    # the pid it can never be reused, so they accumulate. Four had already
+    # collected before anyone looked.
+    atexit.register(_drop_schema)
 
     scoped = PG_URL + ("&" if "?" in PG_URL else "?") + \
         f"options=-csearch_path%3D{PG_SCHEMA}"

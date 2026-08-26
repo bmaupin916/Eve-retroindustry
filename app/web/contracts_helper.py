@@ -180,6 +180,26 @@ def search_public_contracts(conn: Connection, region_id: int, *,
     of the conversion here: the previous version appended each parameter as its
     clause fired, so the binding order was a property of the branch order, and
     a mispairing would have returned plausible rows rather than raising.
+
+    **`NULLS LAST` is stated rather than defaulted, and it is defence, not a
+    fix.** `public_contracts.price` is declared nullable and the two backends
+    order NULLs oppositely — SQLite first on ASC, Postgres last — which with a
+    `LIMIT` on top decides *what is on the page* rather than merely its order:
+    six rows limited to three returned disjoint sets on the two backends when
+    measured directly.
+
+    It is unreachable today, and the reason is worth writing down because it is
+    three functions away from here: `_store` is the only writer of this column
+    and it binds `c.get("price") or 0`, so a courier contract's absent price
+    lands as `0.0` and never as NULL. The clause therefore changes nothing now.
+    It is here so that the ordering stops depending on a coercion somewhere
+    else staying exactly as it is — and that coercion is not obviously
+    permanent, since `max_price=0` is documented below as selecting the *free*
+    contracts, which the same `or 0` makes indistinguishable from the priceless
+    ones.
+
+    SQLite has honoured `NULLS LAST` since 3.30 and `prices_helper` already
+    relies on it, so this costs no portability.
     """
     ensure_public_contract_tables(conn)
     where = ["c.region_id = :region_id"]
@@ -188,8 +208,14 @@ def search_public_contracts(conn: Connection, region_id: int, *,
     if item.strip():
         joins = (" JOIN public_contract_items i ON i.contract_id = c.contract_id"
                  " JOIN sde_types t ON t.type_id = i.type_id")
-        where.append("t.name LIKE :item")
-        params["item"] = f"%{item.strip()}%"
+        # `LOWER(...)` on both sides, not a bare `LIKE`. SQLite's LIKE ignores
+        # ASCII case and Postgres' does not, so the bare form searched
+        # case-insensitively on a laptop and case-sensitively on the
+        # deployment — typing "tritanium" found nothing there while
+        # "Tritanium" worked, with no error to say why. Same defect the plan
+        # form's product search had (fixed v0.9.71); this was the second site.
+        where.append("LOWER(t.name) LIKE :item")
+        params["item"] = f"%{item.strip().lower()}%"
     if ctype:
         where.append("c.type = :ctype")
         params["ctype"] = ctype
@@ -201,7 +227,7 @@ def search_public_contracts(conn: Connection, region_id: int, *,
     sql = (f"SELECT DISTINCT c.contract_id, c.type, c.price, c.reward, c.collateral, "
            f"c.volume, c.date_expired, c.title, c.start_location_id, c.end_location_id, "
            f"c.issuer_id FROM public_contracts c{joins} WHERE {' AND '.join(where)} "
-           f"ORDER BY c.price LIMIT :limit")
+           f"ORDER BY c.price ASC NULLS LAST LIMIT :limit")
     cols = ["contract_id", "type", "price", "reward", "collateral", "volume",
             "date_expired", "title", "start_location_id", "end_location_id", "issuer_id"]
     return [dict(zip(cols, row))

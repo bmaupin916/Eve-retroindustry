@@ -22,7 +22,7 @@ one of them capital-enabled, give you 20 manufacturing slots of which at most
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import ceil, floor
+from math import floor
 
 SECONDS_PER_DAY = 86400
 
