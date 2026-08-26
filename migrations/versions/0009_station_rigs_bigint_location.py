@@ -13,7 +13,7 @@ the cross-backend files exist.
 
 This fixes the one column that blocked that slice. It is not the only column of
 its kind — ESI declares character, corporation, location, item, order and
-contract ids as int64 — and the rest are listed in docs/step-4-worklist.md
+contract ids as int64 — and the rest are listed in docs/working-notes.md
 rather than swept into this migration, because each needs deciding on its own
 and a widening ALTER on a live table is not something to do by pattern match.
 

@@ -126,6 +126,27 @@ pytest
 The test fixtures build a temp database from the committed `sde_base.db`, so no login or network is
 needed.
 
+### The Postgres half
+
+The app runs on SQLite and Postgres, and roughly a third of the suite is parameterised over both.
+Without a Postgres server those halves **skip silently**, so a suspiciously fast run means a stopped
+container rather than a fast machine — read the skip count, not the clock. A healthy full run today
+is about six minutes and reports **2 skipped** (POSIX file modes on Windows, not a backend).
+
+```powershell
+docker start eve-pg
+```
+
+If the container does not exist yet:
+
+```powershell
+docker run -d --name eve-pg -e POSTGRES_PASSWORD=eve -e POSTGRES_USER=eve -e POSTGRES_DB=eve_retroindustry -p 5433:5432 postgres:17
+```
+
+**The host port must stay below 49152.** Windows' dynamic port range is 49152–65535 and WinNAT
+reserves blocks inside it at boot, so a port up there can be taken away by a reboot — see
+[working-notes.md](working-notes.md) for the incident that moved it to 5433.
+
 ## Local data files
 
 All written next to the repo root in dev mode, or into `EVE_APP_DIR` when it is set:

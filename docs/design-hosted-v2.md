@@ -3,8 +3,28 @@
 Target architecture and feature plan for moving from a single-user desktop app to a
 hosted, multi-tenant industry platform with corporation and alliance coordination.
 
-Status: **design**. Nothing here is built. Written 2026-08-17 from a planning session;
-supersedes nothing, but `docs/deploy-vps.md` becomes obsolete when this lands.
+Written 2026-08-17 from a planning session. The line that used to sit here — *"Status:
+**design**. Nothing here is built"* — stopped being true a long way back, so the status
+now lives in §11 where the steps are, and is summarised as:
+
+| | Step | State |
+|---|---|---|
+| 0 | Land the WIP | ✅ v0.9.23 |
+| 1 | Correctness sprint | ✅ v0.9.24–26 |
+| 2 | Security baseline + ESI citizenship | ✅ v0.9.27 |
+| 3 | **Go hosted, single-user** | ⚠️ **code only — never deployed** |
+| 4 | Platform foundations | ✅ v0.9.76 |
+| 5 | Multi-tenancy | ⬜ next |
+| 6 | Groups + coordination MVP | ⬜ |
+| 7 | Feature buildout | 🟡 0 of 8 complete; reactions board in beta |
+
+**Step 3 is the one to read first.** It is the only ✅-adjacent step that is not real: the
+desktop app is deleted and the hosted deployment was never done, so everything built since
+runs on one laptop with no fallback. Steps 4 through 7 are being built *ahead of* the tool
+they are for, which inverts the order this document argues for in "Why this order".
+
+`docs/deploy-vps.md` is rewritten for this design rather than obsoleted by it;
+`docs/working-notes.md` holds the measured lessons that outlived the step that found them.
 
 ---
 
@@ -1451,7 +1471,7 @@ assertion noticing. Same shape as the `esi_client()` docstring in Step 2 — twi
 so it is worth stating as a rule: **a name that claims something about the world needs an
 assertion about the world.**
 
-**Step 4 — Platform foundations. ✅ Done — v0.9.74.** Postgres + Alembic
+**Step 4 — Platform foundations. ✅ Done — v0.9.76.** Postgres + Alembic
 (decide once, not hedged); async token refresh done properly; background sync worker with
 delay-after-completion + jitter; cache-only routes; ETags on every fetch; 4XX quarantine
 per character; ~~verify the OpenAPI/compatibility-date situation before writing the
@@ -1460,9 +1480,9 @@ worker~~; split `main.py` into routers while every route is being touched anyway
 
 | Item | State |
 |---|---|
-| **Schema declared once** | ✅ **done.** `app/db/schema.py` holds all 51 tables as SQLAlchemy Core metadata. It replaced 34 DDL statements in 14 modules, 20 `ensure_*()` functions, 8 `ALTER TABLE` probes and a second copy of the SDE schema in `import_sde.py` — 549 lines deleted. Pinned by a call-site scan: no DDL may exist outside that module. |
+| **Schema declared once** | ✅ **done.** `app/db/schema.py` holds all 51 tables as SQLAlchemy Core metadata. It replaced 34 DDL statements in 14 modules, 20 `ensure_*()` functions, 8 `ALTER TABLE` probes and a second copy of the SDE schema in `import_sde.py` — 549 lines deleted. Pinned by a call-site scan: no DDL may exist outside that module. **Six more shims went in v0.9.76** — `ensure_bp_table`, `ensure_assets_table`, `ensure_corp_assets_table`, `ensure_skills_table`, `ensure_project_tables`, `ensure_user_tables` — and the reason for checking rather than assuming is that `git log -S` put their last caller's removal in `5644579`, the commit that introduced migrations. They were debt that commit left, not debt the query conversion created; deleting them on a hunch would have cemented a regression instead if it had been the other way round. One of the six was also missing the dialect guard its five siblings carry, so it was dead code with a live Postgres bug inside it. |
 | **Migrations** | ✅ **done.** Alembic, baseline `5c9156e72c43`, run at startup. Pre-Alembic databases are stamped rather than rebuilt. `test_the_migrations_match_the_declaration` fails if the declaration and the history drift. |
-| **Postgres itself** | ✅ **done — v0.9.74.** The declaration emits Postgres DDL, `EVE_DATABASE_URL` is the seam, and every hand-written statement now goes through `text()` with named binds. The count went **~316 → 145 (v0.9.65) → 8**, and the eight left are not query code: `PRAGMA`s in SQLAlchemy's connect-event handlers (`app/db/conn.py`), the same three inside `get_conn()` (`app/web/deps.py`, which go when it does), and `PRAGMA database_list` as `_ensure`'s memo key (`app/db/schema.py`, guarded by a dialect check at every caller). `tests/test_sql_portability.py` pins that with three scans — one that fails on any new raw statement, one that fails when the exemption list goes stale, and a positive control, because a scan whose healthy result is a short known list looks exactly like a scan that has stopped reading the tree.
+| **Postgres itself** | ✅ **done — statements v0.9.74, the app actually starting v0.9.75** (the gap between those two is the paragraph below the table, and it is the useful part). The declaration emits Postgres DDL, `EVE_DATABASE_URL` is the seam, and every hand-written statement now goes through `text()` with named binds. The count went **~316 → 145 (v0.9.65) → 8**, and the eight left are not query code: `PRAGMA`s in SQLAlchemy's connect-event handlers (`app/db/conn.py`), the same three inside `get_conn()` (`app/web/deps.py`, which go when it does), and `PRAGMA database_list` as `_ensure`'s memo key (`app/db/schema.py`, guarded by a dialect check at every caller). `tests/test_sql_portability.py` pins that with three scans — one that fails on any new raw statement, one that fails when the exemption list goes stale, and a positive control, because a scan whose healthy result is a short known list looks exactly like a scan that has stopped reading the tree.
 
 **The flip was written down as atomic and was not.** A converted module takes its connection from `app.db.conn.connect()` while the rest still calls `get_conn()`, and both work against one database at once — which is what made it possible to go unit by unit rather than in one commit. Order mattered: **by router**, with the helper that holds its SQL, and the cache readers coming along for free. Converting `deps.py`'s readers first would have forced five routers to open their own connections in code about to be re-touched.
 
@@ -1472,10 +1492,46 @@ worker~~; split `main.py` into routers while every route is being touched anyway
 | **Cache-only routes** | 🟡 **started, and pinned.** `/jobs` is converted and is the worked example: `char_jobs_cache` filled by the worker, the page reads it and never calls ESI, and it says how old the answer is — a cache-only page with no age on it is indistinguishable from a stale one. `tests/test_cache_only_routes.py` scans every route handler and fails on any that reaches ESI while rendering; what is left is named there with a reason each, so the list shrinks deliberately rather than by pattern. The scan follows same-file helpers but does **not** cross modules — `POST /prices/refresh` fetches through `prices_helper` and is invisible to it, which is written down rather than papered over. Still to convert: assets, blueprints, wallet, orders, contracts, planets, PI planner, plan. |
 | **ETags on every fetch** | ✅ **done.** In the transport, so every fetch gets it and no caller has to learn about 304 — a hit is replayed as the 200 it was, X-Pages included, which the paginated fetchers read to decide how many more requests to make. A 304 costs one token of the error budget instead of two and carries no body. Keyed on the URL plus a hash of the credential, because corp endpoints answer differently per member; the token itself is never stored. LRU, 32 MB. `app/market/prices.py` keeps its own persisted store — history has to be recomputed against a moving 7-day window rather than replayed — and a request that already carries If-None-Match is left alone. |
 | **4XX quarantine per character** | ✅ **done.** ESI keeps one error budget for the whole client and a 4xx costs 5 tokens of it, so a character who removed the app in-game answers 401/403 forever and quietly spends the budget everyone else needs. After three consecutive refusals the transport answers that entity locally and stops putting its requests on the wire; any 2xx clears it, backoff lengthens 60s → 1h. Keyed on the entity in the URL rather than the token, because a bearer token is opaque to the transport and `/corporations/` calls are made with some member's. |
-| **Split `main.py`** (W6) | ✅ **done.** 7,112 → 822 lines (835 today). Eleven routers, one commit each, route table checked after every one. `app/web/deps.py` holds what more than one router needs — `get_conn`, `_tr`, the template filters, the active character — and may never import `main`, which is what makes the split possible. |
+| **Split `main.py`** (W6) | ✅ **done.** 7,112 → 822 lines (784 today — v0.9.76 removed 113 unused imports the split had left behind; tree-wide pyflakes went 153 → 44 with them, and the three survivors are genuine re-exports the tests reach as `app_module.X`, now carrying a comment saying pyflakes should report exactly those three). Eleven routers, one commit each, route table checked after every one. `app/web/deps.py` holds what more than one router needs — `get_conn`, `_tr`, the template filters, the active character — and may never import `main`, which is what makes the split possible. |
 
 Compatibility dates are struck through because that question was answered on 2026-08-18
 and was already handled — see §14.
+
+**The last statement was converted at v0.9.74 and the app still could not start on
+Postgres.** Worth stating plainly, because the count is the metric this step was steered by
+and the count was *right*: 8 statements, all PRAGMAs, every module portable, the whole suite
+green on both backends. What no test asked was whether the process comes up. `app/db/database.py`
+passed `connect_args={"timeout": 30.0}` unconditionally — a SQLite DBAPI argument — so
+`create_engine` raised `ProgrammingError: invalid connection option "timeout"` **at import
+time**, and `app/web/main.py` imports `get_session` from that module. Every page, on every
+route, on a real deployment. It was invisible because the cross-backend tests each build
+their own engine and never import the app's, which is exactly the shape of the failures §11
+already collects: *a name that claims something about the world needs an assertion about the
+world*, and "runs on Postgres" is a claim about the world that 1,400 passing statement-level
+tests did not make.
+
+Fixed in v0.9.75, and the fix came with the assertion that was missing:
+`tests/test_app_on_postgres.py` starts the **real app in a subprocess** — one database per
+process is a property of the app, so this cannot be done in-process alongside the SQLite
+suite — copies `sde_base.db` into a per-process Postgres schema, and requests 20 pages.
+All 20 serve 200. That is the first time any part of this project has been observed running
+on Postgres rather than inferred to.
+
+**And v0.9.76 closed four loose ends the conversion had surfaced but not fixed**, each of
+which turned out wider than its description: a **live 500** on `/assets`, `/blueprints` and
+`/plan` (below), the PI expiry ambiguity pinned as a reviewed decision rather than left to
+be rediscovered, the six dead schema shims, and main.py's dead imports.
+
+**The 500 was not one reader's bug, it was one line's ordering.** `load_cached_blueprints`
+caught `ValueError, TypeError, KeyError` around a parse, so a payload that was valid JSON
+but not a list of dicts should have read as "never synced" like every other corrupt cache.
+It escaped as a 500 instead, and the reason is that `_parse_assets` opens with
+`item["item_id"]` — a subscript, so a non-dict raises `TypeError`, caught — while
+`_parse_blueprints` opens with `item.get("quantity", -1)` — an attribute access, so the same
+payload raises `AttributeError`, not caught. The two functions are otherwise identical. The
+assets readers were therefore correct **by accident**, and a refactor that reordered two
+fields would have broken them silently. All three now catch both, so the guarantee no longer
+depends on which access happens to come first.
 
 **Two bugs surfaced by declaring the schema**, both live, neither visible from reading the
 code that caused them:
@@ -1502,6 +1558,16 @@ here are call-site scans for exactly that reason.
 table gains an owner scope; all reads through an account-scoped query layer with a CI lint
 against raw table access; the two-synthetic-accounts leak test on every route. Still one
 real user — but the schema is now safe for a second.
+
+Step 4 leaves this cheaper than it was scoped. Three of its outputs are the same machinery
+Step 5 asks for: one connection abstraction (`app/db/conn.connect()`) so there is a single
+place an owner scope can be threaded through; `text()` with named binds everywhere, so
+adding `AND owner_id = :owner` is an edit to a statement rather than a rewrite of a string;
+and `tests/test_sql_portability.py`, which is already **the CI lint in the shape Step 5
+describes** — an AST scan over `app/` that fails on any statement outside a named exemption
+list. Pointing it at unscoped table access is a change of predicate, not a new mechanism.
+The **order** note stands, though: Step 3 is still undone, so tenancy would land on a tool
+that has never run anywhere but a laptop.
 
 **Step 6 — Groups + coordination MVP.** Corp/alliance membership sync with revalidation;
 roles; orders → commitments → assignments → job verification with the visible match
