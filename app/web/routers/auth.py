@@ -233,8 +233,10 @@ async def auth_callback(request: Request, code: str | None = None,
     except LoginError as exc:
         return _tr("auth_failed.html", request, {"reason": str(exc)})
 
-    conn = get_conn()
-    try:
+    # `security` moved onto the portable query layer, and every use of this
+    # connection in the block below is a `security.*` call — so the whole handler
+    # takes an engine connection rather than mixing two kinds.
+    with _connect() as conn:
         if not security.may_sign_in(conn, character_id):
             # Not necessarily a failure. "Add Character" and "Log In" are the same
             # link, so intent is not recorded anywhere — but complete_login() has
@@ -267,8 +269,6 @@ async def auth_callback(request: Request, code: str | None = None,
                 "reason": f"{character_name} is not the owner of this instance.",
             })
         session_id, _ = security.create_session(conn, character_id)
-    finally:
-        conn.close()
 
     # The caches for a character nobody has synced are empty, and the pages
     # that read them say so rather than fetching. Ask for a round now instead
@@ -396,8 +396,9 @@ async def auth_bootstrap(request: Request, token: str | None = None):
     """
     from app.web.bootstrap import redeem_token
 
-    conn = get_conn()
-    try:
+    # One engine connection for the whole handler: `bootstrap` and `security`
+    # are both on the portable query layer now.
+    with _connect() as conn:
         character_id = redeem_token(conn, token)
         if character_id is None:
             return _tr("auth_failed.html", request, {
@@ -406,8 +407,6 @@ async def auth_bootstrap(request: Request, token: str | None = None):
         if security.get_owner_id(conn) is None:
             security.claim_owner(conn, character_id)
         session_id, _ = security.create_session(conn, character_id)
-    finally:
-        conn.close()
 
     print(f"[auth] bootstrap session issued for character {character_id}", flush=True)
     resp = RedirectResponse("/", status_code=303)
@@ -420,11 +419,8 @@ async def auth_logout(request: Request):
     """Drop this session. The character's ESI tokens are untouched."""
     from fastapi.responses import JSONResponse
 
-    conn = get_conn()
-    try:
+    with _connect() as conn:
         security.delete_session(conn, request.cookies.get(security.SESSION_COOKIE))
-    finally:
-        conn.close()
     resp = JSONResponse({"ok": True})
     security.clear_session_cookie(resp)
     return resp

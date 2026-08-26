@@ -177,13 +177,16 @@ def _login(m) -> tuple[str, str]:
     """
     from app.web import security
 
-    conn = m.get_conn()
-    try:
+    # `security` is on the portable query layer, so this is an engine
+    # connection. Every route test in the suite depends on the session this
+    # mints, which is why it is worth saying plainly rather than leaving the
+    # reader to infer it from a fixture two files away.
+    from app.db.conn import connect
+
+    with connect() as conn:
         security.ensure_sessions_table(conn)
         security.claim_owner(conn, OWNER_CHARACTER_ID)
         return security.create_session(conn, OWNER_CHARACTER_ID)
-    finally:
-        conn.close()
 
 
 @pytest.fixture(scope="session")

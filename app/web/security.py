@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import os
 import secrets
-import sqlite3
 import time
+from sqlalchemy import text
+
+from app.db.conn import dbapi
 from app.db.schema import ensure_schema as ensure_db_schema
 
 # Cookie carrying the session id. Not `active_char`, which stays what it always
@@ -152,12 +154,19 @@ def origin_is_allowed(origin_header: str | None) -> bool:
 # Storage
 # ---------------------------------------------------------------------------
 
-def ensure_sessions_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_sessions_table(conn) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists.
+
+    Dialect-guarded like every other shim: `ensure_schema` memoises by asking
+    `PRAGMA database_list` which file it has, a syntax error on Postgres, where
+    the table comes from the migration history instead.
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(dbapi(conn))
 
 
-def get_owner_id(conn: sqlite3.Connection) -> int | None:
+def get_owner_id(conn) -> int | None:
     """The character that owns this instance, or None if unclaimed.
 
     An explicit EVE_OWNER_CHARACTER_ID always wins over the stored claim, so a
@@ -170,21 +179,26 @@ def get_owner_id(conn: sqlite3.Connection) -> int | None:
         except ValueError:
             print(f"[auth] EVE_OWNER_CHARACTER_ID={pinned!r} is not a number; ignoring",
                   flush=True)
-    row = conn.execute("SELECT character_id FROM app_owner WHERE id = 1").fetchone()
+    row = conn.execute(
+        text("SELECT character_id FROM app_owner WHERE id = 1")).fetchone()
     return int(row[0]) if row else None
 
 
-def claim_owner(conn: sqlite3.Connection, character_id: int) -> None:
+def claim_owner(conn, character_id: int) -> None:
     conn.execute(
-        "INSERT INTO app_owner (id, character_id, claimed_at) VALUES (1, ?, ?) ON CONFLICT (id) DO UPDATE SET character_id=excluded.character_id, claimed_at=excluded.claimed_at",
-        (character_id, time.time()),
+        text("INSERT INTO app_owner (id, character_id, claimed_at)"
+             " VALUES (1, :character_id, :claimed_at)"
+             " ON CONFLICT (id) DO UPDATE SET"
+             " character_id=excluded.character_id,"
+             " claimed_at=excluded.claimed_at"),
+        {"character_id": character_id, "claimed_at": time.time()},
     )
     conn.commit()
     print(f"[auth] character {character_id} claimed this instance. Set "
           f"EVE_OWNER_CHARACTER_ID={character_id} to pin it.", flush=True)
 
 
-def may_sign_in(conn: sqlite3.Connection, character_id: int) -> bool:
+def may_sign_in(conn, character_id: int) -> bool:
     """Whether this character is allowed to hold a session.
 
     Only the owner. Other characters can still be *added* — that is what the
@@ -198,28 +212,31 @@ def may_sign_in(conn: sqlite3.Connection, character_id: int) -> bool:
     return owner == character_id
 
 
-def create_session(conn: sqlite3.Connection, character_id: int) -> tuple[str, str]:
+def create_session(conn, character_id: int) -> tuple[str, str]:
     """Mint a session. Returns (session_id, csrf_token)."""
     session_id = secrets.token_urlsafe(32)
     csrf_token = secrets.token_urlsafe(32)
     now = time.time()
     conn.execute(
-        "INSERT INTO app_sessions (session_id, character_id, csrf_token, created_at, "
-        "last_seen_at) VALUES (?,?,?,?,?)",
-        (session_id, character_id, csrf_token, now, now),
+        text("INSERT INTO app_sessions"
+             " (session_id, character_id, csrf_token, created_at, last_seen_at)"
+             " VALUES (:session_id, :character_id, :csrf_token, :created_at,"
+             "  :last_seen_at)"),
+        {"session_id": session_id, "character_id": character_id,
+         "csrf_token": csrf_token, "created_at": now, "last_seen_at": now},
     )
     conn.commit()
     return session_id, csrf_token
 
 
-def load_session(conn: sqlite3.Connection, session_id: str | None) -> dict | None:
+def load_session(conn, session_id: str | None) -> dict | None:
     """Return the live session for this id, or None. Expired rows are deleted."""
     if not session_id:
         return None
     row = conn.execute(
-        "SELECT session_id, character_id, csrf_token, created_at, last_seen_at "
-        "FROM app_sessions WHERE session_id = ?",
-        (session_id,),
+        text("SELECT session_id, character_id, csrf_token, created_at,"
+             " last_seen_at FROM app_sessions WHERE session_id = :sid"),
+        {"sid": session_id},
     ).fetchone()
     if not row:
         return None
@@ -233,8 +250,10 @@ def load_session(conn: sqlite3.Connection, session_id: str | None) -> dict | Non
     # page and asset, and a write per request would be pointless contention on
     # the same DB the sync worker is using.
     if now - float(row[4]) > 3600:
-        conn.execute("UPDATE app_sessions SET last_seen_at = ? WHERE session_id = ?",
-                     (now, session_id))
+        conn.execute(
+            text("UPDATE app_sessions SET last_seen_at = :now"
+                 " WHERE session_id = :sid"),
+            {"now": now, "sid": session_id})
         conn.commit()
 
     return {
@@ -246,15 +265,18 @@ def load_session(conn: sqlite3.Connection, session_id: str | None) -> dict | Non
     }
 
 
-def delete_session(conn: sqlite3.Connection, session_id: str | None) -> None:
+def delete_session(conn, session_id: str | None) -> None:
     if session_id:
-        conn.execute("DELETE FROM app_sessions WHERE session_id = ?", (session_id,))
+        conn.execute(text("DELETE FROM app_sessions WHERE session_id = :sid"),
+                     {"sid": session_id})
         conn.commit()
 
 
-def purge_expired(conn: sqlite3.Connection) -> int:
+def purge_expired(conn) -> int:
     cutoff = time.time() - SESSION_MAX_AGE
-    cur = conn.execute("DELETE FROM app_sessions WHERE last_seen_at < ?", (cutoff,))
+    cur = conn.execute(
+        text("DELETE FROM app_sessions WHERE last_seen_at < :cutoff"),
+        {"cutoff": cutoff})
     conn.commit()
     return cur.rowcount or 0
 

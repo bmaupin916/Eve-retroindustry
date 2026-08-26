@@ -63,7 +63,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
   **The measure from here is the count of raw `?`-parameter statements**, and
   it has to be taken with an AST walk rather than a grep — see "Count
-  statements with an AST" below. **31** of them at v0.9.73, down from 137 at
+  statements with an AST" below. **8** of them at v0.9.74, down from 137 at
   v0.9.66 and 145 at v0.9.65; **twelve** files still hold a raw `get_conn()`
   handle — still twelve after v0.9.71, because `routers/assets.py` has zero raw
   statements of its own and *still* opens one: `get_active_character`,
@@ -1421,16 +1421,24 @@ for f in pathlib.Path("app").rglob("*.py"):
 which is where the `IN ({ph})` placeholder patterns live, and those are the ones
 that need an expanding bindparam rather than a mechanical rewrite.
 
-## Where the remaining statements are (145 at v0.9.65 → 31 after v0.9.73)
+## Where the remaining statements are (145 at v0.9.65 → 8 after v0.9.74)
 
 Regenerated from the AST scan rather than edited by hand, because the previous
 version of this table had drifted from what the scan actually reported.
 
-| cluster | statements | files |
+| what | statements | why it stays |
 | --- | --- | --- |
-| infrastructure — `security` 7, `bootstrap` 7, `conn` 4, `schema` 1 | 19 | 4 |
-| `main.py` | 9 | 1 |
-| `deps.py` — all three inside `get_conn()` itself | 3 | 1 |
+| `app/db/conn.py` | 4 | `PRAGMA`s in SQLAlchemy's **connect-event handlers**. They run on the raw DBAPI connection by design — there is no `text()` to be had there. |
+| `app/web/deps.py` | 3 | the same three inside `get_conn()`. These do not become portable; they go when `get_conn()` does. |
+| `app/db/schema.py` | 1 | `PRAGMA database_list`, `_ensure`'s memo key. SQLite-only by construction, guarded by a dialect check at every caller. |
+
+**This is the finish line, and it is a test rather than a note.**
+`tests/test_sql_portability.py` holds three scans: one fails on any new raw
+statement outside that list, one fails when a listed file stops having them, and
+a positive control — because this scan's healthy result is a short known list,
+which looks exactly like a scan that has stopped reading the tree. All three
+were mutation-tested: a planted `?`-statement in `assets.py` fails the first, a
+bogus `STILL_RAW` entry fails the second.
 
 **Some of what is left is not a conversion.** `bootstrap.py` runs before the app
 exists and needs filesystem access to the database — that is the property that

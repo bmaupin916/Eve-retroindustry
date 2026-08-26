@@ -280,20 +280,27 @@ def test_market_token_provider_ignores_expired_tokens(app_module):
 
 
 def test_market_token_provider_is_cached(app_module):
-    """A burst of market pages must cost one query, not one per request."""
-    calls = []
-    real_get_conn = app_module.get_conn
+    """A burst of market pages must cost one query, not one per request.
 
-    def counting():
+    The spy follows the connection, not the name. It watched `get_conn` until
+    v0.9.74, when `_market_bucket_token` moved onto the portable query layer and
+    started calling `_connect` — at which point the spy counted zero and the
+    test failed. That is the right failure: a counter that silently observes
+    nothing would have kept passing while the caching regressed.
+    """
+    calls = []
+    real_connect = app_module._connect
+
+    def counting(*a, **kw):
         calls.append(1)
-        return real_get_conn()
+        return real_connect(*a, **kw)
 
     app_module._market_token_cache.update({"token": None, "until": 0.0})
-    app_module.get_conn = counting
+    app_module._connect = counting
     try:
         for _ in range(50):
             app_module._market_bucket_token()
     finally:
-        app_module.get_conn = real_get_conn
+        app_module._connect = real_connect
         app_module._market_token_cache.update({"token": None, "until": 0.0})
     assert len(calls) == 1, calls

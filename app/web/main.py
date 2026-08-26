@@ -115,7 +115,9 @@ from app.character.skills import (
     get_mfg_skill_ids,
 )
 from app.db import conn as db_conn
-from app.db.conn import connect as _connect
+from sqlalchemy import bindparam, text
+
+from app.db.conn import NO_SUCH_TABLE, connect as _connect
 from app.db.migrate import upgrade_to_head
 from app.db.schema import create_sde_schema
 from app.sync import worker as sync_worker
@@ -228,11 +230,12 @@ async def _security_gate(request: Request, call_next):
     if security.is_public_path(path):
         return await call_next(request)
 
-    conn = get_conn()
-    try:
-        session = security.load_session(conn, request.cookies.get(security.SESSION_COOKIE))
-    finally:
-        conn.close()
+    # `security` is on the portable query layer, so this is an engine connection
+    # rather than the raw handle. It runs on **every** non-public request, which
+    # is why it is a short `with` and not something held across `call_next`.
+    with _connect() as _sc:
+        session = security.load_session(
+            _sc, request.cookies.get(security.SESSION_COOKIE))
 
     if session is None:
         return _deny(request, 401, "Not authenticated")
@@ -292,11 +295,16 @@ async def _startup_populate_groups():
         print(f"[sde] could not create the static-data tables: {exc}", flush=True)
 
     try:
-        conn = get_conn()
-        try:
-            count = conn.execute("SELECT COUNT(*) FROM sde_types").fetchone()[0]
-        except sqlite3.OperationalError:
-            count = 0
+        with _connect() as conn:
+            try:
+                count = conn.execute(
+                    text("SELECT COUNT(*) FROM sde_types")).fetchone()[0]
+            except NO_SUCH_TABLE:
+                # Portable pair, not `sqlite3.OperationalError`: this runs on a
+                # database that may have no SDE tables yet, and Postgres raises
+                # ProgrammingError for the same condition.
+                conn.rollback()
+                count = 0
 
         _SDE_READY[0] = count > 0
         if _SDE_READY[0]:
@@ -349,7 +357,8 @@ async def _fetch_wallet_balance(
     """Returns ISK wallet balance, using a 5-min SQLite cache."""
     now = _time.time()
     row = conn.execute(
-        "SELECT balance, cached_at FROM char_wallet_cache WHERE character_id=?", (char_id,)
+        text("SELECT balance, cached_at FROM char_wallet_cache"
+             " WHERE character_id=:cid"), {"cid": char_id},
     ).fetchone()
     if row and (now - row[1]) < _WALLET_CACHE_TTL:
         return row[0]
@@ -364,8 +373,13 @@ async def _fetch_wallet_balance(
             if r.status_code == 200:
                 balance = float(r.json())
                 conn.execute(
-                    "INSERT INTO char_wallet_cache (character_id, balance, cached_at) VALUES (?,?,?) ON CONFLICT (character_id) DO UPDATE SET balance=excluded.balance, cached_at=excluded.cached_at",
-                    (char_id, balance, now),
+                    text("INSERT INTO char_wallet_cache"
+                         " (character_id, balance, cached_at)"
+                         " VALUES (:cid, :balance, :cached_at)"
+                         " ON CONFLICT (character_id) DO UPDATE SET"
+                         " balance=excluded.balance,"
+                         " cached_at=excluded.cached_at"),
+                    {"cid": char_id, "balance": balance, "cached_at": now},
                 )
                 conn.commit()
                 return balance
@@ -398,17 +412,16 @@ def _market_bucket_token() -> str | None:
         return _market_token_cache["token"]
     token: str | None = None
     try:
-        conn = get_conn()
-        try:
+        with _connect() as conn:
             row = conn.execute(
-                "SELECT access_token FROM characters"
-                " WHERE access_token IS NOT NULL AND token_expires_at > ?"
-                " ORDER BY token_expires_at DESC LIMIT 1",
-                (now + 30,),          # margin, so it cannot expire mid-flight
+                text("SELECT access_token FROM characters"
+                     " WHERE access_token IS NOT NULL"
+                     "   AND token_expires_at > :cutoff"
+                     " ORDER BY token_expires_at DESC LIMIT 1"),
+                # margin, so it cannot expire mid-flight
+                {"cutoff": now + 30},
             ).fetchone()
             token = row[0] if row and row[0] else None
-        finally:
-            conn.close()
     except Exception:
         token = None
     # Cached even when None: with nobody logged in this would otherwise hit the
@@ -524,14 +537,16 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
 
     # Blueprint group_ids — exclude from net worth (matches in-game behavior)
     bp_group_ids: set[int] = {
-        r[0] for r in conn.execute(
+        r[0] for r in conn.execute(text(
             "SELECT group_id FROM sde_groups WHERE name LIKE '%Blueprint%'"
-        ).fetchall()
+        )).fetchall()
     }
     type_group: dict[int, int] = {
         r[0]: r[1] for r in conn.execute(
-            f"SELECT type_id, group_id FROM sde_types WHERE type_id IN ({','.join('?' * len(all_type_ids_set))})",
-            list(all_type_ids_set),
+            text("SELECT type_id, group_id FROM sde_types"
+                 " WHERE type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(all_type_ids_set)},
         ).fetchall()
     } if all_type_ids_set else {}
 
@@ -629,19 +644,29 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
             except Exception:
                 pass
         if _skill_ids:
-            _ph = ",".join("?" * len(_skill_ids))
             skill_names = {r[0]: r[1] for r in conn.execute(
-                f"SELECT type_id, name FROM sde_types WHERE type_id IN ({_ph})", list(_skill_ids)
+                text("SELECT type_id, name FROM sde_types"
+                     " WHERE type_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": list(_skill_ids)},
             ).fetchall()}
 
     # Per-character cards.
     for cid, cname in chars:
         char_row = char_rows[cid]
+        # Counted in Python rather than by `json_array_length(data_json)`.
+        # SQLite applies that function to a TEXT column happily; Postgres has
+        # the function but not for `text` — it wants an explicit `::json` cast,
+        # so the SQL would have had to differ per backend. One row per
+        # character, so reading the blob costs nothing worth a dialect branch.
         bp_row = conn.execute(
-            "SELECT json_array_length(data_json) FROM char_blueprints_cache WHERE character_id=?",
-            (cid,),
+            text("SELECT data_json FROM char_blueprints_cache"
+                 " WHERE character_id=:cid"), {"cid": cid},
         ).fetchone()
-        bp_count = bp_row[0] if bp_row and bp_row[0] else 0
+        try:
+            bp_count = len(json.loads(bp_row[0])) if bp_row and bp_row[0] else 0
+        except (TypeError, ValueError):
+            bp_count = 0
 
         assets = assets_by_char.get(cid, [])         # non-singleton, for counts
         all_assets = all_assets_by_char.get(cid, [])  # all items, for value
@@ -687,7 +712,8 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
         _ship_type = _ship.get("ship_type_id")
         if _ship_type:
             _ship_type_name = conn.execute(
-                "SELECT name FROM sde_types WHERE type_id=?", (_ship_type,)
+                text("SELECT name FROM sde_types WHERE type_id=:tid"),
+                {"tid": _ship_type},
             ).fetchone()
             ship_label = _container_display_name(
                 _ship.get("ship_name") or "",
@@ -784,11 +810,8 @@ async def dashboard(request: Request):
     """Instant render from cache/DB only — no ESI. The ESI-backed fields load
     afterwards via /api/dashboard/live, so a slow or rate-limited ESI can never
     make the dashboard (and the app) look frozen."""
-    conn = get_conn()
-    try:
+    with _connect() as conn:
         ctx = await _compute_dashboard(request, conn, live=False)
-    finally:
-        conn.close()
     ctx["login_busy"] = request.query_params.get("login_busy") == "1"
     return _tr("index.html", request, ctx)
 
@@ -797,11 +820,8 @@ async def dashboard(request: Request):
 async def api_dashboard_live(request: Request):
     """ESI-backed dashboard data (corp names, wallet, location, skill queue,
     refined prices), fetched by the dashboard right after the instant render."""
-    conn = get_conn()
-    try:
+    with _connect() as conn:
         ctx = await _compute_dashboard(request, conn, live=True)
-    finally:
-        conn.close()
     if not ctx["logged_in"]:
         return {"logged_in": False}
 

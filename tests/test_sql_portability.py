@@ -314,3 +314,110 @@ def test_the_scan_asks_sqlalchemy_which_column_the_database_fills():
         "a natural key is not filled by the database, and an insert that omits "
         "it really is broken"
     )
+
+
+# ── the query conversion's finish line ───────────────────────────────────────
+
+#: The only places in `app/` still allowed to hand a raw string to
+#: `.execute()` — every one is a `PRAGMA` on a DBAPI connection, and none of
+#: them is a query.
+#:
+#: * `app/db/conn.py` — the pragmas that make SQLite usable under the sync
+#:   worker (WAL, busy_timeout, synchronous). They hang off SQLAlchemy's
+#:   *connect event*, which hands you the raw DBAPI connection by design: there
+#:   is no `text()` to be had there, and nothing to convert.
+#: * `app/web/deps.py` — the same three inside `get_conn()`, the raw handle the
+#:   routers are still being weaned off. These do not become portable; they go
+#:   when `get_conn()` does.
+#: * `app/db/schema.py` — `PRAGMA database_list`, the memo key that tells
+#:   `_ensure` which database file it is looking at. SQLite-only by
+#:   construction, which is why every caller guards it with a dialect check.
+STILL_RAW = {
+    "app/db/conn.py": 4,
+    "app/web/deps.py": 3,
+    "app/db/schema.py": 1,
+}
+
+
+def _raw_execute_sites() -> dict[str, int]:
+    """Every `.execute`/`.executemany` in `app/` whose first argument is a
+    literal string or f-string, counted per file.
+
+    An AST walk rather than a grep, for the reason recorded in the worklist: a
+    grep for `conn.execute("` found two of these in one file where the AST found
+    four, because most of them span lines. `ast.Constant` catches the plain
+    strings and `ast.JoinedStr` the f-strings, which is where the `IN ({ph})`
+    placeholder patterns lived.
+    """
+    counts: dict[str, int] = {}
+    for path in sorted((REPO / "app").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        n = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("execute", "executemany")
+            and node.args
+            and isinstance(node.args[0], (ast.Constant, ast.JoinedStr))
+        )
+        if n:
+            counts[path.relative_to(REPO).as_posix()] = n
+    return counts
+
+
+def test_the_raw_statement_scan_still_sees_something():
+    """A positive control. This scan's healthy result is a short, known list —
+    which is indistinguishable from a scan that has stopped parsing the tree."""
+    counts = _raw_execute_sites()
+
+    assert counts, "the scan found no raw `.execute` anywhere, which cannot be right"
+    assert "app/db/conn.py" in counts, (
+        "the scan missed the connect-event pragmas, so it is not reading the "
+        "tree it thinks it is")
+
+
+def test_only_the_pragma_sites_still_pass_raw_strings_to_execute():
+    """The conversion is done, and this is what keeps it done.
+
+    It started at roughly 316 statements, and stood at 145 as recently as
+    v0.9.65. Everything else now goes through `text()` with named binds. What is
+    left is listed in `STILL_RAW` above and is not query code at all.
+
+    A new raw statement anywhere else is not a style question — it is a
+    statement that runs on SQLite and then fails, or silently behaves
+    differently, on Postgres. The four SQLite-only constructs this conversion
+    actually turned up were `PRAGMA database_list`, `sqlite_master`, `LIKE`'s
+    default case-insensitivity, and `json_array_length` over a TEXT column.
+    Only the first two announce themselves; the other two just quietly answer
+    differently.
+    """
+    counts = _raw_execute_sites()
+
+    unexpected = {f: n for f, n in counts.items() if f not in STILL_RAW}
+    assert not unexpected, (
+        "these hand raw strings to .execute() and are not on the pragma list:\n  "
+        + "\n  ".join(f"{f}: {n}" for f, n in sorted(unexpected.items()))
+        + "\nUse text() with named binds. If it really is a pragma on a DBAPI "
+          "connection, add it to STILL_RAW with a reason.")
+
+
+def test_the_pragma_list_is_all_still_real():
+    """A `STILL_RAW` entry for a file that no longer has raw statements is a
+    licence nobody is using — and the next person to add one there inherits it
+    silently.
+
+    Two exemption lists in this suite have gone stale already
+    (`test_sqlite_under_the_worker.py::PRAGMA_SITES`, twice), both caught by a
+    test of exactly this shape and neither by anyone remembering to look.
+    """
+    counts = _raw_execute_sites()
+
+    stale = sorted(f for f in STILL_RAW if f not in counts)
+    assert not stale, f"listed but no longer raw: {stale}"
+
+    wrong = {f: (STILL_RAW[f], counts[f]) for f in STILL_RAW
+             if f in counts and counts[f] != STILL_RAW[f]}
+    assert not wrong, (
+        "the counts moved, so something was added or removed beside a pragma:\n  "
+        + "\n  ".join(f"{f}: expected {exp}, found {got}"
+                      for f, (exp, got) in sorted(wrong.items())))

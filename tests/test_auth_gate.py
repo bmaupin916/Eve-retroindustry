@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 
 import pytest
+from sqlalchemy import text
 from fastapi.testclient import TestClient
 
 from app.web import security
@@ -21,11 +22,18 @@ OTHER_CHARACTER_ID = 900000002
 
 @pytest.fixture
 def conn(app_module):
-    c = app_module.get_conn()
-    try:
+    """An engine connection.
+
+    This yielded a raw `get_conn()` handle until v0.9.74. `app/web/security.py`
+    and `app/web/bootstrap.py` both moved onto the portable query layer in that
+    change, and between them they are what almost every test in this file calls
+    — so a second `conn` fixture existed for about ten minutes before it
+    became obvious the right move was to convert this one.
+    """
+    from app.db.conn import connect
+
+    with connect() as c:
         yield c
-    finally:
-        c.close()
 
 
 @pytest.fixture
@@ -107,8 +115,8 @@ def test_a_valid_session_gets_through(client):
 def test_an_expired_session_is_refused_and_deleted(app_module, conn):
     session_id, _ = security.create_session(conn, OWNER_CHARACTER_ID)
     conn.execute(
-        "UPDATE app_sessions SET last_seen_at = ? WHERE session_id = ?",
-        (time.time() - security.SESSION_MAX_AGE - 1, session_id),
+        text("UPDATE app_sessions SET last_seen_at = :t WHERE session_id = :sid"),
+        {"t": time.time() - security.SESSION_MAX_AGE - 1, "sid": session_id},
     )
     conn.commit()
 
@@ -344,8 +352,9 @@ def test_a_stale_bootstrap_token_is_refused(app_module, conn, monkeypatch):
     from app.web import bootstrap
 
     token = bootstrap.issue_token(conn, OWNER_CHARACTER_ID)
-    conn.execute("UPDATE app_bootstrap SET created_at = ? WHERE token = ?",
-                 (time.time() - bootstrap.TOKEN_TTL - 1, token))
+    conn.execute(
+        text("UPDATE app_bootstrap SET created_at = :t WHERE token = :token"),
+        {"t": time.time() - bootstrap.TOKEN_TTL - 1, "token": token})
     conn.commit()
     assert bootstrap.redeem_token(conn, token) is None
 
