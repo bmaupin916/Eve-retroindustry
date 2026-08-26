@@ -35,13 +35,27 @@ class BlueprintCache(Base):
 # leaves pooled connections holding the old inode and raises
 # "(sqlite3.OperationalError) attempt to write a readonly database"
 # (SQLITE_READONLY_DBMOVED) on the next INSERT.
-engine = create_engine(
-    database_url(),
-    poolclass=NullPool,
+#
+# **`timeout` is a `sqlite3.connect` argument and must not be sent to psycopg.**
+# It was passed unconditionally until v0.9.75, so on Postgres this module raised
+# `ProgrammingError: invalid connection option "timeout"` — at *import*, because
+# `create_all` below connects. `app/web/main.py` imports `get_session` from
+# here, so the whole application failed to start on Postgres and no page could
+# be served. Nothing caught it: every route test binds SQLite, and the
+# cross-backend files drive functions rather than the app.
+_url = database_url()
+_connect_args = (
     # 30s busy timeout so these writes don't raise "database is locked" when the
     # add-character background sync and token refreshes are writing concurrently.
-    connect_args={"timeout": 30.0},
+    {"timeout": 30.0} if _url.startswith("sqlite") else {}
 )
+engine = create_engine(_url, poolclass=NullPool, connect_args=_connect_args)
+
+# Both tables this declares (`type_cache`, `blueprint_cache`) are also in
+# `app/db/schema.py` and therefore in the migration history, so on a migrated
+# database this is a no-op that still costs a connection at import time. Left
+# in place rather than removed here: it is the fresh-install path for a database
+# that has never been migrated, and untangling that belongs in its own change.
 Base.metadata.create_all(engine)
 
 
