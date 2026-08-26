@@ -102,8 +102,9 @@ def test_no_insert_or_replace_survives():
             offenders.append(f"{rel}:{_line_of(src, m.start())} (OR {m.group(1).upper()})")
     assert not offenders, (
         "SQLite-only INSERT forms: " + ", ".join(offenders)
-        + ". Use app.db.schema.upsert(), or an explicit "
-          "ON CONFLICT ... DO UPDATE / DO NOTHING clause."
+        + ". Use app.db.schema.upsert(), which returns named binds ready for "
+          "text() — `conn.execute(text(upsert(t, cols)), {col: value, ...})` — "
+          "or write an explicit ON CONFLICT ... DO UPDATE / DO NOTHING clause."
     )
 
 
@@ -154,10 +155,11 @@ def test_upsert_preserves_columns_it_was_not_asked_to_write(tmp_path):
     conn.execute(
         upsert("station_rigs", ["location_id", "me_bonus_pct", "updated_at",
                                 "structure_type", "rig1_type_id"]),
-        (60003760, 2.0, 0, "Raitaru", 43920))
+        {"location_id": 60003760, "me_bonus_pct": 2.0, "updated_at": 0,
+         "structure_type": "Raitaru", "rig1_type_id": 43920})
     conn.execute(
         upsert("station_rigs", ["location_id", "me_bonus_pct", "updated_at"]),
-        (60003760, 4.4, 1))
+        {"location_id": 60003760, "me_bonus_pct": 4.4, "updated_at": 1})
 
     row = conn.execute(
         "SELECT me_bonus_pct, structure_type, rig1_type_id FROM station_rigs").fetchone()
@@ -231,7 +233,8 @@ def test_the_security_status_cache_can_be_written_to_a_fresh_database(tmp_path):
     apply_schema(conn)
     conn.execute(
         upsert("solar_system_cache", ["system_id", "security_status", "cached_at"]),
-        (30000142, 0.9, int(time.time())))
+        {"system_id": 30000142, "security_status": 0.9,
+         "cached_at": int(time.time())})
     assert conn.execute("SELECT security_status FROM solar_system_cache").fetchone()[0] == 0.9
     conn.close()
 

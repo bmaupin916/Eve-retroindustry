@@ -972,8 +972,20 @@ def upsert(table: str, columns, update=None) -> str:
     declared primary key rather than repeated at the call site — there is
     already one source of truth for that.
 
-    Placeholders are `?`. When the store moves to Postgres this is the single
-    function that has to start emitting `%s`.
+    **Placeholders are named after their columns**, so the result goes straight
+    through `text()` on either backend and the caller binds a dict:
+
+        conn.execute(text(upsert("app_defaults", ["key", "value"])),
+                     {"key": k, "value": v})
+
+    It emitted `?` until v0.9.80, from back when 316 call sites passed tuples to
+    `sqlite3`. That count reached zero with the query conversion in v0.9.74, and
+    what was left was a helper nothing called which produced SQL this project
+    could no longer execute — `text()` reads `?` as literal SQL, so even SQLite
+    raised `Incorrect number of bindings supplied`, and psycopg never accepted
+    `?` at all. It stayed pointed-at, though: the failure message on
+    `test_no_insert_or_replace_survives` names this function as the fix, so the
+    advice a guard-rail gave you introduced the defect it existed to prevent.
     """
     t = metadata.tables[table]
     pk = [c.name for c in t.primary_key.columns]
@@ -986,7 +998,7 @@ def upsert(table: str, columns, update=None) -> str:
             f"{table} upsert must supply its whole key; missing {sorted(missing)}")
 
     assignments = list(update) if update is not None else [c for c in cols if c not in pk]
-    placeholders = ",".join("?" * len(cols))
+    placeholders = ", ".join(f":{c}" for c in cols)
     sql = (f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
            f"ON CONFLICT ({', '.join(pk)}) DO ")
     if not assignments:

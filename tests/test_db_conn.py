@@ -1,10 +1,12 @@
 """The connection layer the query rewrite targets.
 
 `app/db/conn.py` is the seam: one way to open the database, named binds that
-SQLAlchemy renders into whatever the driver speaks. Nothing uses it yet —
-`get_conn()` still hands out a raw `sqlite3.Connection` and 316 statements are
-written against that. These tests fix the behaviour the call sites will be
-moved onto, so the move is against something already known to work.
+SQLAlchemy renders into whatever the driver speaks. This file was written ahead
+of the move, when nothing used the seam and 316 statements were still written
+against a raw `sqlite3.Connection` from `get_conn()`; it fixed the behaviour the
+call sites would be moved onto, so the move ran against something already known
+to work. **That move finished in v0.9.74** — the count is zero and these tests
+now describe the layer everything uses, not one waiting for callers.
 
 The Postgres half runs only when a server is reachable; see
 `tests/test_postgres_schema.py` for how to start one.
@@ -166,16 +168,49 @@ def test_the_same_statement_runs_on_postgres(monkeypatch):
 
 
 @pytest.mark.skipif(not _pg_reachable(), reason="no Postgres reachable")
-def test_the_upsert_helper_still_emits_positional_placeholders():
-    """A gap worth stating rather than leaving as a surprise.
+def test_the_upsert_helper_is_usable_through_this_module(monkeypatch):
+    """The inverse of what this test asserted until v0.9.80.
 
-    `upsert()` emits `?` because its 316 callers pass tuples. Named binds are
-    what the rewrite converts them to, and until then the helper's output is
-    not directly usable through this module — `text()` would read `?` as
-    literal SQL.
+    It used to pin the `?` placeholders in place — `assert "?" in sql` — on the
+    stated grounds that "its 316 callers pass tuples". The query conversion took
+    that count to zero in v0.9.74, which left the assertion locking a
+    non-portable form into a helper nothing called, and telling anyone who tried
+    to fix it that the old behaviour was correct.
+
+    Executed rather than string-matched, because the failure being guarded
+    against is precisely that the output *looks* fine and does not run: `text()`
+    reads `?` as literal SQL, so the old form raised `Incorrect number of
+    bindings supplied` even on SQLite, and psycopg never accepted `?` at all.
     """
+    from sqlalchemy import create_engine
+
     sql = upsert("app_defaults", ["key", "value"])
-    assert "?" in sql and ":" not in sql.split("ON CONFLICT")[0]
+    assert "?" not in sql
+
+    setup = create_engine(PG_URL)
+    with setup.connect() as c:
+        c.execute(text("DROP SCHEMA IF EXISTS pytest_upsert CASCADE"))
+        c.execute(text("CREATE SCHEMA pytest_upsert"))
+        c.execute(text("CREATE TABLE pytest_upsert.app_defaults "
+                       "(key TEXT PRIMARY KEY, value TEXT)"))
+        c.commit()
+    setup.dispose()
+
+    monkeypatch.setenv(
+        "EVE_DATABASE_URL",
+        PG_URL + ("&" if "?" in PG_URL else "?")
+        + "options=-csearch_path%3Dpytest_upsert")
+    db.dispose()
+    try:
+        with db.connect() as c:
+            c.execute(text(sql), {"key": "sell_venue", "value": "npc"})
+            c.execute(text(sql), {"key": "sell_venue", "value": "upwell"})
+            c.commit()
+            got = c.execute(text("SELECT value FROM app_defaults WHERE key = :k"),
+                            {"k": "sell_venue"}).scalar()
+        assert got == "upwell", "the ON CONFLICT arm did not update the row"
+    finally:
+        db.dispose()
 
 
 # ── the conversion does not have to be atomic ────────────────────────────────

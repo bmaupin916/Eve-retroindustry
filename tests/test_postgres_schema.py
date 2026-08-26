@@ -144,26 +144,21 @@ def test_the_upsert_helper_runs_on_postgres(pg):
 
     from app.db.schema import upsert
 
-    def named(sql: str) -> str:
-        """`?` -> `:p0, :p1, ...`.
-
-        The helper still emits positional placeholders because 316 call sites
-        pass tuples; SQLAlchemy wants named binds. Closing that gap for real is
-        the query rewrite. Doing it here keeps this test about the upsert rather
-        than about placeholders.
-        """
-        for i in range(sql.count("?")):
-            sql = sql.replace("?", f":p{i}", 1)
-        return sql
-
-    full = named(upsert("station_rigs", ["location_id", "me_bonus_pct", "updated_at",
-                                         "structure_type", "rig1_type_id"]))
-    partial = named(upsert("station_rigs", ["location_id", "me_bonus_pct", "updated_at"]))
+    # This test used to carry a local `?` -> `:p0, :p1` shim, because the helper
+    # emitted positional placeholders "while 316 call sites pass tuples". Those
+    # call sites reached zero in v0.9.74 and the helper emits named binds as of
+    # v0.9.80, so the statement now goes straight into `text()` — which is the
+    # thing this test is supposed to be demonstrating.
+    full = upsert("station_rigs", ["location_id", "me_bonus_pct", "updated_at",
+                                   "structure_type", "rig1_type_id"])
+    partial = upsert("station_rigs", ["location_id", "me_bonus_pct", "updated_at"])
 
     with pg.connect() as conn:
-        conn.execute(text(full), {"p0": 60003760, "p1": 2.0, "p2": 0,
-                                  "p3": "Raitaru", "p4": 43920})
-        conn.execute(text(partial), {"p0": 60003760, "p1": 4.4, "p2": 1})
+        conn.execute(text(full), {"location_id": 60003760, "me_bonus_pct": 2.0,
+                                  "updated_at": 0, "structure_type": "Raitaru",
+                                  "rig1_type_id": 43920})
+        conn.execute(text(partial), {"location_id": 60003760,
+                                     "me_bonus_pct": 4.4, "updated_at": 1})
         conn.commit()
         row = conn.execute(text(
             "SELECT me_bonus_pct, structure_type, rig1_type_id FROM station_rigs"

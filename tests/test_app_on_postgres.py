@@ -26,6 +26,7 @@ quietly measure SQLite and pass.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -40,9 +41,19 @@ PROBE = REPO / "tests" / "_app_on_postgres_probe.py"
 def probe_run() -> subprocess.CompletedProcess:
     """Run the probe once; every assertion below reads the same result."""
     assert PROBE.is_file(), f"the probe script is missing: {PROBE}"
+    # `encoding="utf-8"` sets how the *parent* decodes; it says nothing about
+    # how the child encodes. On Windows the child defaults to the console
+    # codepage, so the em-dash this codebase prints everywhere goes out as
+    # cp1252 `0x97`, the parent's UTF-8 decoder raises inside the reader
+    # thread, and `run.stdout` comes back empty — the RESULT line is simply
+    # gone. It surfaced as an intermittent failure of two assertions that
+    # never touch encodings, and only in a full-suite run, because whether any
+    # non-ASCII line gets printed at all depends on which paths the app takes.
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     return subprocess.run(
         [sys.executable, str(PROBE)],
         cwd=REPO, capture_output=True, text=True, encoding="utf-8", timeout=600,
+        env=env,
     )
 
 
