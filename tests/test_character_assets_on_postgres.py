@@ -3,7 +3,7 @@
 The coverage probe says nine of its functions are never executed by the suite:
 `fetch_assets`, `fetch_corp_assets`, `_save_cache`, `_save_corp_cache`,
 `_load_corp_cache`, `assets_at_location`, `assets_at_locations`,
-`ensure_assets_table` and `ensure_corp_assets_table`. Both cache writers and
+the two cache writers, and
 both fetchers, in other words — and `tests/test_sync_worker.py` monkeypatches
 the fetchers onto the worker module, which is why the worker is well covered
 while these never run.
@@ -171,16 +171,6 @@ def test_both_backends_are_actually_exercised(conn):
             text(f"SELECT COUNT(*) FROM {table}")).fetchone()[0] == 0
 
 
-def test_the_schema_shims_are_safe_on_either_backend(conn):
-    """Both forward to `PRAGMA database_list`, which is a syntax error on
-    Postgres. The dialect guard is what makes them safe to keep calling."""
-    assets_api.ensure_assets_table(conn)
-    assets_api.ensure_corp_assets_table(conn)
-
-    assert conn.execute(
-        text("SELECT COUNT(*) FROM char_assets_cache")).fetchone()[0] == 0
-
-
 # ── the character cache ──────────────────────────────────────────────────────
 
 def test_saved_assets_read_back(conn):
@@ -244,6 +234,36 @@ def test_a_corrupt_cache_reads_as_unsynced(conn):
     conn.commit()
 
     assert assets_api.load_cached_assets(conn, CHAR) == (None, 0.0)
+
+
+@pytest.mark.parametrize("payload, shape", [
+    ('{"item_id": 1}', "an object where a list belongs — iterating it yields keys"),
+    ('[null]', "a list holding null"),
+    ('[1, 2]', "a list of bare numbers"),
+])
+def test_a_non_dict_entry_reads_as_never_synced(conn, payload, shape):
+    """The sibling of `test_a_non_dict_entry_reads_as_never_synced` in the
+    blueprints file, and here for a reason worth stating.
+
+    That one was a live 500 until v0.9.76. This one never was — but only by
+    accident of line ordering: `_parse_assets` opens with `item["item_id"]`, so
+    a non-dict entry raises `TypeError` and the handler catches it, while
+    `_parse_blueprints` opens with `item.get(...)` and raised `AttributeError`,
+    which it did not. The two parsers are otherwise identical.
+
+    So this asserts a property that currently holds for the wrong reason. Moving
+    `location_flag` above `item_id` in `_parse_assets` — an ordinary,
+    apparently harmless edit — would turn a graceful "never synced" into a 500
+    on `/assets`. Both readers now catch both exceptions, and this test is what
+    notices if that changes.
+    """
+    conn.execute(
+        text("INSERT INTO char_assets_cache (character_id, data_json, cached_at)"
+             " VALUES (:cid, :data, :at)"),
+        {"cid": CHAR, "data": payload, "at": time.time()})
+    conn.commit()
+
+    assert assets_api.load_cached_assets(conn, CHAR) == (None, 0.0), shape
 
 
 def test_the_read_path_ignores_the_ttl(conn):

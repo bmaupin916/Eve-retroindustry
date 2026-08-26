@@ -193,11 +193,17 @@ def test_both_backends_are_actually_exercised(conn):
         text("SELECT COUNT(*) FROM char_skills_cache")).fetchone()[0] == 0
 
 
-def test_the_schema_shims_are_a_no_op_on_postgres(conn):
-    """Both shims forward to `PRAGMA database_list`, which is a syntax error
-    off SQLite. The guard is what makes them safe to keep calling."""
+def test_the_schema_shim_is_a_no_op_on_postgres(conn):
+    """`ensure_characters_table` forwards to `PRAGMA database_list`, which is a
+    syntax error off SQLite. The dialect guard is what makes it safe to keep
+    calling.
+
+    It used to check `skills_api.ensure_skills_table` too. That one had no
+    caller left anywhere in `app/` — migrations replaced these per-table shims
+    back when the schema got one home — and was removed in v0.9.76 along with
+    five siblings in the same state.
+    """
     ts.ensure_characters_table(conn)
-    skills_api.ensure_skills_table(conn)
 
     assert conn.execute(text("SELECT COUNT(*) FROM characters")).fetchone()[0] == 0
 

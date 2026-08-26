@@ -406,6 +406,16 @@ def _store_pi_cache_for_chars(conn: sqlite3.Connection, char_ids, entries) -> No
             # calls — every entry's character is in `char_ids`. It fires within
             # one batch: two extractor pins on the same planet pulling the same
             # P0 collide on the key, and the later row wins.
+            #
+            # **Keeping the later expiry is a decision, reviewed 2026-08-26.**
+            # The cache holds one row per (character, planet, product), so when
+            # a colony runs two heads on the same P0 only one countdown
+            # survives, and this picks the one that expires last. The
+            # alternative — showing the sooner — would make the dashboard nag
+            # about a head while the other is still producing, and the tile is
+            # there to say "this colony needs attention soon", not to enumerate
+            # heads. `test_two_extractors_on_one_planet_collapse_to_a_single_row`
+            # pins it, so changing it means changing that test on purpose.
             _pc.execute(
                 text("INSERT INTO pi_extractor_cache"
                      " (char_id, char_name, planet_id, planet_name,"

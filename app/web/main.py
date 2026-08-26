@@ -3,117 +3,35 @@ from __future__ import annotations
 
 from app.version import APP_VERSION  # single source of truth (app/version.py)
 from app.web import security
-from app.web.security import ensure_sessions_table
 
 import asyncio
-import datetime
 import os
 import json
-import re
 import sqlite3
-import sys as _sys
-import threading
 import time as _time
-import zipfile as _zipfile
 
-import httpx
 from app.esi.client import (
-    esi_client, esi_error_message,
+    esi_client,
     set_market_token_provider as _esi_set_market_token_provider,
 )
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import (
-    HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse,
-)
-from urllib.parse import quote
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
-from app.auth.token_store import (
-    ensure_characters_table,
-    list_characters,
-    has_any_character,
-    get_character_row,
-    get_valid_token as _get_valid_token_for,
-    is_refresh_invalid,
-    delete_character,
-    update_corporation_id,
-    update_last_sync,
-)
-from app.auth.esi_oauth import begin_login, complete_login, callback_url, LoginError
-from app.character.blueprints import fetch_blueprints, ensure_bp_table
-from app.character import wallet as wallet_api
-from app.character import orders as orders_api
-from app.character import jobs as jobs_api
-from app.character import contracts as contracts_api
-from app.character import planets as planets_api
-from app.web import contracts_helper
-from app.web import pi_planner_helper
-from app.web import app_defaults
-from app.market.taxes import selling_costs
-from app.manufacturing import invention
-from app.manufacturing.margins import build_invention_params
-from app.web import margins_helper
-from app.web import reactions_helper
-from app.character.assets import (
-    fetch_assets, ensure_assets_table, assets_at_location,
-    fetch_corp_assets, ensure_corp_assets_table,
-)
-from app.db.type_resolver import resolve_names_bulk
-from app.esi.client import search_type_by_name
-from app.cache.blueprint_cache import resolve_type
-from app.db.database import get_session
-from app.manufacturing.planner import (
-    build_plan, find_blueprint_for_product, calc_job_time, format_duration,
-    MFG_IMPLANTS, MFG_IMPLANT_PCTS,
-)
-from app.bom.resolver import BOMResolver
-from app.market.prices import ensure_price_table, fetch_station_volumes, get_cached_station_volumes, get_station_volumes_any_age, fetch_structure_market, TRADE_HUBS, JITA_REGION
+# `list_characters`, `ACTIVE_COOKIE` and `get_conn` below are imported and not used
+# *here*. They are deliberate re-exports: the test suite reaches them as
+# `app_module.<name>`, so removing them breaks tests rather than tidying
+# anything. Everything else in this block was dead weight from the W6 split —
+# 113 unused imports, removed in v0.9.76 — and pyflakes should report exactly
+# these three and nothing more.
+from app.auth.token_store import list_characters, is_refresh_invalid
 from app.web.prices_helper import (
     get_prices_for_ids,
     get_cached_prices_for_ids,
     get_price_cache_stats,
-    refresh_jita_prices_all,
-    get_all_price_items,
-    set_custom_price,
-    stream_jita_refresh,
-    stream_hub_refresh,
-    get_hub_cache_stats,
-    get_all_hub_prices,
-    get_price_history,
 )
-from app.web.location_resolver import (
-    resolve_station_names_bulk,
-    load_location_names_from_db,
-    locations_in_system,
-    get_region_for_location,
-    get_security_status,
-)
-from app.web.industry_helper import (
-    ensure_industry_tables,
-    get_adjusted_prices,
-    get_sci_for_system,
-    get_station_me_bonus,
-    save_station_me_bonus,
-    get_station_te_multiplier,
-    get_station_me_bonus_pct,
-    get_station_me_multiplier,
-    get_station_facility,
-    get_product_te_multiplier,
-    get_station_cost_bonus,
-    populate_rig_bonuses,
-    get_rig_types,
-    save_station_rigs_full,
-    get_station_rigs_full,
-    _SCC,
-)
-from app.character.skills import (
-    ensure_skills_table,
-    fetch_skills,
-    fetch_skill_queue,
-    fetch_location,
-    fetch_ship,
-    get_cached_skills,
-    get_mfg_skill_ids,
-)
+from app.web.location_resolver import resolve_station_names_bulk
+from app.web.industry_helper import populate_rig_bonuses
+from app.character.skills import fetch_skill_queue, fetch_location, fetch_ship
 from app.db import conn as db_conn
 from sqlalchemy import bindparam, text
 
@@ -121,12 +39,6 @@ from app.db.conn import NO_SUCH_TABLE, connect as _connect
 from app.db.migrate import upgrade_to_head
 from app.db.schema import create_sde_schema
 from app.sync import worker as sync_worker
-from app.db.schema import (
-    ensure_schema as ensure_db_schema,
-    ensure_sde_schema,
-    forget_applied,
-    sde_index_ddl,
-)
 
 from app.web.deps import (
     all_characters,
@@ -134,34 +46,16 @@ from app.web.deps import (
     character_row,
     ACTIVE_COOKIE,
     STATIC_DIR,
-    TEMPLATES_DIR,
     _SDE_READY,
-    _age_short,
     _container_display_name,
-    _count_eu,
     _deny,
     _ensure_groups_populated,
-    _format_date,
-    _format_number,
-    _isk,
     _isk0,
     _load_assets_from_cache,
-    _load_blueprints_from_cache,
-    _load_corp_assets_from_cache,
-    _price_eu,
-    _resolve_party_names,
     _tr,
     _valid_token_async,
-    _ts_ago,
-    _ts_to_str,
-    _wants_html,
-    ensure_schema,
-    get_active_character,
     get_active_character_id,
-    get_active_token,
     get_conn,
-    get_token_for,
-    templates,
 )
 
 

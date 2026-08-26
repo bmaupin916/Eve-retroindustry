@@ -887,10 +887,15 @@ def test_two_extractors_on_one_planet_collapse_to_a_single_row(client, stub_pi, 
     corner case.
 
     Note what this pins, because it is a decision rather than an inevitability:
-    the surviving row carries the **last** pin's expiry, not the soonest. The
-    dashboard therefore counts down to one of the two heads. Worth revisiting —
-    an alert probably wants the earlier one — but it is pre-existing behaviour
-    and not something a query conversion should quietly change.
+    the surviving row carries the **last** pin's expiry, not the soonest.
+
+    **Reviewed and kept, 2026-08-26.** The cache holds one row per
+    (character, planet, product), so a colony running two heads on the same P0
+    gets one countdown, and it is the one that expires last. Showing the sooner
+    would make the tile nag about a single head while the other is still
+    producing; the tile exists to say "this colony needs attention soon", not to
+    enumerate heads. Changing it means changing this test on purpose, which is
+    the point of asserting the exact value rather than "some expiry".
     """
     early, late = _in(2), _in(40)
     stub_pi({4001: [

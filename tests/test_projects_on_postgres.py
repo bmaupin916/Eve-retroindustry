@@ -56,9 +56,17 @@ def _plan(product_id: int = 12005, qty: int = 1, materials=None, jobs=None) -> d
 def conn(request, tmp_path):
     """One connection per backend, schema built, torn down after."""
     if request.param == "sqlite":
-        engine = create_engine(f"sqlite:///{tmp_path / 'projects.db'}")
+        # `upgrade_to_head`, not `ph.ensure_project_tables`: that shim had no
+        # caller in `app/` and was removed in v0.9.76. The migrations are what
+        # build this schema everywhere else — including this fixture's Postgres
+        # half a few lines down — so using them here makes the two halves agree
+        # about where the tables come from.
+        from app.db.migrate import upgrade_to_head
+
+        url = f"sqlite:///{tmp_path / 'projects.db'}"
+        upgrade_to_head(url)
+        engine = create_engine(url)
         with engine.connect() as c:
-            ph.ensure_project_tables(c.connection.driver_connection)
             yield c
         engine.dispose()
         return

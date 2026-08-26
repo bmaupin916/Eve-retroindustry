@@ -26,11 +26,6 @@ from sqlalchemy.engine import Connection
 from app.db.schema import ensure_schema as ensure_db_schema
 
 
-def ensure_project_tables(conn) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
-
-
 def list_projects(conn: Connection) -> list[dict]:
     # Two LEFT JOINs off the same row is a cartesian product: a project with 2
     # plans and 3 shopping lines produces 6 rows, so a bare

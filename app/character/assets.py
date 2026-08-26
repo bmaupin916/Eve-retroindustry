@@ -26,16 +26,6 @@ class CharAsset:
     is_blueprint_copy:  bool   # True = BPC (blueprint copy with no market price)
 
 
-def ensure_assets_table(conn: Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees
-    it exists, and only on SQLite — `app/db/schema.py` memoises by asking
-    `PRAGMA database_list`, which is a syntax error on Postgres, where the
-    schema arrives through Alembic instead."""
-    if conn.engine.dialect.name != "sqlite":
-        return
-    ensure_db_schema(conn.connection.driver_connection)
-
-
 def _load_cache(conn: Connection, character_id: int) -> list[dict] | None:
     row = conn.execute(
         text("SELECT data_json, cached_at FROM char_assets_cache"
@@ -193,7 +183,15 @@ def load_cached_assets(conn: Connection,
         return None, 0.0
     try:
         return _parse_assets(json.loads(row[0])), float(row[1] or 0.0)
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError, AttributeError):
+        # `AttributeError` is here for symmetry with `load_cached_blueprints`,
+        # and it is not currently reachable from this parser — which is exactly
+        # why it is worth adding. `_parse_assets` happens to open with
+        # `item["item_id"]`, so a non-dict entry raises `TypeError`; its twin
+        # `_parse_blueprints` opens with `item.get(...)` and raised
+        # `AttributeError`, which escaped as a 500 until v0.9.76. One line's
+        # ordering was the whole difference. Catching both here means reordering
+        # these fields cannot reintroduce it.
         return None, 0.0
 
 
@@ -208,7 +206,7 @@ def load_cached_corp_assets(conn: Connection,
         return None, 0.0
     try:
         return _parse_assets(json.loads(row[0])), float(row[1] or 0.0)
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError, AttributeError):
         return None, 0.0
 
 
@@ -262,14 +260,6 @@ def _parse_assets(raw: list[dict]) -> list[CharAsset]:
             is_blueprint_copy  = item.get("is_blueprint_copy", False),
         ))
     return result
-
-
-def ensure_corp_assets_table(conn: Connection) -> None:
-    """Schema shim. See `ensure_assets_table` — SQLite-only for the same
-    reason."""
-    if conn.engine.dialect.name != "sqlite":
-        return
-    ensure_db_schema(conn.connection.driver_connection)
 
 
 def _load_corp_cache(conn: Connection, corporation_id: int) -> list[dict] | None:

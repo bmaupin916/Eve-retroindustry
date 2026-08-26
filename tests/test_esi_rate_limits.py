@@ -243,8 +243,16 @@ def test_market_token_provider_never_triggers_an_oauth_refresh(app_module, monke
         raise AssertionError("provider must not call get_valid_token")
 
     monkeypatch.setattr(ts, "get_valid_token", _boom)
-    monkeypatch.setattr(app_module, "_get_valid_token_for", _boom)
     monkeypatch.setattr(ts.httpx, "post", _boom)      # nor any HTTP of its own
+    # `raising=False` because `main.py` no longer binds this alias — it was one
+    # of 113 unused imports removed in v0.9.76. The guard stays anyway, and this
+    # is the one line in the test that cannot be dropped safely: a module-level
+    # `from ... import get_valid_token as _get_valid_token_for` binds the
+    # original function object, so patching `ts.get_valid_token` above would
+    # *not* catch a caller reaching it through main's own name. If that alias
+    # ever comes back, this makes calling it fail; while it is absent, it costs
+    # nothing.
+    monkeypatch.setattr(app_module, "_get_valid_token_for", _boom, raising=False)
 
     app_module._market_token_cache.update({"token": None, "until": 0.0})
     app_module._market_bucket_token()                  # must not raise

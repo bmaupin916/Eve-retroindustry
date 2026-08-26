@@ -1,7 +1,7 @@
 """`app/character/blueprints.py`, before it moves onto the portable query layer.
 
 The coverage probe finds three of its functions never executed by the suite:
-`_save_cache`, `_load_cache` and `ensure_bp_table` — the cache writer among
+`_save_cache` and `_load_cache` — the cache writer among
 them. `fetch_blueprints` shows as dead too, but that is the probe's known blind
 spot: `tests/test_sync_worker.py` monkeypatches it onto the *worker* module, so
 the worker is well covered while the real function never runs. It has no tests
@@ -14,9 +14,10 @@ Those two assertions stay where they are; everything below is new.
 **These assertions are unchanged by the conversion.** They were written against
 the `sqlite3` version first, so the rewrite could be judged by whether it
 preserves them rather than assembled first and described afterwards. Only the
-fixture underneath moved, and it now runs each of them on both backends — bar
-`test_ensure_bp_table_creates_the_cache_on_a_bare_sqlite_file`, which asks
-`sqlite_master` a question Postgres has no version of.
+fixture underneath moved, and it now runs every one of them on both backends.
+The one exception used to be a SQLite-only test of `ensure_bp_table`; that shim
+had no caller left in `app/` and went in v0.9.76 with five siblings in the same
+state, so there is no exception any more.
 
 Four things here are conversion traps rather than ordinary behaviour:
 
@@ -33,9 +34,10 @@ Four things here are conversion traps rather than ordinary behaviour:
   returns `(None, 0.0)`. `None` and `[]` mean different things everywhere in
   this codebase, and this is the path that decides which one bad JSON gets.
   Writing that test found a hole in it: a payload that parses but is not a
-  list of dicts raises `AttributeError`, which the tuple does not catch, so it
-  escapes to the page as a 500. Pinned below as a known gap rather than fixed
-  in passing — see `test_a_non_dict_entry_escapes_the_handler`.
+  list of dicts raised `AttributeError`, which the tuple did not catch, so it
+  escaped to the page as a 500. **Fixed in v0.9.76** — see
+  `test_a_non_dict_entry_reads_as_never_synced`, which was written asserting the
+  crash so the fix had to be a deliberate commit rather than a quiet one.
 * **`_save_cache` commits; `fetch_blueprints` does not commit separately.** The
   transaction boundary lives inside the writer. Moving it is invisible until a
   caller rolls back.
@@ -188,61 +190,6 @@ def test_both_backends_are_actually_exercised(conn):
 
 
 # ── the schema shim ──────────────────────────────────────────────────────────
-
-def test_ensure_bp_table_creates_the_cache_on_a_bare_sqlite_file(tmp_path):
-    """The one thing the shim promises: call it on a bare database and the
-    table is there afterwards.
-
-    SQLite only, and not because of the assertion — because the shim itself is.
-    `app/db/schema.py` memoises by asking `PRAGMA database_list`, so on Postgres
-    the function returns before doing anything and the schema arrives through
-    Alembic instead. The next test is the Postgres half of this one.
-    """
-    import sqlite3
-
-    def _exists(c) -> int:
-        return c.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
-            " AND name='char_blueprints_cache'").fetchone()[0]
-
-    raw = sqlite3.connect(str(tmp_path / "bare.db"))
-    try:
-        assert _exists(raw) == 0, (
-            "the database was not bare — this test would pass vacuously")
-    finally:
-        raw.close()
-
-    eng = create_engine(f"sqlite:///{tmp_path / 'bare.db'}")
-    try:
-        with eng.connect() as c:
-            bp_api.ensure_bp_table(c)
-            assert _exists(c.connection.driver_connection) == 1
-    finally:
-        eng.dispose()
-
-
-def test_the_shim_is_a_no_op_away_from_sqlite(conn):
-    """It forwards to `PRAGMA database_list`, which is a syntax error on
-    Postgres. The dialect guard is what makes it safe to keep calling, and
-    calling it must leave a working connection behind either way — on Postgres
-    a failed statement aborts the whole transaction, so a missing guard would
-    take out every query after it, not just this one."""
-    bp_api.ensure_bp_table(conn)
-
-    assert conn.execute(
-        text("SELECT COUNT(*) FROM char_blueprints_cache")).fetchone()[0] == 0
-
-
-def test_ensure_bp_table_is_safe_to_call_twice(conn):
-    """It runs on every request path that touches blueprints, so it has to be
-    idempotent — and it must not wipe what is already cached."""
-    bp_api._save_cache(conn, CHAR, [_bp(1)])
-
-    bp_api.ensure_bp_table(conn)
-    bp_api.ensure_bp_table(conn)
-
-    assert _rows(conn) == 1
-
 
 # ── the cache writer ─────────────────────────────────────────────────────────
 
@@ -401,27 +348,31 @@ def test_an_entry_missing_a_required_key_reads_as_never_synced(conn, missing):
     ('[null]', "a list holding null"),
     ('[1, 2]', "a list of bare numbers"),
 ])
-def test_a_non_dict_entry_escapes_the_handler(conn, payload, shape):
-    """**A known gap, pinned rather than fixed here.**
+def test_a_non_dict_entry_reads_as_never_synced(conn, payload, shape):
+    """**Fixed in v0.9.76. This test used to assert the crash.**
 
     `_parse_blueprints` reaches straight for `item.get(...)`, so anything in the
-    list that is not a dict raises `AttributeError` — and the handler above
-    catches only `ValueError`/`TypeError`/`KeyError`. The exception therefore
-    escapes to `/assets`, `/blueprints` and `/plan` as a 500 instead of reading
-    as never-synced like every other corrupt payload.
+    list that is not a dict raises `AttributeError` — and the handler caught only
+    `ValueError`/`TypeError`/`KeyError`. The exception escaped to `/assets`,
+    `/blueprints` and `/plan` as a **500** instead of reading as never-synced
+    like every other corrupt payload.
 
-    Only reachable through a cache that was written by something other than
-    `_save_cache`, which is why it has not been seen. Widening the tuple to
-    include `AttributeError` is a one-word fix, but it is a behaviour change and
-    belongs in its own commit rather than inside the conversion — this test is
-    here so that fix has to be deliberate, and it should flip to the assertion
-    above when it lands.
+    The test was written asserting `pytest.raises(AttributeError)` on purpose,
+    so that widening the tuple had to be a deliberate commit rather than
+    something smuggled into the query conversion. This is that commit, and this
+    is the assertion flipping.
+
+    **What made it this reader and not the assets one beside it is one line's
+    ordering.** `_parse_assets` opens with `item["item_id"]`, so a non-dict
+    raises `TypeError` and is caught; `_parse_blueprints` opens with
+    `item.get("quantity", -1)`, so the identical payload raises `AttributeError`
+    and was not. The two functions are otherwise the same. Both readers now
+    catch both, so the guarantee no longer depends on which access happens to
+    come first — an ordinary reorder of those fields would have reintroduced it.
     """
     _corrupt(conn, payload)
 
-    with pytest.raises(AttributeError):
-        bp_api.load_cached_blueprints(conn, CHAR)
-    assert shape
+    assert bp_api.load_cached_blueprints(conn, CHAR) == (None, 0.0), shape
 
 
 # ── parsing ──────────────────────────────────────────────────────────────────

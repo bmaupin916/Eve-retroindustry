@@ -95,15 +95,6 @@ def get_mfg_skill_ids(conn: Connection) -> set[int]:
     return science_ids | _GENERAL_SKILL_IDS
 
 
-def ensure_skills_table(conn: Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees
-    it exists, and only on SQLite — on Postgres the schema comes from Alembic
-    and `PRAGMA database_list` is a syntax error."""
-    if conn.engine.dialect.name != "sqlite":
-        return
-    ensure_db_schema(conn.connection.driver_connection)
-
-
 def _parse_blob(raw: str) -> tuple[int, dict[int, int]]:
     """Returns (version, skills_dict). Version 0 = old flat schema (filtered subset)."""
     try:

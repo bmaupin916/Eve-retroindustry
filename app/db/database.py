@@ -67,9 +67,13 @@ def harden_db_permissions() -> None:
     ID; the file with the actual secrets in it had no permissions set at all.
     Baseline finding 5.
 
-    Called on import and again from ensure_user_tables(), because the SDE download
-    replaces the file wholesale via shutil.move() and the replacement arrives with
-    whatever permissions the temp file had.
+    Called on import, because the SDE download replaces the file wholesale via
+    shutil.move() and the replacement arrives with whatever permissions the temp
+    file had. It used to be called from `ensure_user_tables()` as well — that
+    function had no caller anywhere and went in v0.9.76, its job (recreating
+    `type_cache` and `blueprint_cache` after the file is replaced) now done by
+    `upgrade_to_head()` at startup, since both tables are in the migration
+    history.
 
     On Windows this only clears the read-only bit — POSIX modes are not enforced —
     so it is effectively a no-op in desktop dev. The VPS is the target.
@@ -85,15 +89,3 @@ harden_db_permissions()
 
 def get_session() -> Session:
     return Session(engine)
-
-
-def ensure_user_tables() -> None:
-    """Re-runs Base.metadata.create_all on the live engine.
-
-    Necessary whenever eve_cache.db is replaced from outside (fresh-install
-    copy of bundled sde_base.db, /setup SDE download, …) — the bundled file
-    only has SDE tables, so the SQLAlchemy-managed user tables
-    (type_cache, blueprint_cache) must be recreated.
-    """
-    Base.metadata.create_all(engine)
-    harden_db_permissions()

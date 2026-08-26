@@ -28,16 +28,6 @@ class CharBlueprint:
     time_efficiency: int       # TE 0-20
 
 
-def ensure_bp_table(conn: Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees
-    it exists, and only on SQLite — `app/db/schema.py` memoises by asking
-    `PRAGMA database_list`, which is a syntax error on Postgres, where the
-    schema arrives through Alembic instead."""
-    if conn.engine.dialect.name != "sqlite":
-        return
-    ensure_db_schema(conn.connection.driver_connection)
-
-
 def _load_cache(conn: Connection, character_id: int) -> list[dict] | None:
     """The fetcher's reader, which enforces `CACHE_TTL`.
 
@@ -88,9 +78,23 @@ def load_cached_blueprints(conn: Connection,
         return None, 0.0
     try:
         return _parse_blueprints(json.loads(row[0])), float(row[1] or 0.0)
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError, AttributeError):
         # None, not [] — "never synced" and "owns none" are different answers
         # and the pages act differently on them.
+        #
+        # `AttributeError` was missing until v0.9.76, and a payload that parsed
+        # but was not a list of dicts therefore escaped as a **500** on
+        # `/assets`, `/blueprints` and `/plan` rather than reading as
+        # never-synced like every other corrupt payload.
+        #
+        # What made it *this* reader and not the assets one beside it is a
+        # single line's ordering, which is worth knowing because it is the kind
+        # of thing an innocuous refactor flips. `_parse_assets` opens with
+        # `item["item_id"]`, so a non-dict raises `TypeError` — caught.
+        # `_parse_blueprints` opens with `item.get("quantity", -1)`, so the same
+        # payload raises `AttributeError` — not caught. The two functions are
+        # otherwise identical. Catching both means the guarantee no longer
+        # depends on which access happens to come first.
         return None, 0.0
 
 
