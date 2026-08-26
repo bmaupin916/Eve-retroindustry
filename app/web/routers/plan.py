@@ -18,6 +18,8 @@ import sqlite3
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
+from sqlalchemy import bindparam, text
+
 from app.auth.token_store import get_character_row
 from app.bom.resolver import BOMResolver
 from app.cache.blueprint_cache import resolve_type
@@ -90,11 +92,12 @@ def _science_skill_mult(
         # from small joined tables; cache them on the function for the rest
         # of the process — sde_skill_time_bonus has only ~27 rows.
         if not hasattr(_science_skill_mult, "_bonus_cache"):
-            _science_skill_mult._bonus_cache = {  # type: ignore[attr-defined]
-                r[0]: r[1] for r in conn.execute(
-                    "SELECT skill_type_id, time_bonus_pct FROM sde_skill_time_bonus"
-                ).fetchall()
-            }
+            with _connect() as _bc:
+                _science_skill_mult._bonus_cache = {  # type: ignore[attr-defined]
+                    r[0]: r[1] for r in _bc.execute(text(
+                        "SELECT skill_type_id, time_bonus_pct"
+                        " FROM sde_skill_time_bonus")).fetchall()
+                }
         if not hasattr(_science_skill_mult, "_name_cache"):
             _science_skill_mult._name_cache = {}  # type: ignore[attr-defined]
         bonus_cache = _science_skill_mult._bonus_cache  # type: ignore[attr-defined]
@@ -102,12 +105,14 @@ def _science_skill_mult(
         # Lazily resolve names for skill_ids we haven't seen yet.
         missing = [sid for sid, _ in preloaded if sid not in name_cache]
         if missing:
-            ph = ",".join("?" * len(missing))
-            for sid, name in conn.execute(
-                f"SELECT type_id, name FROM sde_types WHERE type_id IN ({ph})",
-                missing,
-            ).fetchall():
-                name_cache[sid] = name
+            with _connect() as _nc:
+                for sid, name in _nc.execute(
+                    text("SELECT type_id, name FROM sde_types"
+                         " WHERE type_id IN :ids")
+                    .bindparams(bindparam("ids", expanding=True)),
+                    {"ids": missing},
+                ).fetchall():
+                    name_cache[sid] = name
         mult = 1.0
         details: list[tuple[str, int, float, int]] = []
         for sid, req_level in preloaded:
@@ -123,18 +128,19 @@ def _science_skill_mult(
 
     # Slow path — preloaded not available (single-blueprint callers).
     try:
-        rows = conn.execute(
-            """SELECT bs.skill_type_id,
+        with _connect() as _sc:
+            rows = _sc.execute(
+                text("""SELECT bs.skill_type_id,
                       COALESCE(st.skill_name, t.name) AS skill_name,
                       bs.required_level,
                       st.time_bonus_pct
                FROM sde_blueprint_skills bs
                LEFT JOIN sde_skill_time_bonus st ON st.skill_type_id = bs.skill_type_id
                LEFT JOIN sde_types t              ON t.type_id       = bs.skill_type_id
-               WHERE bs.blueprint_type_id = ? AND bs.activity = ?
-                 AND bs.skill_type_id NOT IN (3380, 3388)""",
-            (bp_type_id, activity),
-        ).fetchall()
+               WHERE bs.blueprint_type_id = :bp AND bs.activity = :activity
+                 AND bs.skill_type_id NOT IN (3380, 3388)"""),
+                {"bp": bp_type_id, "activity": activity},
+            ).fetchall()
     except Exception:
         return 1.0, []
 
@@ -186,7 +192,10 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
             char_skills = get_cached_skills(_sc, char_row["character_id"])
     product_param = request.query_params.get("product", "")
     if product_param.strip().isdigit():
-        row = conn.execute("SELECT name FROM sde_types WHERE type_id=?", (int(product_param),)).fetchone()
+        with _connect() as _pc:
+            row = _pc.execute(
+                text("SELECT name FROM sde_types WHERE type_id=:tid"),
+                {"tid": int(product_param)}).fetchone()
         if row:
             product_param = row[0]
     # Preserve station when switching character; otherwise fall back to the
@@ -206,9 +215,10 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
         prefill_station = str(_defaults["build_station_id"])
     prefill_station_name = ""
     if prefill_station:
-        row = conn.execute(
-            "SELECT name FROM location_name_cache WHERE location_id=?", (int(prefill_station),)
-        ).fetchone()
+        with _connect() as _lc:
+            row = _lc.execute(
+                text("SELECT name FROM location_name_cache WHERE location_id=:lid"),
+                {"lid": int(prefill_station)}).fetchone()
         if row:
             prefill_station_name = row[0]
     stock_default = int(prefill_station) if prefill_station else 0
@@ -236,7 +246,7 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
     })
 
 
-def _resolve_product_local(conn: sqlite3.Connection, query: str) -> tuple[int, str] | None:
+def _resolve_product_local(conn, query: str) -> tuple[int, str] | None:
     """Find a product's type_id by name in the local SDE.
 
     Strategy: exact → prefix → substring. Among candidates it prefers
@@ -244,20 +254,43 @@ def _resolve_product_local(conn: sqlite3.Connection, query: str) -> tuple[int, s
     then the shortest name. That way "Industrial Jump Portal Generator" hits
     "…Generator I" instead of its blueprint or a longer variant.
     Returns None if nothing matches.
+
+    **Every stage folds case explicitly, and that is a real change rather than a
+    translation.** This used to be case-insensitive for two separate
+    SQLite-specific reasons: `COLLATE NOCASE` on the exact match, and SQLite's
+    default where `LIKE` ignores ASCII case on the other two. Postgres has no
+    `NOCASE` collation *and* its `LIKE` is case-sensitive — so translating only
+    the visible half would have left every mixed-case product search broken
+    there, silently, with a green SQLite suite.
+
+    That was not reasoned out; it is what the measurement said. On SQLite,
+    dropping `COLLATE NOCASE` from the exact match changes nothing, because the
+    prefix stage catches the query anyway:
+
+        WHERE name = 'bantam'                        -> None
+        WHERE name LIKE 'bantam%' ORDER BY LENGTH…   -> (582, 'Bantam')
+
+    `LOWER()` on both sides is the portable form. It also widens the folding
+    slightly: SQLite's `NOCASE` folds ASCII only, while Postgres `LOWER()` is
+    locale-aware and folds Unicode. EVE type names are effectively ASCII so
+    nothing observable changes, but it is a difference, and it is written down
+    here rather than discovered later.
     """
     q = query.strip()
     if not q:
         return None
+    needle = q.lower()
 
     def _pick(rows: list[tuple]) -> tuple[int, str] | None:
         if not rows:
             return None
         producible = {
             r[0] for r in conn.execute(
-                "SELECT DISTINCT product_type_id FROM sde_blueprint_products"
-                " WHERE activity IN ('manufacturing','reaction')"
-                f"   AND product_type_id IN ({','.join('?' * len(rows))})",
-                [r[0] for r in rows],
+                text("SELECT DISTINCT product_type_id FROM sde_blueprint_products"
+                     " WHERE activity IN ('manufacturing','reaction')"
+                     "   AND product_type_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": [r[0] for r in rows]},
             ).fetchall()
         }
         # best = producible > published > shorter name > lower type_id
@@ -271,26 +304,27 @@ def _resolve_product_local(conn: sqlite3.Connection, query: str) -> tuple[int, s
 
     # 1) exact
     exact = conn.execute(
-        "SELECT type_id, name, published FROM sde_types WHERE name = ? COLLATE NOCASE",
-        (q,),
+        text("SELECT type_id, name, published FROM sde_types"
+             " WHERE LOWER(name) = :needle"),
+        {"needle": needle},
     ).fetchall()
     hit = _pick(exact)
     if hit:
         return hit
     # 2) prefix (limited so it doesn't explode on generic words)
     pref = conn.execute(
-        "SELECT type_id, name, published FROM sde_types"
-        " WHERE name LIKE ? COLLATE NOCASE LIMIT 200",
-        (q + "%",),
+        text("SELECT type_id, name, published FROM sde_types"
+             " WHERE LOWER(name) LIKE :pattern LIMIT 200"),
+        {"pattern": needle + "%"},
     ).fetchall()
     hit = _pick(pref)
     if hit:
         return hit
     # 3) substring
     sub = conn.execute(
-        "SELECT type_id, name, published FROM sde_types"
-        " WHERE name LIKE ? COLLATE NOCASE LIMIT 200",
-        ("%" + q + "%",),
+        text("SELECT type_id, name, published FROM sde_types"
+             " WHERE LOWER(name) LIKE :pattern LIMIT 200"),
+        {"pattern": "%" + needle + "%"},
     ).fetchall()
     return _pick(sub)
 
@@ -424,7 +458,8 @@ async def plan_result(
             # Exact → prefix → substring; prefers producible, published,
             # shortest name (so "Industrial Jump Portal Generator" hits
             # "…Generator I", not its blueprint).
-            local = _resolve_product_local(conn, product.strip())
+            with _connect() as _rc:
+                local = _resolve_product_local(_rc, product.strip())
 
         if local:
             type_id, type_name = local
@@ -513,16 +548,19 @@ async def plan_result(
         rxn_fac_tax_rate = rxn_fac_tax_pct / 100
 
         # Solar system ID of the manufacturing station
-        sys_row = conn.execute(
-            "SELECT solar_system_id FROM location_name_cache WHERE location_id=?", (station,)
-        ).fetchone()
+        with _connect() as _sc:
+            sys_row = _sc.execute(
+                text("SELECT solar_system_id FROM location_name_cache"
+                     " WHERE location_id=:lid"), {"lid": station}).fetchone()
         solar_system_id: int | None = sys_row[0] if sys_row and sys_row[0] else None
 
         # Solar system ID of the reaction station
         if sep_rxn_station:
-            rxn_sys_row = conn.execute(
-                "SELECT solar_system_id FROM location_name_cache WHERE location_id=?", (eff_rxn_station,)
-            ).fetchone()
+            with _connect() as _sc:
+                rxn_sys_row = _sc.execute(
+                    text("SELECT solar_system_id FROM location_name_cache"
+                         " WHERE location_id=:lid"),
+                    {"lid": eff_rxn_station}).fetchone()
             rxn_solar_system_id: int | None = rxn_sys_row[0] if rxn_sys_row and rxn_sys_row[0] else None
         else:
             rxn_solar_system_id = solar_system_id
@@ -704,27 +742,37 @@ async def plan_result(
         bp_time_idx: dict[int, tuple[int, int]] = {}
         bp_skills_idx: dict[tuple[int, str], list] = {}
         if all_bp_ids:
-            ph = ",".join("?" * len(all_bp_ids))
             ids_list = list(all_bp_ids)
-            for mid, q, act, bp in conn.execute(
-                f"SELECT material_type_id, quantity, activity, blueprint_type_id"
-                f"  FROM sde_blueprint_materials WHERE blueprint_type_id IN ({ph})",
-                ids_list,
-            ).fetchall():
-                bp_materials_idx.setdefault((bp, act), []).append((mid, q))
-            for bp, mtime, rtime in conn.execute(
-                f"SELECT blueprint_type_id, manufacturing_time, reaction_time"
-                f"  FROM sde_blueprints WHERE blueprint_type_id IN ({ph})",
-                ids_list,
-            ).fetchall():
-                bp_time_idx[bp] = (mtime, rtime)
-            for bp, act, sk_id, req_lvl in conn.execute(
-                f"SELECT blueprint_type_id, activity, skill_type_id, required_level"
-                f"  FROM sde_blueprint_skills WHERE blueprint_type_id IN ({ph})"
-                f"    AND skill_type_id NOT IN (3380, 3388)",
-                ids_list,
-            ).fetchall():
-                bp_skills_idx.setdefault((bp, act), []).append((sk_id, req_lvl))
+            _ids = bindparam("ids", expanding=True)
+            with _connect() as _bp:
+                for mid, q, act, bp in _bp.execute(
+                    text("SELECT material_type_id, quantity, activity,"
+                         " blueprint_type_id FROM sde_blueprint_materials"
+                         " WHERE blueprint_type_id IN :ids").bindparams(_ids),
+                    {"ids": ids_list},
+                ).fetchall():
+                    bp_materials_idx.setdefault((bp, act), []).append((mid, q))
+                for bp, mtime, rtime in _bp.execute(
+                    text("SELECT blueprint_type_id, manufacturing_time,"
+                         " reaction_time FROM sde_blueprints"
+                         " WHERE blueprint_type_id IN :ids").bindparams(_ids),
+                    {"ids": ids_list},
+                ).fetchall():
+                    bp_time_idx[bp] = (mtime, rtime)
+                # Industry (3380) and Advanced Industry (3388) are excluded on
+                # purpose: they scale job time for the whole plan and are read
+                # separately below. Left in, the science-skill multiplier
+                # applies them a second time and the plan reports a build
+                # faster than the game allows.
+                for bp, act, sk_id, req_lvl in _bp.execute(
+                    text("SELECT blueprint_type_id, activity, skill_type_id,"
+                         " required_level FROM sde_blueprint_skills"
+                         " WHERE blueprint_type_id IN :ids"
+                         "   AND skill_type_id NOT IN (3380, 3388)")
+                    .bindparams(_ids),
+                    {"ids": ids_list},
+                ).fetchall():
+                    bp_skills_idx.setdefault((bp, act), []).append((sk_id, req_lvl))
 
         # Memoize get_product_te_multiplier per (facility-id, type_id).
         # Same product appears across multiple steps when the resolver
@@ -868,13 +916,16 @@ async def plan_result(
         industry_required = 0
         adv_industry_required = 0
         if bp_ids_in_plan:
-            ph = ",".join("?" * len(bp_ids_in_plan))
-            req_rows = conn.execute(
-                f"SELECT skill_type_id, MAX(required_level) FROM sde_blueprint_skills"
-                f" WHERE blueprint_type_id IN ({ph}) AND skill_type_id IN (3380, 3388)"
-                f" GROUP BY skill_type_id",
-                tuple(bp_ids_in_plan),
-            ).fetchall()
+            with _connect() as _sk:
+                req_rows = _sk.execute(
+                    text("SELECT skill_type_id, MAX(required_level)"
+                         " FROM sde_blueprint_skills"
+                         " WHERE blueprint_type_id IN :ids"
+                         "   AND skill_type_id IN (3380, 3388)"
+                         " GROUP BY skill_type_id")
+                    .bindparams(bindparam("ids", expanding=True)),
+                    {"ids": list(bp_ids_in_plan)},
+                ).fetchall()
             for sid, lvl in req_rows:
                 if sid == 3380:
                     industry_required = int(lvl)
@@ -1189,10 +1240,12 @@ def _derive_job_splits(
         return {}
 
     bp_ids = {bp for bp, _ in seen.values()}
-    ph = ",".join("?" * len(bp_ids))
-    times = {r[0]: (r[1], r[2]) for r in conn.execute(
-        f"SELECT blueprint_type_id, manufacturing_time, reaction_time FROM sde_blueprints "
-        f"WHERE blueprint_type_id IN ({ph})", list(bp_ids))}
+    with _connect() as _tc:
+        times = {r[0]: (r[1], r[2]) for r in _tc.execute(
+            text("SELECT blueprint_type_id, manufacturing_time, reaction_time"
+                 " FROM sde_blueprints WHERE blueprint_type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(bp_ids)})}
 
     splits: dict[int, int] = {}
     # One connection for the whole loop: `get_product_te_multiplier` is called
@@ -1282,9 +1335,11 @@ def _plan_group_ids(conn: sqlite3.Connection, steps: list[dict]) -> dict[int, in
     ids = {job["type_id"] for step in steps for job in step["jobs"]}
     if not ids:
         return {}
-    ph = ",".join("?" * len(ids))
-    return {r[0]: r[1] for r in conn.execute(
-        f"SELECT type_id, group_id FROM sde_types WHERE type_id IN ({ph})", list(ids))}
+    with _connect() as _gc:
+        return {r[0]: r[1] for r in _gc.execute(
+            text("SELECT type_id, group_id FROM sde_types WHERE type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(ids)})}
 
 
 def _capital_group_lookup(conn: sqlite3.Connection, steps: list[dict]) -> set[int]:
@@ -1444,13 +1499,15 @@ def _plan_to_dict(plan, prices, type_name: str, conn: sqlite3.Connection | None 
     if conn is not None and plan.materials:
         ids = list({m.type_id for m in plan.materials})
         if ids:
-            ph = ",".join("?" * len(ids))
-            rows = conn.execute(
-                f"""SELECT t.type_id, g.name
-                    FROM sde_types t LEFT JOIN sde_groups g ON g.group_id = t.group_id
-                    WHERE t.type_id IN ({ph})""",
-                ids,
-            ).fetchall()
+            with _connect() as _gn:
+                rows = _gn.execute(
+                    text("""SELECT t.type_id, g.name
+                    FROM sde_types t LEFT JOIN sde_groups g
+                      ON g.group_id = t.group_id
+                    WHERE t.type_id IN :ids""")
+                    .bindparams(bindparam("ids", expanding=True)),
+                    {"ids": ids},
+                ).fetchall()
             group_names = {r[0]: (r[1] or "—") for r in rows}
 
     materials = []
