@@ -25,6 +25,8 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from sqlalchemy import text
+
 from app.esi.client import esi_client
 from app.db.conn import connect as _connect
 from app.auth.token_store import (
@@ -316,7 +318,7 @@ def _tr(name: str, request: Request, context: dict) -> HTMLResponse:
     return templates.TemplateResponse(request, name, context)
 
 
-async def _ensure_groups_populated(conn: sqlite3.Connection) -> None:
+async def _ensure_groups_populated(conn) -> None:
     """Populate sde_groups via ESI /universe/groups/{id}/ with concurrency limit.
 
     Top-up semantics: fetches only groups referenced by sde_types that are
@@ -325,11 +327,11 @@ async def _ensure_groups_populated(conn: sqlite3.Connection) -> None:
     existing users — and rig_applies_to_product's INNER JOIN on sde_groups
     then silently disabled all rig bonuses for those products.
     """
-    group_ids = [r[0] for r in conn.execute(
+    group_ids = [r[0] for r in conn.execute(text(
         """SELECT DISTINCT t.group_id FROM sde_types t
            LEFT JOIN sde_groups g ON g.group_id = t.group_id
            WHERE t.group_id > 0 AND t.published = 1 AND g.group_id IS NULL"""
-    ).fetchall()]
+    )).fetchall()]
     if not group_ids:
         return
 
@@ -354,34 +356,44 @@ async def _ensure_groups_populated(conn: sqlite3.Connection) -> None:
     async with esi_client() as client:
         results = await asyncio.gather(*[_fetch(client, gid) for gid in group_ids])
 
+    # Named columns rather than `INSERT INTO sde_groups VALUES (?,?)`: a
+    # positional insert binds to the table's column *order*, so adding a column
+    # to sde_groups would silently start writing the name into the wrong one.
     for row in results:
         if row:
-            conn.execute("INSERT INTO sde_groups VALUES (?,?) ON CONFLICT (group_id) DO UPDATE SET name=excluded.name", row)
+            conn.execute(
+                text("INSERT INTO sde_groups (group_id, name)"
+                     " VALUES (:group_id, :name)"
+                     " ON CONFLICT (group_id) DO UPDATE SET name=excluded.name"),
+                {"group_id": row[0], "name": row[1]})
     conn.commit()
 
 
-def _load_blueprints_from_cache(conn: sqlite3.Connection, char_id: int) -> list[dict]:
+def _load_blueprints_from_cache(conn, char_id: int) -> list[dict]:
     row = conn.execute(
-        "SELECT data_json FROM char_blueprints_cache WHERE character_id=?", (char_id,)
+        text("SELECT data_json FROM char_blueprints_cache"
+             " WHERE character_id=:cid"), {"cid": char_id},
     ).fetchone()
     if not row:
         return []
     return json.loads(row[0])
 
 
-def _load_assets_from_cache(conn: sqlite3.Connection, char_id: int) -> list[dict]:
+def _load_assets_from_cache(conn, char_id: int) -> list[dict]:
     """Load assets straight from the JSON cache without an ESI call."""
     row = conn.execute(
-        "SELECT data_json FROM char_assets_cache WHERE character_id=?", (char_id,)
+        text("SELECT data_json FROM char_assets_cache"
+             " WHERE character_id=:cid"), {"cid": char_id},
     ).fetchone()
     if not row:
         return []
     return json.loads(row[0])
 
 
-def _load_corp_assets_from_cache(conn: sqlite3.Connection, corp_id: int) -> list[dict]:
+def _load_corp_assets_from_cache(conn, corp_id: int) -> list[dict]:
     row = conn.execute(
-        "SELECT data_json FROM corp_assets_cache WHERE corporation_id=?", (corp_id,)
+        text("SELECT data_json FROM corp_assets_cache"
+             " WHERE corporation_id=:cid"), {"cid": corp_id},
     ).fetchone()
     if not row:
         return []

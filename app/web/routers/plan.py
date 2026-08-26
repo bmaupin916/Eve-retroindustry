@@ -182,7 +182,8 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
     location_ids = []
     char_skills: dict[int, int] = {}
     if char_row:
-        raw = _load_assets_from_cache(conn, char_row["character_id"])
+        with _connect() as _ac:
+            raw = _load_assets_from_cache(_ac, char_row["character_id"])
         location_ids = sorted({a["location_id"] for a in raw if not a.get("is_singleton", False)})
         # Cached either way now. The two branches used to differ — a signed-in
         # character got a live fetch and a token-less one got the cache — which
@@ -642,7 +643,8 @@ async def plan_result(
                                     rxn_facility=rxn_facility)
 
         all_ids = list(set(_collect_type_ids(root) + [type_id]))
-        prices = await get_prices_for_ids(conn, all_ids)
+        with _connect() as _pc:
+            prices = await get_prices_for_ids(_pc, all_ids)
 
         plan = build_plan(
             product_type_id=type_id,
@@ -1007,7 +1009,10 @@ async def plan_result(
     sell_loc = selling_station if selling_station else station
     station_sell_price: float | None = None
     if plan_data and plan_data.get("product_type_id"):
-        svols = get_cached_station_volumes(conn, sell_loc)
+        # `app/market/prices.py` moved onto the portable layer, so this takes an
+        # engine connection now rather than the router's raw `get_conn()` handle.
+        with _connect() as _vc:
+            svols = get_cached_station_volumes(_vc, sell_loc)
         if svols:
             entry = svols.get(plan_data["product_type_id"])
             if entry and entry[1]:
@@ -1143,7 +1148,8 @@ async def _build_stock_station_options(
     """
     if not plan_char_id:
         return []
-    raw = _load_assets_from_cache(conn, plan_char_id)
+    with _connect() as _ac:
+        raw = _load_assets_from_cache(_ac, plan_char_id)
     # Roll up container contents onto their station and skip ship cargo/fittings.
     station_types = _rollup_stock_from_cache(raw)
     if not station_types:

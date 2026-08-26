@@ -34,6 +34,8 @@ from app.web.deps import (
     get_active_token,
     get_conn,
 )
+from sqlalchemy import bindparam, text
+
 from app.db.conn import connect as _connect
 from app.web.location_resolver import (
     get_region_for_location,
@@ -57,7 +59,7 @@ router = APIRouter()
 async def _bg_fetch_prices(type_ids: list[int]) -> None:
     """Fire-and-forget: fetch Jita prices for the given type_ids using a fresh connection."""
     from app.market.prices import fetch_jita_prices_bulk as _bulk
-    conn = get_conn()
+    conn = _connect()
     try:
         async with esi_client() as client:
             await _bulk(client, conn, type_ids, force=True)
@@ -80,22 +82,20 @@ def _refresh_type_ids(conn) -> list[int]:
     for char_id, _name in all_characters():
         asset_type_ids |= {a["type_id"] for a in _load_assets_from_cache(conn, char_id)}
         bp_type_ids |= {bp["type_id"] for bp in _load_blueprints_from_cache(conn, char_id)}
-    mat_ids = {r[0] for r in conn.execute(
-        "SELECT DISTINCT material_type_id FROM sde_blueprint_materials"
-    ).fetchall()}
-    cached_ids = {r[0] for r in conn.execute(
-        "SELECT type_id FROM market_price_cache"
-    ).fetchall()}
+    mat_ids = {r[0] for r in conn.execute(text(
+        "SELECT DISTINCT material_type_id FROM sde_blueprint_materials")).fetchall()}
+    cached_ids = {r[0] for r in conn.execute(text(
+        "SELECT type_id FROM market_price_cache")).fetchall()}
     # All published tradeable types (modules, ammo, ships, skillbooks, ...)
-    tradeable_ids = {r[0] for r in conn.execute(
-        "SELECT type_id FROM sde_types WHERE published=1 AND market_group_id IS NOT NULL"
-    ).fetchall()}
+    tradeable_ids = {r[0] for r in conn.execute(text(
+        "SELECT type_id FROM sde_types"
+        " WHERE published=1 AND market_group_id IS NOT NULL")).fetchall()}
     return list(asset_type_ids | bp_type_ids | mat_ids | cached_ids | tradeable_ids)
 
 
 @router.post("/prices/refresh", response_class=HTMLResponse)
 async def prices_refresh(request: Request):
-    conn = get_conn()
+    conn = _connect()
 
     all_ids = _refresh_type_ids(conn)
 
@@ -114,7 +114,7 @@ async def prices_refresh(request: Request):
 
 @router.get("/prices/refresh/stream")
 async def prices_refresh_stream():
-    conn = get_conn()
+    conn = _connect()
     all_ids = _refresh_type_ids(conn)
 
     async def event_gen():
@@ -140,7 +140,7 @@ async def prices_refresh_hub_stream(region_id: int):
     from fastapi.responses import JSONResponse
     if region_id not in TRADE_HUBS:
         return JSONResponse({"error": "unknown hub"}, status_code=404)
-    conn = get_conn()
+    conn = _connect()
     all_ids = _refresh_type_ids(conn)
 
     async def event_gen():
@@ -163,7 +163,7 @@ async def prices_refresh_hub_stream(region_id: int):
 async def api_price_history(type_id: int, region_id: int = JITA_REGION):
     """Daily market history (~1 year) for a type — powers the price-history chart
     opened from the Prices table. Defaults to Jita / The Forge."""
-    conn = get_conn()
+    conn = _connect()
     try:
         series = await get_price_history(conn, region_id, type_id)
     finally:
@@ -181,7 +181,7 @@ async def api_market_orders(request: Request, type_id: int, region_id: int = JIT
     citadel's orders are not in the public region feed, so we read its authed
     structure market directly (otherwise the tab showed unrelated region orders
     and never matched the table's per-station sell / available)."""
-    conn = get_conn()
+    conn = _connect()
     token = get_active_token(request, conn)
     try:
         orders: list[dict] = []
@@ -287,32 +287,32 @@ async def prices_suggest(q: str = ""):
     ql = q.strip().lower()
     if len(ql) < 2:
         return {"groups": [], "items": []}
-    conn = get_conn()
+    conn = _connect()
     try:
         await _ensure_groups_populated(conn)
         like = f"%{ql}%"
         groups = [
             {"name": r[0], "count": r[1]}
             for r in conn.execute(
-                """SELECT g.name, COUNT(t.type_id) AS n
+                text("""SELECT g.name, COUNT(t.type_id) AS n
                    FROM sde_groups g
                    JOIN sde_types t ON t.group_id = g.group_id AND t.published = 1
-                   WHERE LOWER(g.name) LIKE ?
+                   WHERE LOWER(g.name) LIKE :like
                    GROUP BY g.group_id
-                   HAVING n > 0
-                   ORDER BY (LOWER(g.name) = ?) DESC, n DESC, g.name
-                   LIMIT 8""",
-                (like, ql),
+                   HAVING COUNT(t.type_id) > 0
+                   ORDER BY (LOWER(g.name) = :exact) DESC, n DESC, g.name
+                   LIMIT 8"""),
+                {"like": like, "exact": ql},
             ).fetchall()
         ]
         items = [
             {"type_id": r[0], "name": r[1]}
             for r in conn.execute(
-                """SELECT type_id, name FROM sde_types
-                   WHERE published = 1 AND LOWER(name) LIKE ?
-                   ORDER BY (LOWER(name) LIKE ?) DESC, LENGTH(name), name
-                   LIMIT 10""",
-                (like, ql + "%"),
+                text("""SELECT type_id, name FROM sde_types
+                   WHERE published = 1 AND LOWER(name) LIKE :like
+                   ORDER BY (LOWER(name) LIKE :prefix) DESC, LENGTH(name), name
+                   LIMIT 10"""),
+                {"like": like, "prefix": ql + "%"},
             ).fetchall()
         ]
         return {"groups": groups, "items": items}
@@ -324,7 +324,7 @@ async def prices_suggest(q: str = ""):
 async def prices_search(q: str = ""):
     if len(q.strip()) < 2:
         return {"mode": "name", "group_name": None, "items": []}
-    conn = get_conn()
+    conn = _connect()
     await _ensure_groups_populated(conn)
     pattern = f"%{q.strip().lower()}%"
     import time as _time
@@ -336,33 +336,38 @@ async def prices_search(q: str = ""):
     # because the user is looking for a specific type by name, not all items from one of the N
     # groups containing the substring.
     group_rows = conn.execute(
-        "SELECT group_id, name FROM sde_groups WHERE LOWER(name) = ? ORDER BY name",
-        (q.strip().lower(),),
+        text("SELECT group_id, name FROM sde_groups"
+             " WHERE LOWER(name) = :name ORDER BY name"),
+        {"name": q.strip().lower()},
     ).fetchall()
 
     if group_rows:
         group_ids = [r[0] for r in group_rows]
-        ph = ",".join("?" * len(group_ids))
-        rows = conn.execute(f"""
+        rows = conn.execute(
+            text("""
             SELECT t.type_id, t.name, g.name AS group_name,
                    m.sell_price, m.buy_price, m.cached_at,
                    m.volume, m.jita_available
             FROM sde_types t
             JOIN sde_groups g ON g.group_id = t.group_id
             LEFT JOIN market_price_cache m ON m.type_id = t.type_id
-            WHERE t.published = 1 AND t.group_id IN ({ph})
+            WHERE t.published = 1 AND t.group_id IN :gids
             ORDER BY g.name, t.name
             LIMIT 500
-        """, group_ids).fetchall()
+        """).bindparams(bindparam("gids", expanding=True)),
+            {"gids": group_ids}).fetchall()
         found_groups = list(dict.fromkeys(r[1] for r in group_rows))
         label = ", ".join(found_groups[:3])
 
         # Ensure all returned types are tracked; background-fetch ones with no price yet.
         uncached = [r[0] for r in rows if r[5] is None]  # cached_at IS NULL → never fetched
         if uncached:
-            conn.executemany(
-                "INSERT INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0) ON CONFLICT (type_id) DO NOTHING",
-                [(tid,) for tid in uncached],
+            conn.execute(
+                text("INSERT INTO market_price_cache"
+                     " (type_id, sell_price, buy_price, cached_at)"
+                     " VALUES (:tid, NULL, NULL, 0)"
+                     " ON CONFLICT (type_id) DO NOTHING"),
+                [{"tid": tid} for tid in uncached],
             )
             conn.commit()
             import asyncio as _asyncio
@@ -393,7 +398,7 @@ async def prices_search(q: str = ""):
     # Fallback: search within item names. LEFT JOIN so types without a price in
     # the cache are shown too (we're fetching them in the background). Restrict to
     # tradeable only (market_group_id) so BPCs/unpublished/off-market items aren't returned.
-    rows = conn.execute("""
+    rows = conn.execute(text("""
         SELECT t.type_id, t.name, g.name AS group_name,
                m.sell_price, m.buy_price, m.cached_at,
                m.volume, m.jita_available
@@ -402,17 +407,20 @@ async def prices_search(q: str = ""):
         LEFT JOIN market_price_cache m ON m.type_id = t.type_id
         WHERE t.published = 1
           AND t.market_group_id IS NOT NULL
-          AND LOWER(t.name) LIKE ?
+          AND LOWER(t.name) LIKE :pattern
         ORDER BY t.name
         LIMIT 100
-    """, (pattern,)).fetchall()
+    """), {"pattern": pattern}).fetchall()
 
     # Bg-fetch for types without a price
     uncached = [r[0] for r in rows if r[5] is None]
     if uncached:
-        conn.executemany(
-            "INSERT INTO market_price_cache (type_id, sell_price, buy_price, cached_at) VALUES (?,NULL,NULL,0) ON CONFLICT (type_id) DO NOTHING",
-            [(tid,) for tid in uncached],
+        conn.execute(
+            text("INSERT INTO market_price_cache"
+                 " (type_id, sell_price, buy_price, cached_at)"
+                 " VALUES (:tid, NULL, NULL, 0)"
+                 " ON CONFLICT (type_id) DO NOTHING"),
+            [{"tid": tid} for tid in uncached],
         )
         conn.commit()
         import asyncio as _asyncio
@@ -445,7 +453,7 @@ async def api_set_custom_price(request: Request):
     type_id = int(body["type_id"])
     price_raw = body.get("price")
     price = float(price_raw) if price_raw not in (None, "", "null") else None
-    conn = get_conn()
+    conn = _connect()
     set_custom_price(conn, type_id, price)
     conn.close()
     return {"ok": True, "type_id": type_id, "price": price}
@@ -455,7 +463,7 @@ async def api_set_custom_price(request: Request):
 async def api_station_volume_cached(location_id: int):
     """Cache-only station volumes (any age) + newest cached_at — used to restore a
     previously loaded custom station on page load without a fresh ESI fetch."""
-    conn = get_conn()
+    conn = _connect()
     try:
         res = get_station_volumes_any_age(conn, location_id)
     finally:
@@ -476,7 +484,7 @@ async def prices_station_stream(request: Request, location_id: int):
     old fixed 90% fake bar looked frozen. Streams orders/volume progress; on done
     the client reads the now-cached data via /api/prices/station-volume/cached."""
     import json as _json
-    conn = get_conn()
+    conn = _connect()
     token = get_active_token(request, conn)
     ensure_price_table(conn)
     try:
@@ -492,7 +500,8 @@ async def prices_station_stream(request: Request, location_id: int):
             # here (a previous partial/failed fetch could otherwise be replayed,
             # e.g. blank sell/available with only 7d volume). The cache still backs
             # the silent restore-on-page-load path (/station-volume/cached).
-            type_ids = [r[0] for r in conn.execute("SELECT type_id FROM market_price_cache").fetchall()]
+            type_ids = [r[0] for r in conn.execute(text(
+                "SELECT type_id FROM market_price_cache")).fetchall()]
             if not type_ids:
                 type_ids = _refresh_type_ids(conn)
             total = len(type_ids) or 1
@@ -544,7 +553,7 @@ async def api_station_volume(request: Request):
     body = await request.json()
     location_id = int(body["location_id"])
 
-    conn = get_conn()
+    conn = _connect()
     token = get_active_token(request, conn)
     ensure_price_table(conn)
     # Region of this location — returned so the price-history chart can offer
@@ -564,7 +573,8 @@ async def api_station_volume(request: Request):
             for k, v in cached.items()
         }}
 
-    type_ids = [r[0] for r in conn.execute("SELECT type_id FROM market_price_cache").fetchall()]
+    type_ids = [r[0] for r in conn.execute(text(
+        "SELECT type_id FROM market_price_cache")).fetchall()]
     if not type_ids:
         type_ids = _refresh_type_ids(conn)
 
@@ -599,7 +609,7 @@ async def api_station_volume(request: Request):
 
 @router.get("/prices", response_class=HTMLResponse)
 async def prices_page(request: Request):
-    conn = get_conn()
+    conn = _connect()
     stats = get_price_cache_stats(conn)
     # By default render only the relevant subset (user assets + BPs + custom prices).
     # The full cache has ~19k items → rendering the whole table = 48 MB HTML. The rest
@@ -610,11 +620,11 @@ async def prices_page(request: Request):
         relevant |= {a["type_id"] for a in _load_assets_from_cache(conn, char_id)}
         relevant |= {bp["type_id"] for bp in _load_blueprints_from_cache(conn, char_id)}
     if relevant:
-        ph = ",".join("?" * len(relevant))
         bp_products = conn.execute(
-            f"SELECT product_type_id FROM sde_blueprint_products"
-            f" WHERE blueprint_type_id IN ({ph})",
-            tuple(relevant),
+            text("SELECT product_type_id FROM sde_blueprint_products"
+                 " WHERE blueprint_type_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(relevant)},
         ).fetchall()
         relevant |= {r[0] for r in bp_products}
     items = get_all_price_items(conn, relevant_ids=relevant)

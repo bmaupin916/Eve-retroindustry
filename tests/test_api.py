@@ -178,11 +178,11 @@ def test_blueprint_badges_bpo_bpc_rxn(app_module, client):
 def test_prices_hub_columns_render(app_module, client):
     # A downloaded trade hub (Amarr / Domain) shows its comparison columns.
     import time as _t
-    from app.market.prices import ensure_price_table
+    from app.db.schema import ensure_schema
     m = app_module
     c = m.get_conn()
     try:
-        ensure_price_table(c)
+        ensure_schema(c)
         c.execute(
             "INSERT OR REPLACE INTO hub_price_cache (region_id, type_id, sell_price, buy_price, volume, available, cached_at) "
             "VALUES (?,?,?,?,?,?,?)", (10000043, 34, 1234567.0, 5.5, 1234, 999, _t.time()))
@@ -236,11 +236,12 @@ def test_price_history_endpoint(app_module, client):
     # Served from a fresh cache row → no ESI call needed (hermetic).
     import json
     import time as _t
-    from app.market.prices import ensure_price_table, JITA_REGION
+    from app.db.schema import ensure_schema
+    from app.market.prices import JITA_REGION
     m = app_module
     c = m.get_conn()
     try:
-        ensure_price_table(c)
+        ensure_schema(c)
         series = [
             {"d": "2026-07-20", "avg": 100.0, "low": 95.0, "high": 110.0, "vol": 5000},
             {"d": "2026-07-21", "avg": 102.0, "low": 97.0, "high": 112.0, "vol": 6000},
@@ -271,11 +272,11 @@ def test_station_volume_cached_served_regardless_of_age(app_module, client):
     # An 8-hour-old custom-station cache is still served (used to restore the
     # station on page load instead of forcing a re-fetch).
     import time as _t
-    from app.market.prices import ensure_price_table
+    from app.db.schema import ensure_schema
     m = app_module
     c = m.get_conn()
     try:
-        ensure_price_table(c)
+        ensure_schema(c)
         c.execute("INSERT OR REPLACE INTO station_volume_cache "
                   "(location_id, type_id, volume, best_sell, traded_volume, cached_at) "
                   "VALUES (?,?,?,?,?,?)", (60003760, 34, 1000, 7.5, 500, _t.time() - 3600 * 8))

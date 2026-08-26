@@ -63,7 +63,7 @@ lives in [design-hosted-v2.md](design-hosted-v2.md) §11.
 
   **The measure from here is the count of raw `?`-parameter statements**, and
   it has to be taken with an AST walk rather than a grep — see "Count
-  statements with an AST" below. **85** of them at v0.9.71, down from 137 at
+  statements with an AST" below. **41** of them at v0.9.72, down from 137 at
   v0.9.66 and 145 at v0.9.65; **twelve** files still hold a raw `get_conn()`
   handle — still twelve after v0.9.71, because `routers/assets.py` has zero raw
   statements of its own and *still* opens one: `get_active_character`,
@@ -1421,25 +1421,30 @@ for f in pathlib.Path("app").rglob("*.py"):
 which is where the `IN ({ph})` placeholder patterns live, and those are the ones
 that need an expanding bindparam rather than a mechanical rewrite.
 
-## Where the remaining statements are (145 at v0.9.65 → 85 after v0.9.71)
+## Where the remaining statements are (145 at v0.9.65 → 41 after v0.9.72)
 
 Regenerated from the AST scan rather than edited by hand, because the previous
 version of this table had drifted from what the scan actually reported.
 
 | cluster | statements | files |
 | --- | --- | --- |
-| prices — `prices_helper` 15, `routers/prices` 13, `market/prices` 11 | 39 | 3 |
 | infrastructure — `security` 7, `bootstrap` 7, `conn` 4, `schema` 1 | 19 | 4 |
-| `main.py` 9, `deps.py` 8 | 17 | 2 |
+| `main.py` | 9 | 1 |
 | the rest — `schematics` 4, `type_resolver` 2, `esi_oauth` 2, `routers/auth` 1, `planner` 1 | 10 | 5 |
+| `deps.py` — all three inside `get_conn()` itself | 3 | 1 |
 
 Gone from this table: `contracts_helper` + `routers/contracts` (v0.9.66),
 `routers/assets` (v0.9.68), `routers/locations` (v0.9.69), the PI pair
-`routers/planets` + `pi_planner_helper` (v0.9.70), and `routers/plan` (v0.9.71).
+`routers/planets` + `pi_planner_helper` (v0.9.70), `routers/plan` (v0.9.71),
+and the whole prices cluster plus the `deps.py` readers (v0.9.72).
 
-**The prices cluster is one unit, not three.** `market/prices.py` is called by
-both `prices_helper` and `routers/prices`, so converting any one of them alone
-leaves a caller handing the wrong kind of connection across the boundary.
+**`deps.py` is down to `get_conn()`'s own three PRAGMAs.** Its four cache
+readers converted with the prices cluster because `routers/prices.py` could not
+switch to an engine connection while they wanted a DBAPI one. That is the
+cascade this file predicted for `deps.py`, arriving a unit early — and it is why
+`routers/prices.py` is the **first router to drop `get_conn()` entirely**: the
+three helpers it still calls (`get_active_character`, `get_active_character_id`,
+`get_active_token`) accept a connection and *ignore* it.
 
 **`deps.py` is last, not next — this paragraph used to say the opposite.**
 
@@ -1456,9 +1461,11 @@ along for free. `contracts_helper` + `routers/contracts` (v0.9.66) and
 `routers/assets` (v0.9.68) both went that way. `get_conn()` itself, with its 59
 call sites, is the closing act.
 
-Next by that rule: the prices cluster (39 across three files, the largest unit
-left), then the infrastructure files, and finally `main.py` + `deps.py` — where
-`get_conn()` itself lives and 59 call sites depend on it.
+What is left is no longer router-shaped. `security.py`, `bootstrap.py`,
+`conn.py` and `schema.py` sit *underneath* the app rather than in it —
+`bootstrap.py` runs before the app exists, and `conn.py` is the seam itself — so
+they will not follow the "open a short-lived `_connect()` per statement"
+pattern. `main.py` (9) and `get_conn()`'s three PRAGMAs are the closing act.
 
 
 ## The route-jump chunk was twice the size it could be (v0.9.67)

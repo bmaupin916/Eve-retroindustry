@@ -34,11 +34,12 @@ def db(tmp_path):
     path = str(tmp_path / "eve_cache.db")
     shutil.copy2(SDE, path)
     conn = sqlite3.connect(path)
-    from app.market.prices import ensure_price_table
-    ensure_price_table(conn)
     from app.db.schema import ensure_schema
-    # `industry_helper.ensure_industry_tables` used to be called here too. It
-    # only ever forwarded to this, and it now takes a SQLAlchemy connection.
+    # Two shims used to be called here and both were dropped for the same
+    # reason, one conversion apart: `industry_helper.ensure_industry_tables`
+    # and `market.prices.ensure_price_table`. Each only ever forwarded to
+    # `ensure_schema` below, and each now takes a SQLAlchemy connection rather
+    # than this DBAPI one.
     ensure_schema(conn)
     conn.close()
 

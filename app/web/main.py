@@ -304,7 +304,8 @@ async def _startup_populate_groups():
             # engine connection rather than this startup's raw handle.
             with _connect() as _ic:
                 populate_rig_bonuses(_ic)
-            await _ensure_groups_populated(conn)
+            with _connect() as _gc:
+                await _ensure_groups_populated(_gc)
         else:
             # Nothing here copies a database into place any more. Static data
             # arrives by running the importer against CCP's build-pinned feed,
@@ -502,7 +503,8 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
     assets_by_char: dict[int, list[dict]] = {}
     all_assets_by_char: dict[int, list[dict]] = {}
     for cid, _ in chars:
-        raw = _load_assets_from_cache(conn, cid)
+        with _connect() as _ac:
+            raw = _load_assets_from_cache(_ac, cid)
         all_assets_by_char[cid] = raw
         assets_by_char[cid] = [a for a in raw if not a.get("is_singleton", False)]
         all_type_ids_set.update(a["type_id"] for a in raw)
@@ -510,10 +512,15 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
     # Prices: full (ESI adjusted for missing) when live, cache-only otherwise.
     prices: dict[int, tuple] = {}
     if all_type_ids_set:
-        if live:
-            prices = await get_prices_for_ids(conn, list(all_type_ids_set))
-        else:
-            prices = get_cached_prices_for_ids(conn, list(all_type_ids_set))
+        # Both branches call into `prices_helper`, which is on the portable
+        # query layer now. Rewiring only the `live` one left the cache-only path
+        # — the one the dashboard actually takes on a normal load — handing a
+        # DBAPI connection to a converted function.
+        with _connect() as _pc:
+            if live:
+                prices = await get_prices_for_ids(_pc, list(all_type_ids_set))
+            else:
+                prices = get_cached_prices_for_ids(_pc, list(all_type_ids_set))
 
     # Blueprint group_ids — exclude from net worth (matches in-game behavior)
     bp_group_ids: set[int] = {
@@ -756,7 +763,8 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
         elif char_value is not None:
             agg_value = (agg_value or 0.0) + char_value
 
-    price_stats = get_price_cache_stats(conn)
+    with _connect() as _pc:
+        price_stats = get_price_cache_stats(_pc)
 
     return {
         "logged_in": True,

@@ -9,6 +9,8 @@ import json as _json
 import sqlite3
 import time
 import httpx
+from sqlalchemy import bindparam, text
+
 from app.esi.client import esi_client
 
 from app.market.prices import (
@@ -38,8 +40,9 @@ def get_cached_jita_prices(conn: sqlite3.Connection, type_ids: list[int]) -> dic
     result = {}
     for tid in type_ids:
         row = conn.execute(
-            "SELECT sell_price, buy_price FROM market_price_cache WHERE type_id=?",
-            (tid,)
+            text("SELECT sell_price, buy_price FROM market_price_cache"
+                 " WHERE type_id=:tid"),
+            {"tid": tid},
         ).fetchone()
         if row and (row[0] is not None or row[1] is not None):
             result[tid] = (row[0], row[1])
@@ -48,16 +51,17 @@ def get_cached_jita_prices(conn: sqlite3.Connection, type_ids: list[int]) -> dic
 
 def get_price_cache_stats(conn: sqlite3.Connection) -> dict:
     """Price cache statistics."""
-    row = conn.execute(
-        "SELECT COUNT(*), MAX(cached_at), MIN(cached_at) FROM market_price_cache WHERE sell_price IS NOT NULL"
-    ).fetchone()
+    row = conn.execute(text(
+        "SELECT COUNT(*), MAX(cached_at), MIN(cached_at) FROM market_price_cache"
+        " WHERE sell_price IS NOT NULL")).fetchone()
     count = row[0] or 0
     last_update = row[1]
     fresh = 0
     stale = 0
     if count > 0:
         now = time.time()
-        r2 = conn.execute("SELECT cached_at FROM market_price_cache").fetchall()
+        r2 = conn.execute(
+            text("SELECT cached_at FROM market_price_cache")).fetchall()
         for (ts,) in r2:
             if ts and (now - ts) < PRICE_CACHE_TTL:
                 fresh += 1
@@ -75,10 +79,11 @@ def get_price_cache_stats(conn: sqlite3.Connection) -> dict:
 def _load_custom_overrides(conn: sqlite3.Connection, type_ids: list[int]) -> dict[int, float]:
     if not type_ids:
         return {}
-    placeholders = ",".join("?" * len(type_ids))
     rows = conn.execute(
-        f"SELECT type_id, price FROM custom_price_override WHERE type_id IN ({placeholders})",
-        type_ids,
+        text("SELECT type_id, price FROM custom_price_override"
+             " WHERE type_id IN :ids")
+        .bindparams(bindparam("ids", expanding=True)),
+        {"ids": list(type_ids)},
     ).fetchall()
     return {r[0]: r[1] for r in rows}
 
@@ -158,13 +163,13 @@ def get_all_price_items(
         # Always include everything with a custom_price
         ph = ",".join("?" * len(relevant_ids)) if relevant_ids else "NULL"
         where_clause = (
-            f"WHERE m.type_id IN ({ph}) OR c.price IS NOT NULL"
+            "WHERE m.type_id IN :ids OR c.price IS NOT NULL"
             if relevant_ids
             else "WHERE c.price IS NOT NULL"
         )
-        params = tuple(relevant_ids)
+        params = {"ids": list(relevant_ids)} if relevant_ids else {}
 
-    rows = conn.execute(f"""
+    stmt = text(f"""
         SELECT m.type_id, t.name, m.sell_price, m.buy_price, m.cached_at,
                c.price AS custom_price, m.volume, m.jita_available
         FROM market_price_cache m
@@ -172,7 +177,10 @@ def get_all_price_items(
         LEFT JOIN custom_price_override c ON c.type_id = m.type_id
         {where_clause}
         ORDER BY t.name ASC NULLS LAST
-    """, params).fetchall()
+    """)
+    if "IN :ids" in where_clause:
+        stmt = stmt.bindparams(bindparam("ids", expanding=True))
+    rows = conn.execute(stmt, params).fetchall()
     now = time.time()
     return [
         {
@@ -193,12 +201,16 @@ def set_custom_price(conn: sqlite3.Connection, type_id: int, price: float | None
     """Stores or deletes the custom price for the given type_id."""
     ensure_price_table(conn)
     if price is None:
-        conn.execute("DELETE FROM custom_price_override WHERE type_id=?", (type_id,))
+        conn.execute(
+            text("DELETE FROM custom_price_override WHERE type_id=:tid"),
+            {"tid": type_id})
     else:
         conn.execute(
-            "INSERT INTO custom_price_override (type_id, price, updated_at) VALUES (?,?,?) "
-            "ON CONFLICT(type_id) DO UPDATE SET price=excluded.price, updated_at=excluded.updated_at",
-            (type_id, price, time.time()),
+            text("INSERT INTO custom_price_override (type_id, price, updated_at)"
+                 " VALUES (:tid, :price, :updated_at)"
+                 " ON CONFLICT (type_id) DO UPDATE SET"
+                 " price=excluded.price, updated_at=excluded.updated_at"),
+            {"tid": type_id, "price": price, "updated_at": time.time()},
         )
     conn.commit()
 
@@ -230,19 +242,22 @@ def _persist_bulk_orders(
             refreshed += 1
             traded.append(tid)
         # Volume (7-day history) is not overwritten in this refresh — the old value is kept
-        rows.append((tid, sell, buy, jita_avail, now))
-    # Use COALESCE for volume — INSERT OR REPLACE would erase the existing volume,
-    # so use an UPSERT instead
-    conn.executemany(
-        """INSERT INTO market_price_cache (type_id, sell_price, buy_price, jita_available, cached_at)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(type_id) DO UPDATE SET
+        rows.append({"tid": tid, "sell": sell, "buy": buy,
+                     "avail": jita_avail, "now": now})
+    # Deliberately does not touch `volume`: it is filled by a separate 7-day
+    # history pass, and an INSERT OR REPLACE here would erase it.
+    if rows:
+        conn.execute(
+            text("""INSERT INTO market_price_cache
+                 (type_id, sell_price, buy_price, jita_available, cached_at)
+           VALUES (:tid, :sell, :buy, :avail, :now)
+           ON CONFLICT (type_id) DO UPDATE SET
              sell_price = excluded.sell_price,
              buy_price = excluded.buy_price,
              jita_available = excluded.jita_available,
-             cached_at = excluded.cached_at""",
-        rows,
-    )
+             cached_at = excluded.cached_at"""),
+            rows,
+        )
     conn.commit()
     return refreshed, traded
 
@@ -284,11 +299,13 @@ async def _fill_volumes(
             results = await asyncio.gather(
                 *[_one(client, tid) for tid in batch], return_exceptions=True
             )
-            rows = [(vol, tid) for r in results if not isinstance(r, Exception)
+            rows = [{"vol": vol, "tid": tid}
+                    for r in results if not isinstance(r, Exception)
                     for tid, vol in [r] if vol is not None]
             if rows:
-                conn.executemany(
-                    "UPDATE market_price_cache SET volume=? WHERE type_id=?", rows
+                conn.execute(
+                    text("UPDATE market_price_cache SET volume=:vol"
+                         " WHERE type_id=:tid"), rows
                 )
                 conn.commit()
                 updated += len(rows)
@@ -403,18 +420,21 @@ def _persist_hub_bulk_orders(
         if sell is not None or buy is not None:
             refreshed += 1
             traded.append(tid)
-        rows.append((region_id, tid, sell, buy, avail, now))
+        rows.append({"rid": region_id, "tid": tid, "sell": sell,
+                     "buy": buy, "avail": avail, "now": now})
     # volume is filled separately (7-day history) — don't overwrite it here.
-    conn.executemany(
-        """INSERT INTO hub_price_cache (region_id, type_id, sell_price, buy_price, available, cached_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(region_id, type_id) DO UPDATE SET
+    if rows:
+        conn.execute(
+            text("""INSERT INTO hub_price_cache
+                 (region_id, type_id, sell_price, buy_price, available, cached_at)
+           VALUES (:rid, :tid, :sell, :buy, :avail, :now)
+           ON CONFLICT (region_id, type_id) DO UPDATE SET
              sell_price = excluded.sell_price,
              buy_price = excluded.buy_price,
              available = excluded.available,
-             cached_at = excluded.cached_at""",
-        rows,
-    )
+             cached_at = excluded.cached_at"""),
+            rows,
+        )
     conn.commit()
     return refreshed, traded
 
@@ -448,11 +468,13 @@ async def _fill_hub_volumes(
             results = await asyncio.gather(
                 *[_one(client, tid) for tid in batch], return_exceptions=True
             )
-            rows = [(vol, region_id, tid) for r in results if not isinstance(r, Exception)
+            rows = [{"vol": vol, "rid": region_id, "tid": tid}
+                    for r in results if not isinstance(r, Exception)
                     for tid, vol in [r] if vol is not None]
             if rows:
-                conn.executemany(
-                    "UPDATE hub_price_cache SET volume=? WHERE region_id=? AND type_id=?", rows
+                conn.execute(
+                    text("UPDATE hub_price_cache SET volume=:vol"
+                         " WHERE region_id=:rid AND type_id=:tid"), rows
                 )
                 conn.commit()
                 updated += len(rows)
@@ -517,9 +539,9 @@ async def stream_hub_refresh(conn: sqlite3.Connection, type_ids: list[int], regi
 def get_hub_cache_stats(conn: sqlite3.Connection, region_id: int) -> dict:
     """Row count + last-update timestamp for one hub's cache."""
     row = conn.execute(
-        "SELECT COUNT(*), MAX(cached_at) FROM hub_price_cache "
-        "WHERE region_id=? AND sell_price IS NOT NULL",
-        (region_id,),
+        text("SELECT COUNT(*), MAX(cached_at) FROM hub_price_cache"
+             " WHERE region_id=:rid AND sell_price IS NOT NULL"),
+        {"rid": region_id},
     ).fetchone()
     count = row[0] or 0
     last_update = row[1]
@@ -540,11 +562,11 @@ def get_all_hub_prices(
     if not type_ids:
         return {}
     out: dict[int, dict[int, dict]] = {}
-    ph = ",".join("?" * len(type_ids))
     rows = conn.execute(
-        f"SELECT type_id, region_id, sell_price, buy_price, volume, available "
-        f"FROM hub_price_cache WHERE type_id IN ({ph})",
-        list(type_ids),
+        text("SELECT type_id, region_id, sell_price, buy_price, volume, available"
+             " FROM hub_price_cache WHERE type_id IN :ids")
+        .bindparams(bindparam("ids", expanding=True)),
+        {"ids": list(type_ids)},
     ).fetchall()
     for tid, rid, sell, buy, vol, avail in rows:
         if sell is None and buy is None and vol is None and avail is None:
@@ -607,8 +629,9 @@ async def get_price_history(conn: sqlite3.Connection, region_id: int, type_id: i
     _today = datetime.date.today().isoformat()   # extend the timeline to today
     ensure_price_table(conn)
     row = conn.execute(
-        "SELECT data_json, cached_at FROM price_history_cache WHERE region_id=? AND type_id=?",
-        (region_id, type_id),
+        text("SELECT data_json, cached_at FROM price_history_cache"
+             " WHERE region_id=:rid AND type_id=:tid"),
+        {"rid": region_id, "tid": type_id},
     ).fetchone()
     # Densify on every return (incl. cache hits) so no-trade days are filled even
     # for cache rows written before densifying existed. It's idempotent.
@@ -631,11 +654,13 @@ async def get_price_history(conn: sqlite3.Connection, region_id: int, type_id: i
         return []
 
     conn.execute(
-        """INSERT INTO price_history_cache (region_id, type_id, data_json, cached_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(region_id, type_id) DO UPDATE SET
-             data_json = excluded.data_json, cached_at = excluded.cached_at""",
-        (region_id, type_id, _json.dumps(series), time.time()),
+        text("""INSERT INTO price_history_cache
+                 (region_id, type_id, data_json, cached_at)
+           VALUES (:rid, :tid, :data_json, :cached_at)
+           ON CONFLICT (region_id, type_id) DO UPDATE SET
+             data_json = excluded.data_json, cached_at = excluded.cached_at"""),
+        {"rid": region_id, "tid": type_id,
+         "data_json": _json.dumps(series), "cached_at": time.time()},
     )
     conn.commit()
     return _densify_history(series, _today)

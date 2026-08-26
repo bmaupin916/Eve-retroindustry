@@ -355,7 +355,8 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
                 for bucket in [dv["hangar"], *dv["containers"].values()]:
                     all_price_ids |= {item["type_id"] for item in bucket.values()}
         all_price_ids = list(all_price_ids)
-        prices = await get_prices_for_ids(conn, all_price_ids)
+        with _connect() as _pc:
+            prices = await get_prices_for_ids(_pc, all_price_ids)
 
         def _add_prices(bucket: dict):
             for item in bucket.values():
@@ -394,9 +395,14 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
 
         # Aggregate assets_raw across all selected chars so container name
         # resolution works for every owner.
-        assets_raw_by_char: dict[int, list] = {
-            cid: _load_assets_from_cache(conn, cid) for cid, _ in selected_chars
-        }
+        # One connection for the whole comprehension rather than one per
+        # character: the loader is on the portable layer now, and `_ac` has to
+        # be bound somewhere — substituting the name without opening the block
+        # is a NameError that only fires on a page with a character selected.
+        with _connect() as _ac:
+            assets_raw_by_char: dict[int, list] = {
+                cid: _load_assets_from_cache(_ac, cid) for cid, _ in selected_chars
+            }
         container_info: dict[int, tuple[str, int]] = {}
         if all_container_ids:
             for owner_id, _ in selected_chars:
@@ -483,7 +489,8 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
 
         # ── Build corp stations ───────────────────────────────────────────────
         if corp_sd and corp_id:
-            corp_assets_raw = _load_corp_assets_from_cache(conn, corp_id)
+            with _connect() as _ac:
+                corp_assets_raw = _load_corp_assets_from_cache(_ac, corp_id)
             corp_container_type_map = {item["item_id"]: item["type_id"] for item in corp_assets_raw}
             all_corp_container_ids = [
                 cid
@@ -1034,7 +1041,8 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
     assets: list[dict] = []
     assets_by_char: dict[int, list[dict]] = {}
     for cid_sel, _ in selected_chars:
-        a = _load_assets_from_cache(conn, cid_sel)
+        with _connect() as _ac:
+            a = _load_assets_from_cache(_ac, cid_sel)
         assets_by_char[cid_sel] = a
         assets.extend(a)
     asset_item_ids = {item["item_id"] for item in assets}

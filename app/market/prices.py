@@ -11,6 +11,9 @@ import time
 import sqlite3
 import httpx
 from app.esi.client import esi_client
+from sqlalchemy import text
+
+from app.db.conn import connect as _connect, dbapi
 from app.db.schema import ensure_schema as ensure_db_schema
 
 ESI_BASE = "https://esi.evetech.net/latest"
@@ -48,9 +51,19 @@ _HIST_SEM = asyncio.Semaphore(30)
 # DB schema
 # ---------------------------------------------------------------------------
 
-def ensure_price_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_price_table(conn) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists.
+
+    Dialect-guarded like its sibling `ensure_hist_etag_table`: `ensure_schema`
+    memoises by asking `PRAGMA database_list` which file it is looking at, which
+    is a syntax error on Postgres. Converted alongside the rest of this module
+    so every caller hands these functions the same kind of connection — a shim
+    left on the old contract is how a caller ends up passing two different
+    connection types into one module.
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(dbapi(conn))
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +98,9 @@ async def fetch_adjusted_prices(client: httpx.AsyncClient) -> dict[int, dict]:
 
 def _get_cached_price(conn: sqlite3.Connection, type_id: int) -> tuple[float | None, float | None]:
     row = conn.execute(
-        "SELECT sell_price, buy_price, cached_at FROM market_price_cache WHERE type_id=?",
-        (type_id,)
+        text("SELECT sell_price, buy_price, cached_at FROM market_price_cache"
+             " WHERE type_id=:tid"),
+        {"tid": type_id},
     ).fetchone()
     if row and (time.time() - (row[2] or 0)) < PRICE_CACHE_TTL:
         return row[0], row[1]
@@ -102,8 +116,15 @@ def _save_cached_price(
     jita_available: int | None = None,
 ):
     conn.execute(
-        "INSERT INTO market_price_cache (type_id, sell_price, buy_price, volume, jita_available, cached_at) VALUES (?,?,?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET sell_price=excluded.sell_price, buy_price=excluded.buy_price, volume=excluded.volume, jita_available=excluded.jita_available, cached_at=excluded.cached_at",
-        (type_id, sell, buy, volume, jita_available, time.time())
+        text("INSERT INTO market_price_cache"
+             " (type_id, sell_price, buy_price, volume, jita_available, cached_at)"
+             " VALUES (:type_id, :sell, :buy, :volume, :jita_available, :cached_at)"
+             " ON CONFLICT (type_id) DO UPDATE SET"
+             " sell_price=excluded.sell_price, buy_price=excluded.buy_price,"
+             " volume=excluded.volume, jita_available=excluded.jita_available,"
+             " cached_at=excluded.cached_at"),
+        {"type_id": type_id, "sell": sell, "buy": buy, "volume": volume,
+         "jita_available": jita_available, "cached_at": time.time()},
     )
     conn.commit()
 
@@ -154,9 +175,17 @@ _hist_etags: dict[tuple[int, int], tuple[str, dict[str, int], float]] = {}
 _hist_etags_dirty: set[tuple[int, int]] = set()
 
 
-def ensure_hist_etag_table(conn: sqlite3.Connection) -> None:
-    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists."""
-    ensure_db_schema(conn)
+def ensure_hist_etag_table(conn) -> None:
+    """Schema shim. The table lives in app/db/schema.py; this only guarantees it exists.
+
+    Guarded on the dialect, for the same reason as the other shims:
+    `ensure_schema` memoises by asking `PRAGMA database_list` which file it has,
+    and that is a syntax error on Postgres. There the table arrives from the
+    migration history, so there is nothing to shim.
+    """
+    if conn.engine.dialect.name != "sqlite":
+        return
+    ensure_db_schema(dbapi(conn))
 
 
 def load_hist_etags(conn: sqlite3.Connection, region_id: int) -> int:
@@ -164,8 +193,9 @@ def load_hist_etags(conn: sqlite3.Connection, region_id: int) -> int:
     ensure_hist_etag_table(conn)
     n = 0
     for tid, etag, days_json, expires_at in conn.execute(
-        "SELECT type_id, etag, days_json, expires_at FROM market_hist_etag WHERE region_id=?",
-        (region_id,),
+        text("SELECT type_id, etag, days_json, expires_at FROM market_hist_etag"
+             " WHERE region_id=:rid"),
+        {"rid": region_id},
     ):
         if not etag:
             continue
@@ -189,10 +219,24 @@ def flush_hist_etags(conn: sqlite3.Connection) -> int:
         entry = _hist_etags.get(key)
         if not entry:
             continue
-        rows.append((key[0], key[1], entry[0], json.dumps(entry[1]), now, entry[2]))
-    conn.executemany(
-        "INSERT INTO market_hist_etag "
-        "(region_id, type_id, etag, days_json, cached_at, expires_at) VALUES (?,?,?,?,?,?) ON CONFLICT (region_id, type_id) DO UPDATE SET etag=excluded.etag, days_json=excluded.days_json, cached_at=excluded.cached_at, expires_at=excluded.expires_at",
+        rows.append({"region_id": key[0], "type_id": key[1], "etag": entry[0],
+                     "days_json": json.dumps(entry[1]), "cached_at": now,
+                     "expires_at": entry[2]})
+    if not rows:
+        # Every dirty key had already been evicted from `_hist_etags`. Under
+        # `sqlite3` an empty `executemany` was a no-op; SQLAlchemy raises
+        # `StatementError` on an empty parameter list, so this guard is
+        # load-bearing after the conversion rather than tidiness.
+        _hist_etags_dirty.clear()
+        return 0
+    conn.execute(
+        text("INSERT INTO market_hist_etag"
+             " (region_id, type_id, etag, days_json, cached_at, expires_at)"
+             " VALUES (:region_id, :type_id, :etag, :days_json, :cached_at,"
+             "  :expires_at)"
+             " ON CONFLICT (region_id, type_id) DO UPDATE SET"
+             " etag=excluded.etag, days_json=excluded.days_json,"
+             " cached_at=excluded.cached_at, expires_at=excluded.expires_at"),
         rows,
     )
     conn.commit()
@@ -582,13 +626,14 @@ def _cached_region_volume(conn: sqlite3.Connection, region_id: int | None) -> di
     if not region_id:
         return None
     if region_id == JITA_REGION:
-        rows = conn.execute(
-            "SELECT type_id, volume FROM market_price_cache WHERE volume IS NOT NULL"
-        ).fetchall()
+        rows = conn.execute(text(
+            "SELECT type_id, volume FROM market_price_cache"
+            " WHERE volume IS NOT NULL")).fetchall()
     else:
         rows = conn.execute(
-            "SELECT type_id, volume FROM hub_price_cache WHERE region_id=? AND volume IS NOT NULL",
-            (region_id,),
+            text("SELECT type_id, volume FROM hub_price_cache"
+                 " WHERE region_id=:rid AND volume IS NOT NULL"),
+            {"rid": region_id},
         ).fetchall()
     return {r[0]: r[1] for r in rows} if rows else None
 
@@ -671,8 +716,9 @@ async def fetch_structure_market(
         # Try location_name_cache first (populated by location resolver in web layer)
         try:
             row = conn.execute(
-                "SELECT region_id FROM location_name_cache WHERE location_id=?",
-                (structure_id,)
+                text("SELECT region_id FROM location_name_cache"
+                     " WHERE location_id=:lid"),
+                {"lid": structure_id},
             ).fetchone()
             if row and row[0]:
                 region_id = row[0]
@@ -721,12 +767,23 @@ async def fetch_structure_market(
         sell = entry["best_sell"] if entry else None
         traded = history_map.get(tid)
         result[tid] = (vol, sell, traded)
-        rows.append((structure_id, tid, vol, sell, traded, now))
+        rows.append({"location_id": structure_id, "type_id": tid,
+                     "volume": vol, "best_sell": sell,
+                     "traded_volume": traded, "cached_at": now})
 
-    conn.executemany(
-        "INSERT INTO station_volume_cache (location_id, type_id, volume, best_sell, traded_volume, cached_at) VALUES (?,?,?,?,?,?) ON CONFLICT (location_id, type_id) DO UPDATE SET volume=excluded.volume, best_sell=excluded.best_sell, traded_volume=excluded.traded_volume, cached_at=excluded.cached_at",
-        rows,
-    )
+    if rows:
+        conn.execute(
+            text("INSERT INTO station_volume_cache"
+                 " (location_id, type_id, volume, best_sell, traded_volume,"
+                 "  cached_at)"
+                 " VALUES (:location_id, :type_id, :volume, :best_sell,"
+                 "  :traded_volume, :cached_at)"
+                 " ON CONFLICT (location_id, type_id) DO UPDATE SET"
+                 " volume=excluded.volume, best_sell=excluded.best_sell,"
+                 " traded_volume=excluded.traded_volume,"
+                 " cached_at=excluded.cached_at"),
+            rows,
+        )
     conn.commit()
     return result
 
@@ -832,13 +889,24 @@ async def fetch_station_volumes(
     for tid in type_ids:
         vol, sell = order_map.get(tid, (None, None))
         traded = history_map.get(tid)
-        rows.append((location_id, tid, vol, sell, traded, now))
+        rows.append({"location_id": location_id, "type_id": tid,
+                     "volume": vol, "best_sell": sell,
+                     "traded_volume": traded, "cached_at": now})
         result_map[tid] = (vol, sell, traded)
 
-    conn.executemany(
-        "INSERT INTO station_volume_cache (location_id, type_id, volume, best_sell, traded_volume, cached_at) VALUES (?,?,?,?,?,?) ON CONFLICT (location_id, type_id) DO UPDATE SET volume=excluded.volume, best_sell=excluded.best_sell, traded_volume=excluded.traded_volume, cached_at=excluded.cached_at",
-        rows,
-    )
+    if rows:
+        conn.execute(
+            text("INSERT INTO station_volume_cache"
+                 " (location_id, type_id, volume, best_sell, traded_volume,"
+                 "  cached_at)"
+                 " VALUES (:location_id, :type_id, :volume, :best_sell,"
+                 "  :traded_volume, :cached_at)"
+                 " ON CONFLICT (location_id, type_id) DO UPDATE SET"
+                 " volume=excluded.volume, best_sell=excluded.best_sell,"
+                 " traded_volume=excluded.traded_volume,"
+                 " cached_at=excluded.cached_at"),
+            rows,
+        )
     conn.commit()
     flush_hist_etags(conn)
     return result_map
@@ -850,9 +918,9 @@ def get_cached_station_volumes(
 ) -> dict[int, tuple[int | None, float | None, int | None]] | None:
     """Returns cached data if it is fresh, otherwise None."""
     rows = conn.execute(
-        "SELECT type_id, volume, best_sell, traded_volume, cached_at FROM station_volume_cache WHERE location_id=?",
-        (location_id,)
-    ).fetchall()
+        text("SELECT type_id, volume, best_sell, traded_volume, cached_at"
+             " FROM station_volume_cache WHERE location_id=:lid"),
+        {"lid": location_id}).fetchall()
     if not rows:
         return None
     now = time.time()
@@ -875,9 +943,9 @@ def get_station_volumes_any_age(
     loaded custom station on page load (like the never-expiring Jita cache).
     Returns (data, newest_cached_at) or None if nothing is cached."""
     rows = conn.execute(
-        "SELECT type_id, volume, best_sell, traded_volume, cached_at FROM station_volume_cache WHERE location_id=?",
-        (location_id,)
-    ).fetchall()
+        text("SELECT type_id, volume, best_sell, traded_volume, cached_at"
+             " FROM station_volume_cache WHERE location_id=:lid"),
+        {"lid": location_id}).fetchall()
     if not rows:
         return None
     data = {r[0]: (r[1], r[2], r[3]) for r in rows}

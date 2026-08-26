@@ -26,9 +26,7 @@ def db(tmp_path):
     shutil.copy2(SDE, path)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    from app.market.prices import ensure_price_table
     from app.db.schema import ensure_schema
-    ensure_price_table(conn)
     # Was `industry_helper.ensure_industry_tables`, which is now a shim that
     # takes a SQLAlchemy connection and returns early on anything but SQLite.
     # The fixture is creating the schema on the DBAPI handle, so it calls what

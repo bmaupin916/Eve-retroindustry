@@ -163,7 +163,8 @@ async def suggest_station(request: Request, q: str = ""):
     # Locations where the character has assets (personal + corporate)
     asset_locs: set[int] = set()
     if char:
-        raw = _load_assets_from_cache(conn, char[0])
+        with _connect() as _ac:
+            raw = _load_assets_from_cache(_ac, char[0])
         for a in raw:
             if not a.get("is_singleton", False):
                 asset_locs.add(a["location_id"])
@@ -509,7 +510,6 @@ async def fetch_plan_sell_price(request: Request, location_id: int, type_id: int
     """Fetch the best sell price of a specific product at the given station, save it to station_volume_cache."""
     conn = get_conn()
     token = get_active_token(request, conn)
-    ensure_price_table(conn)
 
     # Ensure the type_id is present in market_price_cache (the fetchers need it for filtering)
     with _connect() as _pc:
@@ -526,16 +526,23 @@ async def fetch_plan_sell_price(request: Request, location_id: int, type_id: int
     region_id = await _region_for(location_id, token)
 
     try:
-        if location_id >= 1_000_000_000:
-            if not token:
-                conn.close()
-                return {"ok": False, "error": "Sign-in is required to access the structure market."}
-            result = await fetch_structure_market(conn, location_id, token, {type_id}, region_id)
-        else:
-            if not region_id:
-                conn.close()
-                return {"ok": False, "error": "Could not determine the region for this location."}
-            result = await fetch_station_volumes(conn, location_id, region_id, [type_id])
+        # One engine connection for the whole fetch. `app/market/prices.py` is on
+        # the portable layer now, and unlike the route-jump cache these writers
+        # need the connection *during* the ESI calls — they persist orders and
+        # volumes as the pages arrive — so it is held across the await by
+        # necessity rather than by oversight.
+        with _connect() as _mc:
+            ensure_price_table(_mc)
+            if location_id >= 1_000_000_000:
+                if not token:
+                    conn.close()
+                    return {"ok": False, "error": "Sign-in is required to access the structure market."}
+                result = await fetch_structure_market(_mc, location_id, token, {type_id}, region_id)
+            else:
+                if not region_id:
+                    conn.close()
+                    return {"ok": False, "error": "Could not determine the region for this location."}
+                result = await fetch_station_volumes(_mc, location_id, region_id, [type_id])
     except PermissionError as e:
         conn.close()
         return {"ok": False, "error": str(e)}
@@ -592,7 +599,8 @@ async def suggest(request: Request, q: str = ""):
 
     if char:
         char_id, _ = char
-        raw_bps = _load_blueprints_from_cache(conn, char_id)
+        with _connect() as _ac:
+            raw_bps = _load_blueprints_from_cache(_ac, char_id)
         if raw_bps:
             bp_type_ids = list({bp["type_id"] for bp in raw_bps})
             # Group by type_id — pick the best one (BPO > BPC, highest ME)
