@@ -35,7 +35,7 @@ import time
 import zipfile
 
 from rich.console import Console
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Connection, make_url
 
 from app.sde import feed
@@ -429,7 +429,18 @@ def _drop_static_data(engine, url: str) -> None:
             os.remove(path)
             console.print(f"[dim]Removed existing {path}[/]")
         return
-    tables = [metadata.tables[n] for n in sorted(SDE_TABLES)]
+    # Ask which of them are actually there, rather than reporting the length of
+    # the list we asked about. `drop_all(checkfirst=True)` silently skips the
+    # ones that do not exist, so the old message told an operator running
+    # `--fresh` against a database with no static data that 14 tables had been
+    # dropped. Harmless on its own, and exactly the shape of claim this project
+    # has been bitten by before: a line that states a number it never measured.
+    with engine.connect() as conn:
+        present = set(inspect(conn).get_table_names())
+    tables = [metadata.tables[n] for n in sorted(SDE_TABLES) if n in present]
+    if not tables:
+        console.print("[dim]No static-data tables to drop[/]")
+        return
     metadata.drop_all(engine, tables=tables, checkfirst=True)
     console.print(f"[dim]Dropped {len(tables)} static-data tables[/]")
 

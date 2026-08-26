@@ -297,6 +297,43 @@ An exemption scoped to a whole file is a hole, not a tuning.
 
 ---
 
+## The most dangerous function in a file is often the least tested one
+
+`import_sde.py --fresh` had no test on either backend, and `_drop_static_data`
+is the one function in that file whose docstring names a consequence: deleting
+the database "would take `characters` and every refresh token with it, which is
+a defect this project has shipped once already, from a different button". The
+guard was written, described, and never exercised.
+
+It turned out to be **correct**, which is the part worth noticing — the reason to
+test it was never a suspicion, it was the cost of being wrong. Mutating it five
+ways (drop everything / drop nothing / miscount / unlink without releasing the
+handle / drop tables instead of removing the file) is caught 5/5 by
+`tests/test_sde_fresh_import.py`. The mutation that drops every declared table
+really does destroy `characters` and the token in it, on a live Postgres
+database, in about a second.
+
+Two things the test had to get right to be worth having:
+
+* **The two branches do opposite things and both are correct.** A SQLite *file*
+  is deleted whole, because that path builds the committed `sde_base.db` bundle
+  and dropping tables would leave whatever else the file held — which then ships.
+  Any other target drops the fourteen SDE tables only. A test asserting one
+  behaviour on both backends would be asserting a bug on one of them.
+* **The positive control is not optional here.** Every "the runtime data
+  survived" assertion is equally satisfied by a `_drop_static_data` that does
+  nothing whatsoever, so one test has to check the static data actually went.
+
+### The same file was claiming a number it never measured
+
+`--fresh` printed *"Dropped 14 static-data tables"* against a database with
+none. `drop_all(checkfirst=True)` silently skips what is not there, and the
+message reported the length of the list it had asked about. Harmless, and
+exactly the shape this project keeps getting caught by — so it now inspects
+first and says "No static-data tables to drop" when that is what happened.
+
+---
+
 ## The rule the design doc keeps rediscovering
 
 **A name that claims something about the world needs an assertion about the
