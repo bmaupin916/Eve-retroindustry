@@ -32,7 +32,14 @@ DEFAULTS: dict[str, tuple[object, type]] = {
     "industry_skill":        (5, int),
     "adv_industry_skill":    (5, int),
     "input_basis":           ("sell", str), # "sell" = instant-buy, "buy" = place orders
-    "price_hub":             ("jita", str), # only Jita for now; configurable later
+    # `price_hub` used to sit here, carrying the comment "only Jita for now;
+    # configurable later". It was not that: nothing read it, anywhere, and the
+    # hub was chosen elsewhere. A declared default with no reader is worse than
+    # no default — it is stored, offered to every caller of `load_defaults`,
+    # and answers questions about behaviour it does not affect. Removing it is
+    # safe for existing installs because `save_defaults` and `load_defaults`
+    # both treat `DEFAULTS` as the schema and skip any stored row not in it, so
+    # the leftover value becomes dead weight rather than an error.
 
     # ── Job splitting and slots ──────────────────────────────────────────
     # Longest a single job may run before it is split into several. 0 = never

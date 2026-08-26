@@ -47,7 +47,10 @@ from dataclasses import dataclass
 # and Advanced Industry (3388).
 SKILL_ACCOUNTING = 16622
 SKILL_BROKER_RELATIONS = 3446
-SKILL_ADVANCED_BROKER_RELATIONS = 16597      # relist fee only, unused for now
+# Advanced Broker Relations (16597) is deliberately absent. It reduces the fee
+# for *modifying* an existing order, and nothing here models relisting — so a
+# constant for it would sit in the module that computes fees looking like an
+# input to them. It belongs with the relist feature, if that is ever built.
 
 SALES_TAX_BASE = 0.075          # 7.5% since Version 22.02 (2025-03-12), was 4%
 SALES_TAX_PER_LEVEL = 0.11      # Accounting cuts the base by 11% per level

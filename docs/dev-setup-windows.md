@@ -131,7 +131,11 @@ needed.
 The app runs on SQLite and Postgres, and roughly a third of the suite is parameterised over both.
 Without a Postgres server those halves **skip silently**, so a suspiciously fast run means a stopped
 container rather than a fast machine — read the skip count, not the clock. A healthy full run today
-is about six minutes and reports **2 skipped** (POSIX file modes on Windows, not a backend).
+is about six minutes and reports **2 skipped**. Both are real platform facts rather than deferred
+work, and it is worth knowing which two so a third stands out: one is POSIX file modes, which
+Windows does not enforce, and the other is a test that lowers a SQLite compile-time limit and has
+no Postgres equivalent, so it skips on that backend's half. A count above two means something
+else is skipping — most likely the Postgres container.
 
 ```powershell
 docker start eve-pg
