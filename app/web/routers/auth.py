@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import sqlite3
 import time as _time
 
 from fastapi import APIRouter, Request
@@ -43,6 +42,10 @@ from app.market.prices import TRADE_HUBS
 from app.sync import worker as sync_worker
 from app.web import app_defaults, security
 from app.db.conn import connect as _connect
+from sqlalchemy import text
+
+from app.db.conn import NO_SUCH_TABLE
+
 from app.web.deps import (ACTIVE_COOKIE, _tr, _valid_token_async,
                           all_characters, any_character, character_row,
                           get_conn)
@@ -502,7 +505,8 @@ async def settings_page(request: Request):
         from app.db.conn import connect
         with connect() as _defaults_conn:
             defaults = app_defaults.get_defaults(_defaults_conn)
-        station_options = _industry_station_options(conn)
+        with connect() as _st:
+            station_options = _industry_station_options(_st)
         # Only the eight canonical decryptors: the faction-flavoured duplicates
         # and the ancient-relic ones behave identically or belong to reverse
         # engineering, and 64 entries would make the picker unusable.
@@ -524,18 +528,21 @@ async def settings_page(request: Request):
     })
 
 
-def _industry_station_options(conn: sqlite3.Connection) -> list[dict]:
+def _industry_station_options(conn) -> list[dict]:
     """Stations we know a name for — the candidates for a build/reaction default.
 
     Sourced from the shared location-name cache, so it lists exactly the places
     this install has already seen (assets, jobs, a previous /plan).
     """
     try:
-        rows = conn.execute(
-            "SELECT location_id, name FROM location_name_cache "
-            "WHERE name IS NOT NULL AND name <> '' ORDER BY name"
-        ).fetchall()
-    except sqlite3.OperationalError:
+        rows = conn.execute(text(
+            "SELECT location_id, name FROM location_name_cache"
+            " WHERE name IS NOT NULL AND name <> '' ORDER BY name")).fetchall()
+    except NO_SUCH_TABLE:
+        # The portable pair, not `sqlite3.OperationalError`: Postgres raises
+        # ProgrammingError for a missing table, so the driver-specific except
+        # would stop catching the moment the backend changed — and this is a
+        # first-run path, where the table genuinely may not exist yet.
         return []
     return [{"location_id": r[0], "name": r[1]} for r in rows]
 

@@ -47,9 +47,14 @@ APP = REPO / "app"
 #: `test_db_conn.py::test_sqlite_still_gets_its_pragmas` covers instead.
 PRAGMA_SITES = {
     "app/web/deps.py",         # the raw handle every router opens
-    "app/auth/esi_oauth.py",   # rotating refresh tokens, a genuine writer
     "app/web/bootstrap.py",    # first-run setup, before anything else exists
 }
+# `app/auth/esi_oauth.py` was here until v0.9.73 and was removed because
+# `test_the_exemption_list_is_all_still_real` said so, which is the entire point
+# of that test. Its `_open_conn` had been dead since `token_store` converted —
+# nothing called it, while a comment further down the same file asserted it was
+# still in use. An exemption list is a claim about the world, and this one is
+# the only thing keeping it honest.
 
 WRITE_SQL = ("insert into", "update ", "delete from", "create table",
              "drop table", "alter table", "replace into")

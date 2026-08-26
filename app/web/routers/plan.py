@@ -513,7 +513,8 @@ async def plan_result(
             for tid, q in _station_types.get(sid, {}).items():
                 available[tid] = available.get(tid, 0) + q
 
-        bp = find_blueprint_for_product(blueprints, type_id, conn)
+        with _connect() as _bc:
+            bp = find_blueprint_for_product(blueprints, type_id, _bc)
         me = float(me_override if me_override is not None else (bp.material_efficiency if bp else 0))
         te = int(te_override if te_override is not None else (bp.time_efficiency if bp else 0))
 

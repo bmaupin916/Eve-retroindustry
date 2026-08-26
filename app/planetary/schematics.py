@@ -60,6 +60,11 @@ class PINode:
         return acc
 
 
+from sqlalchemy import text
+
+from app.db.conn import connect_to_path
+
+
 class PIResolver:
     """Walks the PI schematic graph. Usable headless — constructor takes a path.
 
@@ -69,8 +74,11 @@ class PIResolver:
     """
 
     def __init__(self, db_path: str):
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
+        # `connect_to_path`, not `connect()`: this resolver is handed an explicit
+        # database path — the web layer passes the app's, the tests pass
+        # `sde_base.db` directly — and routing it through the configured URL
+        # would quietly ignore the argument.
+        self.conn = connect_to_path(db_path)
         self._schematic_cache: dict[int, sqlite3.Row | None] = {}
         self._mat_cache: dict[int, list[sqlite3.Row]] = {}
         self._name_cache: dict[int, str] = {}
@@ -87,8 +95,9 @@ class PIResolver:
         if cached is not None:
             return cached
         row = self.conn.execute(
-            "SELECT name FROM sde_types WHERE type_id=?", (type_id,)
-        ).fetchone()
+            text("SELECT name FROM sde_types WHERE type_id=:tid"),
+            {"tid": type_id},
+        ).mappings().fetchone()
         name = row["name"] if row else f"Unknown ({type_id})"
         self._name_cache[type_id] = name
         return name
@@ -99,8 +108,9 @@ class PIResolver:
         if cached is not _MISSING:
             return cached  # type: ignore[return-value]
         row = self.conn.execute(
-            "SELECT type_id FROM sde_types WHERE name=?", (name,)
-        ).fetchone()
+            text("SELECT type_id FROM sde_types WHERE name=:name"),
+            {"name": name},
+        ).mappings().fetchone()
         tid = row["type_id"] if row else None
         self._type_id_cache[name] = tid
         return tid
@@ -115,11 +125,11 @@ class PIResolver:
         cached = self._schematic_cache.get(type_id, _MISSING)
         if cached is not _MISSING:
             return cached  # type: ignore[return-value]
-        row = self.conn.execute("""
+        row = self.conn.execute(text("""
             SELECT schematic_id, name, cycle_time, output_type_id, output_qty
             FROM sde_planet_schematics
-            WHERE output_type_id = ?
-        """, (type_id,)).fetchone()
+            WHERE output_type_id = :tid
+        """), {"tid": type_id}).mappings().fetchone()
         self._schematic_cache[type_id] = row
         return row
 
@@ -127,12 +137,12 @@ class PIResolver:
         cached = self._mat_cache.get(schematic_id)
         if cached is not None:
             return cached
-        rows = self.conn.execute("""
+        rows = self.conn.execute(text("""
             SELECT m.type_id, m.quantity, t.name
             FROM sde_planet_schematic_materials m
             JOIN sde_types t ON t.type_id = m.type_id
-            WHERE m.schematic_id = ?
-        """, (schematic_id,)).fetchall()
+            WHERE m.schematic_id = :sid
+        """), {"sid": schematic_id}).mappings().fetchall()
         self._mat_cache[schematic_id] = rows
         return rows
 

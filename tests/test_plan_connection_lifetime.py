@@ -90,21 +90,34 @@ def test_the_happy_path_closes_the_sde_connection_too(client, monkeypatch):
 
 # ── the same leak, one layer down ────────────────────────────────────────────
 
-def test_build_plan_closes_both_of_its_connections_when_something_raises(tmp_path):
+def test_build_plan_closes_its_connection_when_something_raises(tmp_path):
     """`app/manufacturing/planner.py::build_plan` had the identical shape twice.
 
-    It opens two connections — `connect_to_path(db_path)` for the resolver and a
-    raw `sqlite3.connect(db_path)` for the blueprint lookup — and closed both
-    with bare calls at the bottom of a span containing
+    It used to open **two** connections — `connect_to_path(db_path)` for the
+    resolver and a raw `sqlite3.connect(db_path)` for the blueprint lookup — and
+    close both with bare calls at the bottom of a span containing
     `find_blueprint_for_product` and `resolver.resolve`. `plan_result` calls it
     from inside the same `except Exception` handler, so a failure here leaked
     **two** handles per attempt with no symptom at all.
 
-    The trap this pins, and the reason a bare `with` would not have been the
-    fix: a `sqlite3.Connection` used as a context manager commits or rolls back
-    its transaction and does **not** close the connection. Only
-    `contextlib.closing` closes it. A "fixed" version using `with` looks right,
-    passes any test that checks for an exception, and leaks exactly as before.
+    **There is one connection now.** `find_blueprint_for_product` moved onto the
+    portable query layer in v0.9.73, so it takes the resolver's connection and
+    the raw one is gone entirely. This test was renamed rather than deleted: the
+    leak it guards is a property of the `try/finally`, not of how many handles
+    are inside it.
+
+    Worth keeping for the trap it records even though no `sqlite3` handle
+    survives here to fall into it: a `sqlite3.Connection` used as a bare context
+    manager commits or rolls back its transaction and does **not** close the
+    connection. Only `contextlib.closing` closes it. A "fixed" version using
+    `with` looks right, passes any test that checks for an exception, and leaks
+    exactly as before. That is why the old code wrapped it the way it did, and
+    the reasoning outlives the code.
+
+    The `opened_raw` half of this test is kept as a **negative** assertion for
+    the same reason the positive controls exist elsewhere: if a raw
+    `sqlite3.connect` ever reappears inside `build_plan`, that is a regression
+    worth failing on rather than silently re-permitting.
     """
     import shutil
     import sqlite3
@@ -146,16 +159,13 @@ def test_build_plan_closes_both_of_its_connections_when_something_raises(tmp_pat
         sqlite3.connect = real_connect
 
     assert opened_engine, "the spy never saw the engine connection — retarget this"
-    assert opened_raw, "the spy never saw the raw connection — retarget this"
 
     for c in opened_engine:
         assert c.closed, "the engine connection outlived a failed build_plan"
-    for c in opened_raw:
-        # A closed sqlite3.Connection raises on use; there is no `.closed`.
-        try:
-            c.execute("SELECT 1")
-        except sqlite3.ProgrammingError:
-            continue
-        raise AssertionError(
-            "the raw sqlite3 connection outlived a failed build_plan — note "
-            "that `with sqlite3.connect(...)` would NOT have fixed this")
+
+    # Now a regression guard rather than a leak check. `build_plan` opened a raw
+    # sqlite3 handle until v0.9.73 and no longer does; if one comes back, the
+    # `contextlib.closing` trap in the docstring comes back with it.
+    assert not opened_raw, (
+        f"build_plan opened {len(opened_raw)} raw sqlite3 connection(s) — it "
+        f"should use the engine connection it already has")

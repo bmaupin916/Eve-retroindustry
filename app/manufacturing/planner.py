@@ -8,8 +8,9 @@ Modes:
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from sqlalchemy import text
+
 from typing import Literal
-import sqlite3
 
 from app.bom.resolver import (
     BOMResolver, BOMNode, InventionParams, StationFacility, total_invention_cost,
@@ -155,13 +156,13 @@ class ManufacturingPlan:
 def find_blueprint_for_product(
     blueprints: list[CharBlueprint],
     product_type_id: int,
-    db_conn: sqlite3.Connection,
+    db_conn,
 ) -> CharBlueprint | None:
     row = db_conn.execute(
-        """SELECT blueprint_type_id FROM sde_blueprint_products
-           WHERE product_type_id=? AND activity IN ('manufacturing','reaction')
-           LIMIT 1""",
-        (product_type_id,)
+        text("""SELECT blueprint_type_id FROM sde_blueprint_products
+           WHERE product_type_id=:pid AND activity IN ('manufacturing','reaction')
+           LIMIT 1"""),
+        {"pid": product_type_id},
     ).fetchone()
     if not row:
         return None
@@ -207,8 +208,6 @@ def build_plan(
     runs_per_job_by_product: dict[int, int] | None = None,
     invention: InventionParams | None = None,
 ) -> ManufacturingPlan:
-    import contextlib
-
     from app.db.conn import connect_to_path
 
     # Both connections scoped, for the reason `plan_result` was fixed in
@@ -217,12 +216,15 @@ def build_plan(
     # so the bare closes at the bottom were skipped on exactly the paths that
     # reach them. Two handles per failed plan, held until the process exited.
     #
-    # `contextlib.closing` on the sqlite3 one and not a bare `with`: a
-    # `sqlite3.Connection` used as a context manager commits or rolls back the
-    # transaction and does **not** close the connection, which is the trap that
-    # makes this look fixed while still leaking.
-    with connect_to_path(db_path) as sde,             contextlib.closing(sqlite3.connect(db_path)) as db_conn:
-        bp = find_blueprint_for_product(blueprints, product_type_id, db_conn)
+    # One connection now, not two. This used to open a second, raw
+    # `sqlite3.connect(db_path)` purely because `find_blueprint_for_product`
+    # spoke the DBAPI — with a `contextlib.closing` around it, because a
+    # `sqlite3.Connection` used as a bare context manager commits or rolls back
+    # and does **not** close, which is the trap that makes a leak look fixed.
+    # That function is on the portable layer now, so it takes `sde` and the
+    # whole second connection goes away.
+    with connect_to_path(db_path) as sde:
+        bp = find_blueprint_for_product(blueprints, product_type_id, sde)
         # me_override/te_override carry the ROOT ME/TE the caller already settled
         # on (a value typed into the form, or the blueprint's own). Without them
         # this function re-derived ME from the owned blueprint only, so a

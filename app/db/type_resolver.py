@@ -4,23 +4,32 @@ Priority: local SDE → ESI (storing into sde_types for next time).
 """
 import asyncio
 import sqlite3
+from sqlalchemy import text
+
 import httpx
 
 ESI_BASE = "https://esi.evetech.net/latest"
 _ESI_SEM = asyncio.Semaphore(10)
 
 
-def resolve_name_sync(conn: sqlite3.Connection, type_id: int) -> str | None:
+def resolve_name_sync(conn, type_id: int) -> str | None:
     """Return the name from the local SDE. None if missing."""
-    row = conn.execute("SELECT name FROM sde_types WHERE type_id=?", (type_id,)).fetchone()
+    row = conn.execute(
+        text("SELECT name FROM sde_types WHERE type_id=:tid"),
+        {"tid": type_id}).fetchone()
     return row[0] if row else None
 
 
-def _save_to_sde(conn: sqlite3.Connection, type_id: int, name: str,
+def _save_to_sde(conn, type_id: int, name: str,
                  group_id: int | None, published: bool):
     conn.execute(
-        "INSERT INTO sde_types (type_id, name, group_id, published) VALUES (?,?,?,?) ON CONFLICT (type_id) DO UPDATE SET name=excluded.name, group_id=excluded.group_id, published=excluded.published",
-        (type_id, name, group_id, 1 if published else 0)
+        text("INSERT INTO sde_types (type_id, name, group_id, published)"
+             " VALUES (:tid, :name, :group_id, :published)"
+             " ON CONFLICT (type_id) DO UPDATE SET"
+             " name=excluded.name, group_id=excluded.group_id,"
+             " published=excluded.published"),
+        {"tid": type_id, "name": name, "group_id": group_id,
+         "published": 1 if published else 0},
     )
     conn.commit()
 

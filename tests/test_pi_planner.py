@@ -10,6 +10,8 @@ import sqlite3
 
 import pytest
 
+from sqlalchemy import text
+
 from app.db.conn import connect_to_path
 
 from app.planetary.planet_data import single_planet_types
@@ -106,7 +108,12 @@ def test_facility_rates(pi):
     out at anything else, the cycle-time maths is wrong.
     """
     expected = {1: 40.0, 2: 5.0, 3: 3.0, 4: 1.0}
-    rows = pi.conn.execute("SELECT output_type_id FROM sde_planet_schematics").fetchall()
+    # `pi.conn` is an engine connection now — PIResolver moved onto the portable
+    # query layer. `.mappings()` keeps `row["output_type_id"]` working below: a
+    # SQLAlchemy Row does not support string subscripting, a RowMapping does,
+    # and that is what stands in for the old `sqlite3.Row` row_factory.
+    rows = pi.conn.execute(text(
+        "SELECT output_type_id FROM sde_planet_schematics")).mappings().fetchall()
     assert len(rows) > 60, "SDE planet schematics look unpopulated"
 
     seen = set()

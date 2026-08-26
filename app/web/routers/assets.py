@@ -149,7 +149,8 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
             all_type_ids_for_names |= {a.type_id for a in corp_list}
         # No client: `resolve_names_bulk` reads the SDE and the name cache, and
         # only reaches ESI for ids neither knows. Passing None keeps it local.
-        names = await resolve_names_bulk(conn, list(all_type_ids_for_names), None)
+        with _connect() as _nc:
+            names = await resolve_names_bulk(_nc, list(all_type_ids_for_names), None)
     else:
         names = {}
 
@@ -995,7 +996,8 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
             all_unique_type_ids |= {bp.type_id for bp in bps_for}
         # None, not a client: every blueprint type is in the SDE, and a page
         # that must not fetch should not be given the means to.
-        names = await resolve_names_bulk(conn, list(all_unique_type_ids), None)
+        with _connect() as _nc:
+            names = await resolve_names_bulk(_nc, list(all_unique_type_ids), None)
 
         if all_unique_type_ids:
             with _connect() as _pc:

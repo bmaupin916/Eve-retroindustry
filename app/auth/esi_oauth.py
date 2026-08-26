@@ -23,7 +23,6 @@ import base64
 import hashlib
 import os
 import secrets
-import sqlite3
 import threading
 import time
 import urllib.parse
@@ -48,20 +47,6 @@ DEFAULT_CALLBACK_URL = "http://localhost:8000/callback"
 def callback_url() -> str:
     """The redirect URI. Must match the application registration at CCP."""
     return os.environ.get("EVE_CALLBACK_URL", "").strip() or DEFAULT_CALLBACK_URL
-
-
-def _open_conn() -> sqlite3.Connection:
-    """Open a fresh SQLite connection to the app DB."""
-    app_dir = os.environ.get("EVE_APP_DIR") or os.path.join(
-        os.path.dirname(__file__), "..", ".."
-    )
-    conn = sqlite3.connect(os.path.join(app_dir, "eve_cache.db"), timeout=30.0)
-    try:
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA journal_mode=WAL")
-    except Exception:
-        pass
-    return conn
 
 
 SCOPES = [
@@ -264,8 +249,9 @@ def complete_login(code: str | None, state: str | None) -> tuple[int, str]:
         raise LoginError("EVE's response did not contain the expected tokens.") from exc
 
     # `token_store` is on the portable query layer, so this takes an engine
-    # connection rather than the module's own sqlite3 one. `_open_conn` still
-    # exists for the rest of this module.
+    # connection. This was the last caller of the module's own `_open_conn`,
+    # which is why that function — and the two PRAGMAs it applied by hand —
+    # is now gone. Its docstring outlived its callers by a conversion.
     from app.db.conn import connect as _connect
     with _connect() as conn:
         ensure_characters_table(conn)
