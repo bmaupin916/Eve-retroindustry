@@ -288,7 +288,9 @@ and the equivalents for science and reactions. A joiner who grants jobs but not 
 read as *"12 in use, capacity not shared"* — never `12/0`, which says "a character with no
 slots" when the truth is "a character who declined to say". `/jobs` already computes the
 maximum as `None` in exactly this case; the corp board renders that state rather than
-coercing it to a number.
+coercing it to a number. A second scope is missing for the same layer —
+`esi-corporations.read_divisions.v1`, so a corp warehouse can be called what the corp
+calls it (§7). Both belong in one re-authorisation, not two.
 
 ### Bring-your-own client ID
 
@@ -637,6 +639,98 @@ stops being optional once a corp dashboard exists, because the dashboard's headl
 is exactly the one the distinction changes. §9.7.1 makes it cheaper than it was costed:
 alliance-assigned contracts arrive through the corp scope we already request, so
 "contracted back to the corp" is observable without a new grant.
+
+### The warehouse and the contract ledger — how gaps 1 and 3 get built
+
+Added 2026-08-28, after measuring what is already fetched. Both of the two hardest gaps
+above turn out to be **interpretation problems, not integration problems**: the endpoints
+are wired, the scopes are granted, and what is missing is a designation and a state machine.
+
+#### A corp mineral pool is a (structure, hangar division) pair
+
+Both halves are already in the cache. `fetch_corp_assets` reads
+`/corporations/{id}/assets/` and keeps `location_id` and `location_flag`, and
+`app/web/routers/assets.py` already buckets by the `CorpSAG1`–`CorpSAG7` flags — the seven
+corporation hangar divisions. Nothing needs fetching. What is missing is a **designation**:
+which (location, division) pairs are the build programme's pool. That is one configuration
+row per corp, not a feature.
+
+**One scope is missing, and it is the difference between "Division 3" and "Mineral Pool".**
+`/corporations/{id}/divisions/` (`esi-corporations.read_divisions.v1`, **not currently in
+`SCOPES`**) returns the corporation's own names for its seven hangar and seven wallet
+divisions. We hardcode `"CorpSAG3": "Division 3"` at `app/web/routers/assets.py:54`. Corps
+name these — *Build Mats*, *Capital Parts*, *Do Not Touch* — and that name is how members
+already refer to them out loud, so a tool that says "Division 3" is asking people to
+translate. The generic label stays as the fallback when the scope is absent.
+
+**Batch the grant, do not take it alone.** Scopes are fixed at authorization time (§5), so
+adding one re-authorises every linked character. Step 5's purge decision (§6) already forces
+exactly that event. **Any scope this design wants — divisions here, skills for the slot
+board — should be added in the same re-auth**, not in three separate ones spread over three
+months.
+
+**Reachability is the hard half, and we cannot see it.** "Materials are present" is not
+"the builder can get them". Corp hangar access is granted by role and title, and ESI exposes
+no per-division access mask per member. So the app must not claim reachability it cannot
+observe: report *"present in Build Mats @ <structure>"* and let a builder say they cannot
+reach it. Same discipline as the skills scope on the slot board — never render an inference
+as a fact.
+
+**Availability must net out what is already committed.** Forty million tritanium in the pool
+against three open assignments needing thirty-five is five million available, not forty.
+Free materials = pool contents − reservations held by open assignments. Without that
+subtraction two builders both see enough, both start, and the second one fails at the job
+window — which is the exact failure the whole tool exists to prevent, reproduced one level
+down.
+
+**Structure names need docking access.** `/universe/structures/{id}` answers only for a
+character who can dock there, so the warehouse's name resolves for members and not for
+outsiders. That happens to match the information boundary above: the alliance read model
+must not print a structure anyway.
+
+#### Corp contracts are the delivery ledger, and they are already fetched
+
+`app/character/contracts.py` already reads `/corporations/{id}/contracts/` and
+`/contracts/{cid}/items/`; `contracts_cache` is keyed `[owner_id, owner_kind]` and
+`esi-contracts.read_corporation_contracts.v1` is already in `SCOPES`. So the "second state
+machine" that the built-vs-delivered question warned about needs **no new grant and no new
+fetcher** — only interpretation.
+
+Three flows a build programme runs on, all of them observable:
+
+* **Issuance** — corp contracts materials *out* to a builder (issuer the corp, assignee the
+  character, price zero). This is what corps use instead of handing out hangar roles, and it
+  is the cleaner half of the materials problem: a contract is an explicit, auditable
+  handover where a hangar pull is not. **An expired issuance is a silently blocked
+  assignment**, and the expiry date is right there on the object.
+* **Delivery** — builder contracts finished hulls *to* the corp. This is the answer to
+  built-vs-delivered, it is directly observable, and it is the moment an assignment should
+  close.
+* **Courier** — hauling between the warehouse and the build structure, carrying
+  `start_location_id`, `end_location_id`, `reward`, `collateral` and `volume`. That is the
+  logistics leg no version of this plan has modelled, and it is free once contracts are read
+  as a ledger rather than a list.
+
+**Match deliveries by contents, not by title.** Contract titles are free text and people
+write "stuff". `contract_items_cache` holds the actual items and — by the design note on the
+table — never goes stale, because a contract's contents are fixed when it is created. So
+match `type_id` and quantity against the assignment, under the same rules as job matching
+above: accumulate quantity, and never claim retroactively.
+
+**Dedupe on `contract_id`, always.** §9.7.1 measured that the corporation endpoint also
+returns contracts assigned to the corporation's *alliance* and issued by other member corps
+— the same 2,912 rows arriving once per member corp. A delivery ledger that counts a
+contract once per corp that can see it inflates every number on the dashboard, and it
+inflates them in the direction that says the programme is going well.
+
+**Payment becomes observable on the same objects.** An item-exchange contract from the corp
+to a builder carrying a `price` is the build fee actually paid, so gap 3 gets its
+verification without touching the wallet journal.
+
+**One role caveat.** The corporation contracts endpoint requires the **Accountant** role —
+our own module docstring records it. Whoever links the corp must hold it, and a corp linked
+by someone who does not must degrade per §5: *"not authorized"*, not an empty ledger that
+reads as "nothing was ever delivered".
 
 ### Open questions
 
