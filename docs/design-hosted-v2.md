@@ -217,7 +217,7 @@ the migration; items 6–8 are new obligations that hosting creates.
    place, so this is a prerequisite for finding (7) in the next list anyway.
 
 **Correction to `docs/deploy-vps.md`:** it states an attacker can "act with your stored
-ESI tokens". All 24 requested scopes are read-only, including
+ESI tokens". All 23 requested scopes are read-only, including
 `esi-planets.manage_planets.v1`. An attacker gets complete financial and asset
 intelligence and can exfiltrate refresh tokens, but cannot move ISK or assets. The doc
 should be corrected so it is trusted on the parts that are accurate.
@@ -1798,7 +1798,7 @@ filesystem access to the database, which is the property that makes it safe to k
 
 `docs/deploy-vps.md` is rewritten: the SSH tunnel is gone, nginx + TLS is the deployment,
 and the section claiming an attacker could "act with your stored ESI tokens" is corrected —
-all 24 scopes are read-only. The README no longer promises that nothing leaves your
+all 23 scopes are read-only. The README no longer promises that nothing leaves your
 machine, because that is the thing this step trades away. *(W2's worst endpoint deleted
 rather than defended)*
 

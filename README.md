@@ -167,7 +167,7 @@ Nothing is sent anywhere other than the official EVE Online ESI API
 SDE feed (`developers.eveonline.com`).
 
 The database holds every character's refresh token. The app restricts it to the
-owning user, and all 24 requested scopes are read-only — someone who obtained it
+owning user, and all 23 requested scopes are read-only — someone who obtained it
 would get complete financial and asset intelligence, but could not move ISK,
 assets or jobs. Tokens are not yet encrypted at rest.
 

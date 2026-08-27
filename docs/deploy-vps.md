@@ -60,7 +60,19 @@ is for — see [Locked out](#locked-out).
 ## 1. System packages
 
 ```bash
-sudo apt update && sudo apt install -y python3 python3-venv python3-pip git nginx
+sudo apt update && sudo apt install -y python3 python3-venv python3-pip git nginx postgresql
+```
+
+Postgres is not optional on a server. The app runs on either backend, but the
+sync worker writes continuously while pages read, and that is the case SQLite
+handles worst — it is the whole reason Step 4 of the design existed.
+
+Create the role and the database now, because the SDE import in step 4 writes to
+whichever one the environment points at:
+
+```bash
+sudo -u postgres createuser eve --pwprompt
+sudo -u postgres createdb eve_retroindustry --owner eve
 ```
 
 ## 2. Service user and clone
@@ -103,6 +115,18 @@ build number is recorded in the database and a run with nothing to do says so
 and stops.
 
 Until it has run, every page redirects to `/setup`, which tells you this.
+
+**It writes to whatever `EVE_DATABASE_URL` says**, and that variable lives in the
+environment file created in step 5 — which does not exist yet. Either write that
+file first and source it, or pass the URL inline for this one command, the form
+`import_sde.py`'s own docstring gives:
+
+```bash
+sudo -u eve EVE_DATABASE_URL=postgresql+psycopg://eve:PASSWORD@127.0.0.1:5432/eve_retroindustry .venv/bin/python import_sde.py
+```
+
+Get this wrong and the import succeeds into a SQLite file the service will never
+open, which looks identical to not having run it at all.
 
 > **Why not ship a prebuilt file?** Earlier versions committed `sde_base.db`
 > and copied it into place. Three separate defects lived in that machinery —
@@ -197,11 +221,16 @@ EVE_APP_DIR=/opt/eve-retroindustry
 # only to debug, or on a second process that must not also sync.
 EVE_SYNC_WORKER=1
 
-# Postgres, when the query conversion finishes. Unset means SQLite at
-# $EVE_APP_DIR/eve_cache.db, which is what this deployment uses today.
-# The migrations and the SDE importer already run against it; the request path
-# does not yet, so setting this now gets you a schema and no working pages.
-# EVE_DATABASE_URL=postgresql+psycopg://user:pass@host:5432/eve_retroindustry
+# Postgres. Unset means SQLite at $EVE_APP_DIR/eve_cache.db.
+#
+# Set it. Since v0.9.76 the whole request path runs on either backend, and the
+# reason to prefer Postgres on a server is what Step 4 was about: SQLite under a
+# continuously writing sync worker is one file with one writer. Create the
+# database and role first — the app migrates to head on startup, and
+# import_sde.py fills the static tables, which sit outside the migration
+# history. A wrong URL fails loudly at startup; an absent one falls back to
+# SQLite silently, which is the worse outcome.
+EVE_DATABASE_URL=postgresql+psycopg://eve:CHANGEME@127.0.0.1:5432/eve_retroindustry
 ```
 
 ## 6. systemd unit
@@ -323,7 +352,7 @@ exits quickly when there is nothing new.
 ## What an attacker gets
 
 Worth being accurate about, because the previous version of this document was
-not. All 24 requested scopes are **read-only**, `esi-planets.manage_planets.v1`
+not. All 23 requested scopes are **read-only**, `esi-planets.manage_planets.v1`
 included. Someone with your session or your database gets complete financial and
 asset intelligence, and can exfiltrate refresh tokens — but cannot move ISK,
 assets or jobs.
