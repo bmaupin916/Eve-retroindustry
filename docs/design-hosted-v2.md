@@ -279,6 +279,17 @@ wants to claim alliance project lines grants identity plus `read_character_jobs`
 then leaks that, not their net worth. Minimum scope becomes a property of the system rather
 than a principle in a document.
 
+**One capability's scopes are not obvious: appearing on a corp slot board.** Occupancy —
+how many slots a character is using — comes from `read_character_jobs`, which §6 already
+asks every joiner for. **Capacity does not.** Slot maxima are derived from skills
+(`esi-skills.read_skills.v1`), because EVE has no endpoint reporting "this character has
+ten manufacturing slots"; the number is `1 + Mass Production + Advanced Mass Production`,
+and the equivalents for science and reactions. A joiner who grants jobs but not skills must
+read as *"12 in use, capacity not shared"* — never `12/0`, which says "a character with no
+slots" when the truth is "a character who declined to say". `/jobs` already computes the
+maximum as `None` in exactly this case; the corp board renders that state rather than
+coercing it to a number.
+
 ### Bring-your-own client ID
 
 Technically viable — PKCE means no client secret, so a user registers their own application
@@ -347,11 +358,29 @@ superset has to be declared up front.
 
 This is the expensive, unglamorous part, and it is where the project can hurt real people.
 
-There is **no ownership concept anywhere in the current schema**. `production_projects`,
-`project_plans`, `project_jobs`, `project_shopping` and `margin_watchlist` are all global.
-`app_defaults` is a single key/value table, so the entire app has one build station. And
-`main.py` has 18 sites that query characters on the assumption every character in the DB
-belongs to the same person.
+There is **no ownership concept across most of the schema.** Measured 2026-08-28: of 45 app
+tables, ~16 are already keyed to a character or corporation, and ~20 are global by nature —
+market, prices, routes, public contracts, and the 14 SDE tables beside them. **Nine are
+per-user state with no owner at all** — `app_defaults`, `station_rigs`,
+`custom_price_override`, `project_shopping`, `production_projects`, `project_plans`,
+`margin_snapshot`, `project_jobs`, `margin_watchlist` — and between them they account for
+**92 references in `app/`**. `app_defaults` is the worst of the nine: one key/value table,
+so the entire app has a single build station. Four further tables already carry an owner
+under another name and only need normalising — `contracts_cache`, `market_orders_cache` and
+`wallet_ledger_cache` on `[owner_id, owner_kind]`, `pi_colony_cache` on `char_id`.
+
+**So the hard core of this step is nine tables and ninety-two call sites, not forty-five.**
+
+Single-tenancy is also written into the schema as a constraint. `app_owner` is a one-row
+table carrying `CheckConstraint("id = 1", name="ck_app_owner_single_row")` — *the first
+character to log in claims the instance*. Step 5 is the commit that deletes that line and
+turns it into `accounts`, with a character-to-account link table beside it and an
+`account_id` on `app_sessions`.
+
+The character-query assumption survived the Step 4 split without shrinking. It used to be
+phrased here as "18 sites in `main.py`"; `main.py` is now a 182-line CLI and those reads
+live across twelve routers instead, which spreads the problem out rather than reducing it.
+**73 routes** is the surface the two-account leak test has to cover.
 
 Requirements:
 
@@ -372,6 +401,26 @@ Requirements:
   loop froze the whole app". `_valid_token_async` wraps it in a thread; v0.9.22 was a fix
   for this class. Every remaining synchronous path becomes a shared stall. Fix properly,
   do not wrap.
+
+**Existing user data is purged, not migrated** (decided 2026-08-28). There is one user and
+a handful of characters, and re-adding an account is thirty seconds of SSO against fifteen
+minutes of backfill nobody will ever run twice. So the nine ownerless tables get their
+primary keys changed outright.
+
+The reason this matters beyond saving an afternoon: the migration-safe route is
+`ADD COLUMN owner_id NULL` → backfill → tighten, and **a nullable owner column is exactly
+how a leak survives the CI lint**. The statement carries its `AND owner_id = :owner`, the
+scan passes, and rows with a NULL owner match nobody or everybody depending on the join.
+Purging means every table reaches `NOT NULL` with the owner in the primary key in the same
+commit that adds it, and there is never an interim state to get wrong. The token store gets
+the same benefit: re-authorising each character means encryption at rest lands with no
+decrypt-legacy-plaintext path to maintain for ever.
+
+Alembic migrations are still written — schema history stopped being optional in Step 4 —
+they are simply drop-and-recreate rather than backfills. This does **not** extend to the SDE
+or the market caches, which are expensive to *refetch* rather than expensive to retype, and
+are global anyway. **The licence expires the moment a second real person has data in
+here** — which is one more reason Step 5 lands before Step 6's corp pilot, not after.
 
 ---
 
@@ -401,6 +450,29 @@ structure locations are operational security in EVE.
 Enforce it in the read model. If the alliance query cannot select a character or facility
 column, nobody can add it to a template later.
 
+### Roster granularity — the corp view has an alt problem too
+
+The boundary above is about the *alliance* view. There is a second one inside a single
+corp, and it is easy to miss because the corp is where people assume everything is already
+shared.
+
+**Aggregating capacity to the player deanonymises alts to corp leadership.** A leader needs
+a player's total slots in order to assign work — and the moment the roster prints character
+names grouped under a player, the app has published which characters share an account. That
+is exactly what ESI refuses to do (§5): there is no endpoint linking characters to an EVE
+account, deliberately, and rebuilding one out of our own account table is not neutral just
+because we happen to be able to.
+
+**Decision: the corp roster is player-level by default.** A display name, slots by category,
+free now and free in 24 hours. Character-level detail is opt-in per character, by that
+character's owner, and off until they say so. Assignment targets a **player**, and the
+player decides which of their characters runs it — which is also the simpler model, because
+a leader is allocating against a capacity pool rather than choosing a pilot.
+
+Enforce it the way the alliance boundary is enforced: the roster read model does not select
+a character column unless that character is opted in. If the query cannot produce the name,
+no template can leak it later.
+
 ### What already exists
 
 `app/manufacturing/schedule.py` is further along than the feature needs:
@@ -417,6 +489,35 @@ column, nobody can add it to a template later.
 `fetch_industry_jobs` passes ESI through raw with `include_completed=True`, giving
 `job_id`, `product_type_id`, `runs`, `activity_id`, `start_date`, `end_date`, `status`,
 `facility_id`.
+
+### Capacity — the slot board
+
+The leader's first question is not "what is everyone building", it is **"who can take
+work"**. That is a slot count, and most of it is already written.
+
+`/jobs` computes it per character today (`app/web/routers/industry.py`): capacity is
+`1 + level(skill A) + level(skill B)` per category — Mass Production / Advanced Mass
+Production for manufacturing, Laboratory Operation / Advanced Laboratory Operation for
+science, Mass Reactions / Advanced Mass Reactions for reactions, eleven maximum each — and
+occupancy is a count of jobs in `active`, `paused` or `ready`, bucketed from `activity_id`
+through `_SLOT_CATEGORY`. Both inputs, `char_skills_cache` and `char_jobs_cache`, are kept
+warm by the Step 4 worker. **The corp board is that same arithmetic aggregated one level
+up**, not a new fetch and not a new model.
+
+Three things it must do that the per-character page does not:
+
+* **Report free slots, not total.** A player with 30 slots and 28 of them running their own
+  work has two. Free is the number an assignment decision is made against; total is trivia.
+* **Give free slots a time axis.** Slots come back as jobs end and `end_date` is already
+  cached, so *free now / free in 24h* is arithmetic rather than a projection. Same honesty
+  the ETA section below asks for, one level down.
+* **Distinguish "no capacity" from "capacity not shared".** Capacity needs the skills scope
+  and occupancy does not (§5), so a member who granted one but not the other must not
+  render as a zero.
+
+**There are no corp-level slots in EVE.** Slots are a property of a character; a
+corporation's capacity is the sum of its members' and nothing else. Nobody should go
+looking for a corporation endpoint that reports them.
 
 ### The hard problem: jobs carry no project tag
 
@@ -441,6 +542,32 @@ Two robustness requirements:
   already deliberate in the docstring; it needs a comment saying why, because it is the
   kind of thing that gets "simplified" later.
 
+### Matching rules — five things "the next job of that type" has to settle
+
+The default rule is the obvious one: once a player holds an assignment, the next job they
+start for that product counts toward it. That rule is right, and it is under-specified in
+five places — each one a way the ledger quietly tells a lie.
+
+1. **Match runs, not jobs.** "Build 200 Ravens" is ten jobs of twenty runs, or one of two
+   hundred, and the builder chooses which. Accumulate `runs` toward the assigned quantity;
+   never treat one job as one assignment.
+2. **A T2 assignment produces jobs that are not of that type.** Copying (activity 5) and
+   invention (8) come first, and neither is "manufacturing of the assigned product". Match
+   strictly on the assignment's product *and* activity, and show prerequisite jobs as
+   **related but unclaimed** — so the builder can see the tool understood what they were
+   doing, without it counting a BPC as a hull.
+3. **Two open assignments of the same product to the same player need a stated tiebreak.**
+   FIFO by assignment creation, shown in the ledger. Any rule will do; an *unstated* one
+   means the answer changes with implementation details, which is the one thing a ledger
+   may not do.
+4. **No retroactive claiming.** A job started before the assignment existed does not count
+   automatically, however tempting the time window is. Retroactive claiming takes work the
+   builder considers theirs, and that is the fastest way to lose trust in the whole ledger.
+   Offer an explicit "claim this job" button and let them decide.
+5. **The ledger is the feature, not the audit trail.** Auto-match with a one-click "not this
+   one" is already the chosen approach; rules 1–4 exist to keep the number of times anyone
+   needs that button low enough that they keep using it at all.
+
 ### Honest ETAs
 
 The estimate is two different things: running jobs have real `end_date`s, unstarted work
@@ -450,6 +577,66 @@ confident date hides that.
 Present it as it decomposes: *50 built · 30 in build (longest ends in 4 days) · 120 not
 started (~21 days at current slots)*. Same information, degrades honestly, and makes the
 bottleneck visible — which is the leader's actual decision.
+
+### What the coordination layer is still missing
+
+Added 2026-08-28. The chain at the top of this section models *who builds what* and nothing
+else. Everything below is something real corp industry programmes run on, and this design
+has no answer for it yet. Listed in the order they would sink a pilot.
+
+**1. Materials — nobody has said who supplies them.** An assignment of 25 Ravens is not
+actionable until it is settled whether the builder buys the minerals or the corp seeds
+them. Every programme that works has an answer, usually *corp buys, seeds a hangar
+division, builder pulls, builder contracts the hulls back*; a tool that ignores the
+material flow becomes a second spreadsheet beside the one people already keep. The data is
+reachable — `esi-assets.read_corporation_assets.v1` gives hangar contents by division, and
+`corp_assets_cache` exists. Minimum viable version is one flag on an assignment: **can this
+start** — inputs present in a division this player can reach, yes / no / partial. This is
+the largest gap in the section and it is larger than the matching problem.
+
+**2. Blueprints — an assignment can be impossible and nothing says so.** Building Ravens
+needs a Raven blueprint at a usable ME in the hands of the person assigned.
+`char_blueprints_cache` is already cached and `esi-corporations.read_blueprints.v1` covers
+the corp library, which turns assignment from guesswork into a query: *who can build this,
+at what ME*. It removes the most demoralising failure mode there is — being handed work you
+cannot do — and it makes a corp BPO library view nearly free, which corps ask for on its
+own merits.
+
+**3. Payment — the second most common reason these programmes die.** Someone builds and
+someone pays: a flat fee, ISK per run, or a share of the sale. If the tool holds the
+assignments and the completions but not the money, the money stays in a spreadsheet and the
+spreadsheet stays the source of truth. Minimum: an assignment carries an agreed reward, a
+completed assignment produces a payable line, and paid/unpaid is visible to both sides.
+`wallet_ledger_cache` already carries corp divisions, so *verifying* a payment landed is in
+reach later; recording what is owed does not need it.
+
+**4. Acceptance, and a pull mode.** The chain assigns work to people who may not log in for
+a week, which produces a plan that is fiction. An assignment needs **accepted / declined /
+expired**, with expiry returning it to the pool — the same treatment the abandoned-
+commitment question below wants, one level down. And many corps run better on **pull** than
+push: publish what is needed and let members claim lines. Support both by defining an
+assignment as *a claim someone else made on your behalf*; the state machine is identical.
+
+**5. Notifications, or the leader polls a web page forever.** Assignment offered, job
+finished, assignment overdue, blocked on materials. This is the strongest argument for the
+Discord bot (§9.5) — not as a query interface, which is the fun part, but as the thing that
+closes the loop. An in-app inbox is the fallback and should exist regardless.
+
+**6. Who may assign.** ESI Director is checkable (§5), but the person running a build
+programme is usually not a director, and directors are usually not running it. App-level
+roles layered over ESI roles, bootstrapped by Director, revalidated with membership.
+Leaving the corp must revoke the ability to assign **and** clear that person's assignments
+from the board — without deleting the history of what they built.
+
+**7. An audit log.** Who assigned what, who accepted, who detached a match, who marked
+something paid. This is a tool where ISK and blame meet, and an append-only log is what
+ends the argument. One table, written on every state transition, never updated.
+
+**Delivery is already an open question below and should move up.** "Built vs delivered"
+stops being optional once a corp dashboard exists, because the dashboard's headline number
+is exactly the one the distinction changes. §9.7.1 makes it cheaper than it was costed:
+alliance-assigned contracts arrive through the corp scope we already request, so
+"contracted back to the corp" is observable without a new grant.
 
 ### Open questions
 
@@ -1689,6 +1876,14 @@ ledger; the coarse alliance read model. Joiners grant minimal scopes (identity +
 `read_character_jobs`). **Pilot in own corp and measure the match-correction rate before
 any alliance rollout.**
 
+**Step 6 grew, 2026-08-28.** The corp management layer as actually wanted — a slot board
+aggregating free capacity per player, materials and blueprint feasibility on an assignment,
+payment records, acceptance with expiry, notifications, app-level roles and an audit log —
+is more than "orders → commitments → assignments" implied. See §7's four new subsections.
+The slot board is the cheap part, because the arithmetic already exists on `/jobs`;
+materials and blueprints are the two that decide whether the pilot is usable at all, and
+payment is what stops it reverting to a spreadsheet. Re-estimated below.
+
 **Step 7 — Feature buildout. 0 of 11 complete; 1 in beta.** Market BI rebuild on the group
 tree; refine calculator; mining ledger; appraisal; compression LP; Discord bot; dashboard
 widgets; and the three contracts items added 2026-08-28 (§9.7). Ordered by appetite — each
@@ -1748,7 +1943,7 @@ calls**, **47 tables**.
 | 3 — Go hosted | **1–2 sessions** + your VPS time | Med-high | Mostly *deletion*, which is fast. The unknown is deployment: DNS, certificates and the real SSO callback are elapsed time, not coding time. |
 | 4 — Platform foundations | **3–5 sessions** | **Low** | The wall. 310 queries and 47 tables to move to Postgres, plus ~45 SQLite-specific statements (`INSERT OR REPLACE` ×25, `PRAGMA` ×12, `AUTOINCREMENT` ×4). Splitting a 7,413-line module is mechanical but large. Widest range of any step. |
 | 5 — Multi-tenancy | **2–3 sessions** | Medium | Touches every table and every read, but the pattern is uniform once the query layer exists. The leak tests are what make it slow to call done. |
-| 6 — Groups + coordination | **3–4 sessions** to MVP | Low-med | The flagship, and the least designed. Plus **weeks of calendar time** piloting in your own corp — the match-correction rate cannot be rushed. |
+| 6 — Groups + coordination | **3–4** to the orders-to-assignments MVP; **6–9** with the corp layer | Low-med | The flagship, and the least designed. The MVP is the chain only; §7's slot board, materials and blueprint feasibility, payment, acceptance, roles and audit log are the rest. Plus **weeks of calendar time** piloting in your own corp — the match-correction rate cannot be rushed. |
 | 7 — Feature buildout | **10–17 sessions** for all of it | Medium | A menu, not a step. Each item is independent and separately estimable (below). |
 
 **Step 7, itemised** — pick, do not commit to the total:
@@ -1768,8 +1963,8 @@ calls**, **47 tables**.
 | Discord bot (§9.5) | 2–3 — identity linking is most of it |
 
 **Totals.** Steps 2–3 (a real hosted tool, secured): **2–4 sessions**. Steps 2–6 (the
-coordination product): **10–16 sessions** plus pilot time. Everything including all of
-Step 7: **18–30 sessions**.
+coordination product): **13–21 sessions** plus pilot time. Everything including all of
+Step 7: **23–38 sessions**.
 
 **Read these as ranges, not dates.** Two honest caveats. Step 4 is the least certain
 estimate here and the most likely to double — a Postgres port surfaces its problems while
@@ -1956,8 +2151,8 @@ Distinct from §11's worry register, which lists *code* problems that specific s
 These are risks to the plan itself; none of them is closed by shipping a step.
 
 **R1 — Multi-tenancy fails silently, and the failure is someone else's wallet.**
-18 query sites assume every character belongs to one person; no table has an owner column.
-This is not hard work, it is *thorough* work, and thoroughness across 80 routes is exactly
+Nine tables hold per-user state with no owner column at all, read from 92 call sites (§6).
+This is not hard work, it is *thorough* work, and thoroughness across 73 routes is exactly
 where a solo developer under no deadline misses one filter. There is no error when it goes
 wrong — just a corpmate seeing ISK they should not. Step 5's scoped query layer, CI lint and
 two-account leak test exist specifically to make this a property of the code rather than a
