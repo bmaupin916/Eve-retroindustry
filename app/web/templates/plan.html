@@ -639,8 +639,17 @@ function switchPlanChar(charId) {
     </div>
   </div>
 
-  {# Profit by sell price source (client-side recompute after fetch) #}
-  {% if result.revenue is not none %}
+  {# Profit by sell price source (client-side recompute after fetch)
+
+     Gated on there being a plan, NOT on already having a price. `revenue` comes
+     from the product's Jita sell price, and a supercarrier is never on a market
+     order — so gating on it hid this table for exactly the hulls it is most
+     useful for. Worse, the table is what "Fetch price" / "Fetch contract" write
+     into: `_recomputeProfitRow` looks up `#profit-compare tr[data-src=…]` and
+     returns early when the row is absent, so those buttons silently did nothing
+     on any product with no market price. The feature that supplies a missing
+     price was hidden precisely when the price was missing. #}
+  {% if result.quantity %}
   <div style="border-top:1px solid #21262d;padding:.55rem .75rem">
     <div class="text-uppercase fw-semibold mb-2" style="color:#8b949e;font-size:.68rem;letter-spacing:.07em">
       <i class="bi bi-graph-up-arrow me-1"></i>Profit by sell price

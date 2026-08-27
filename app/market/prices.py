@@ -622,9 +622,34 @@ def _cached_region_volume(conn: sqlite3.Connection, region_id: int | None) -> di
     store theirs in hub_price_cache. A custom station's "region vol/7d" is exactly
     that region-wide number, so when the region is one we've already loaded we can
     reuse it verbatim — the same data the Jita/hub columns show. Returns
-    {type_id: volume} or None if that region isn't cached yet."""
+    {type_id: volume} or None if that region isn't cached yet.
+
+    **Only while ESI still calls that copy current.** The stored `volume` is a
+    precomputed 7-day *sum*, and a sum cannot be re-windowed: once ESI rebuilds
+    its history the window has moved, the total is wrong, and nothing about the
+    value says so. Reusing it verbatim for ever therefore quietly under- or
+    over-states the region volume on every custom station in the region.
+
+    The freshness test is ESI's own `Expires`, which `market_hist_etag` already
+    records per type — the same header `_region_history_volume` uses a few lines
+    up to skip a refetch entirely. No invented TTL: this file's stance is that a
+    number is current while the server says it is and not one second longer.
+    `MIN(expires_at)` is the conservative summary of a region — if the earliest
+    entry has expired, the window has moved for all of them.
+
+    A region with no recorded expiry returns None and takes the slow path. That
+    is the right direction: a sum whose freshness cannot be established is not
+    one to serve as current.
+    """
     if not region_id:
         return None
+
+    fresh_until = conn.execute(
+        text("SELECT MIN(expires_at) FROM market_hist_etag WHERE region_id = :rid"),
+        {"rid": region_id}).scalar()
+    if not fresh_until or time.time() >= fresh_until:
+        return None
+
     if region_id == JITA_REGION:
         rows = conn.execute(text(
             "SELECT type_id, volume FROM market_price_cache"

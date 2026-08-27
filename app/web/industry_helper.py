@@ -128,10 +128,23 @@ def get_station_cost_bonus(conn: Connection, location_id: int) -> float:
 
 
 def populate_rig_bonuses(conn: Connection) -> None:
-    """Populate rig_bonuses from local SDE. No-op if already populated."""
-    if conn.execute(text("SELECT COUNT(*) FROM rig_bonuses")).fetchone()[0] > 0:
-        return
+    """Derive rig_bonuses from the SDE, and keep it in step with the SDE.
 
+    This used to return early the moment the table had any rows, which made it
+    a **one-shot**. `rig_bonuses` is an *app* table, so it survives an SDE
+    import untouched, and nothing anywhere else clears it — so a database
+    filled from one SDE build kept that build's rigs for ever. CCP adds
+    structure rigs; the new ones would never appear in the picker and would
+    carry no bonus into any ME or TE figure, silently, on six read paths.
+
+    Comparing against the SDE rather than stamping a build number costs one
+    query and catches strictly more: a rig whose *bonus* or name changed
+    without the build being re-imported looks identical to a build stamp.
+
+    Rows the SDE no longer publishes are deleted rather than left behind. An
+    unpublished rig that stayed in the table would go on being offered in the
+    picker, which is the same defect in the other direction.
+    """
     group_ids = list(_RIG_GROUP_MAP.keys())
     rows = conn.execute(
         text("SELECT type_id, name, group_id FROM sde_types"
@@ -164,6 +177,28 @@ def populate_rig_bonuses(conn: Connection) -> None:
         entries.append({"type_id": type_id, "name": name, "set_size": set_size,
                         "category": category, "me_bonus": me_bonus,
                         "te_bonus": te_bonus})
+
+    # Nothing to write unless the SDE now says something different. Compared on
+    # every derived field, not just the row count: a rig can change its bonus
+    # or its name without the count moving.
+    desired = {e["type_id"]: (e["name"], e["set_size"], e["category"],
+                              float(e["me_bonus"]), float(e["te_bonus"]))
+               for e in entries}
+    current = {
+        r[0]: (r[1], r[2], r[3], float(r[4]), float(r[5]))
+        for r in conn.execute(text(
+            "SELECT type_id, name, set_size, category, me_bonus, te_bonus"
+            " FROM rig_bonuses")).fetchall()
+    }
+    if current == desired:
+        return
+
+    stale = sorted(set(current) - set(desired))
+    if stale:
+        conn.execute(
+            text("DELETE FROM rig_bonuses WHERE type_id IN :ids").bindparams(
+                bindparam("ids", expanding=True)),
+            {"ids": stale})
 
     # Guarded because an empty list is not a no-op here the way it was for
     # `executemany`: SQLAlchemy has no rows to infer the statement's parameter

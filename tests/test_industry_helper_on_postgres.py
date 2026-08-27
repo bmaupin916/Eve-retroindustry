@@ -190,9 +190,58 @@ def test_a_plain_efficiency_rig_carries_both(conn):
     assert got == (2.0, 20.0), f"on {_backend(conn)}"
 
 
-def test_populate_is_a_noop_once_the_table_has_rows(conn):
-    """The early return is the only thing making this cheap to call repeatedly.
-    A conversion that lost it would re-read the SDE every time."""
+class _CountingConn:
+    """A real connection that records which statements wrote.
+
+    `populate_rig_bonuses` used to be cheap by returning the moment the table
+    had any rows. It now compares against the SDE instead, so "cheap" has to be
+    demonstrated rather than assumed: an unchanged SDE must still write nothing.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.writes: list[str] = []
+
+    def execute(self, stmt, *a, **kw):
+        head = str(stmt).strip().split()[0].upper()
+        if head in ("INSERT", "DELETE", "UPDATE"):
+            self.writes.append(head)
+        return self._inner.execute(stmt, *a, **kw)
+
+    def commit(self):
+        return self._inner.commit()
+
+
+def test_a_rig_added_by_a_later_sde_appears(conn):
+    """The defect this replaced, and the reason it was invisible.
+
+    `rig_bonuses` is an *app* table, so an SDE import leaves it alone, and
+    nothing else clears it. While `populate_rig_bonuses` returned early on "the
+    table has rows", a database filled from one SDE build kept that build's rigs
+    for ever — CCP adds structure rigs, and a new one would never reach the
+    picker nor carry its bonus into any ME/TE figure.
+    """
+    ih.populate_rig_bonuses(conn)
+    before = conn.execute(text("SELECT COUNT(*) FROM rig_bonuses")).fetchone()[0]
+
+    new_rig = 99_001
+    conn.execute(text("INSERT INTO sde_types (type_id, name, group_id, published)"
+                      " VALUES (:t, 'Standup M-Set Equipment Manufacturing"
+                      " Material Efficiency III', 1816, 1)"), {"t": new_rig})
+    conn.commit()
+
+    ih.populate_rig_bonuses(conn)
+
+    got = conn.execute(text("SELECT me_bonus FROM rig_bonuses WHERE type_id=:t"),
+                       {"t": new_rig}).fetchone()
+    assert got is not None, f"a rig added after first population never appeared, on {_backend(conn)}"
+    assert conn.execute(
+        text("SELECT COUNT(*) FROM rig_bonuses")).fetchone()[0] == before + 1
+
+
+def test_a_rig_the_sde_no_longer_publishes_is_removed(conn):
+    """The same staleness in the other direction: a row left behind goes on
+    being offered in the picker for a rig that no longer exists."""
     conn.execute(text("INSERT INTO rig_bonuses (type_id, name, set_size,"
                       " category, me_bonus, te_bonus)"
                       " VALUES (1, 'sentinel', 'M', 'manufacturing', 0, 0)"))
@@ -201,7 +250,19 @@ def test_populate_is_a_noop_once_the_table_has_rows(conn):
     ih.populate_rig_bonuses(conn)
 
     assert conn.execute(
-        text("SELECT COUNT(*) FROM rig_bonuses")).fetchone()[0] == 1
+        text("SELECT COUNT(*) FROM rig_bonuses WHERE type_id=1")).fetchone()[0] == 0
+
+
+def test_nothing_is_written_when_the_sde_has_not_changed(conn):
+    """What the old early return bought, kept. Comparing before writing is the
+    whole point — otherwise this rewrites every rig on every settings page."""
+    ih.populate_rig_bonuses(conn)
+
+    spy = _CountingConn(conn)
+    ih.populate_rig_bonuses(spy)
+
+    assert spy.writes == [], (
+        f"a second call rewrote the table on {_backend(conn)}: {spy.writes}")
 
 
 def test_items_without_standup_in_the_name_are_skipped(conn):

@@ -248,10 +248,31 @@ def test_an_entry_with_no_etag_is_not_loaded(conn):
 
 # ── the region volume reuse ──────────────────────────────────────────────────
 
+def _still_current(conn, region_id) -> None:
+    """Record that ESI still calls this region's history current.
+
+    A precondition of reuse since v0.9.82: the stored `volume` is a precomputed
+    7-day *sum* and cannot be re-windowed, so it is served only while ESI's own
+    `Expires` says the copy it came from is still authoritative. The tests below
+    are about *which table* and *which region* a volume is read from, which is
+    orthogonal — so they state the freshness rather than depend on the absence
+    of a check. `tests/test_region_volume_reuse.py` is where the expiry rule
+    itself is pinned.
+    """
+    conn.execute(
+        text("INSERT INTO market_hist_etag"
+             " (region_id, type_id, etag, days_json, cached_at, expires_at)"
+             " VALUES (:r, :t, '', '{}', :c, :x)"),
+        {"r": region_id, "t": TRITANIUM, "c": time.time(),
+         "x": time.time() + 3600})
+    conn.commit()
+
+
 def test_the_forge_volume_comes_from_the_jita_cache(conn):
     """Jita's region is special-cased: its 7-day volumes live in
     `market_price_cache`, not `hub_price_cache`."""
     market._save_cached_price(conn, TRITANIUM, 5.5, 4.5, volume=999)
+    _still_current(conn, JITA_REGION)
 
     assert market._cached_region_volume(conn, JITA_REGION) == {TRITANIUM: 999}
 
@@ -268,6 +289,8 @@ def test_a_hub_volume_comes_from_the_hub_cache_for_that_region(conn):
          {"r": SINQ_LAISON, "t": TRITANIUM, "s": 7.0, "b": 6.0, "v": 222,
           "c": time.time()}])
     conn.commit()
+    _still_current(conn, HEIMATAR)
+    _still_current(conn, SINQ_LAISON)
 
     assert market._cached_region_volume(conn, HEIMATAR) == {TRITANIUM: 111}
     assert market._cached_region_volume(conn, SINQ_LAISON) == {TRITANIUM: 222}
@@ -276,7 +299,14 @@ def test_a_hub_volume_comes_from_the_hub_cache_for_that_region(conn):
 def test_a_region_with_nothing_cached_is_none_not_empty(conn):
     """`None` means "not loaded yet, go and fetch"; `{}` would mean "loaded, and
     this region trades nothing". The caller branches on it, so collapsing the
-    two turns a cache miss into a claim about the market."""
+    two turns a cache miss into a claim about the market.
+
+    The freshness stamp is deliberate: without it this would return `None` at
+    the expiry gate and never reach the empty-rows path it is named after —
+    still green, and testing nothing.
+    """
+    _still_current(conn, HEIMATAR)
+
     assert market._cached_region_volume(conn, HEIMATAR) is None
 
 
@@ -294,6 +324,7 @@ def test_rows_without_a_volume_are_excluded(conn):
     """
     market._save_cached_price(conn, TRITANIUM, 5.5, 4.5, volume=999)
     market._save_cached_price(conn, PYERITE, 3.0, 2.0)          # no volume
+    _still_current(conn, JITA_REGION)
 
     got = market._cached_region_volume(conn, JITA_REGION)
 
