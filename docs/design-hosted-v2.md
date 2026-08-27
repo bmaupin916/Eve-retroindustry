@@ -1762,6 +1762,9 @@ calls**, **47 tables**.
 | Market BI rebuild (§9.4) | 1–2 |
 | Mining ledger (§9.3) | 1–2 |
 | Compression LP | 1–2 |
+| Contract appraisal (§9.7.2) | 1 — the cascade is the work; share it with the §9.3 appraiser |
+| Public contract index in the worker (§9.7.3) | 1 — mostly deleting the page-triggered stream |
+| Alliance contracts (§9.7.1) | 1 — *but see Step 6; the finding belongs there, not here* |
 | Discord bot (§9.5) | 2–3 — identity linking is most of it |
 
 **Totals.** Steps 2–3 (a real hosted tool, secured): **2–4 sessions**. Steps 2–6 (the
