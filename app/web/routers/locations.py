@@ -191,20 +191,33 @@ async def suggest_station(request: Request, q: str = ""):
             other_ids.add(loc_id)
     other.sort(key=lambda x: x["name"])
 
-    # ESI search — NPC stations + systems + player structures (in parallel)
+    # ESI lookup — NPC stations + systems + player structures (in parallel)
     try:
         async with esi_client() as client:
+            # **CCP removed the public `/search/` endpoint.** It answers 404 on
+            # every version for every query, including ones that cannot fail.
+            # That silently cost this box two of its four sources: NPC stations
+            # by name, and the system-name lookup everything below keys off.
+            # Losing the second is the worse half — without a system id the code
+            # never reaches "structures in this system" or "NPC stations in this
+            # system", so a nullsec system typed in full returned nothing even
+            # when it has an NPC station.
+            #
+            # It failed invisibly for two compounding reasons: a 404 here yields
+            # an empty list rather than an error, and the *authenticated*
+            # `/characters/{id}/search/` still exists — so player structures the
+            # character can dock at kept appearing and the box looked alive.
+            #
+            # `POST /universe/ids/` is the documented replacement. It matches
+            # **whole names only**: the old `strict=false` partial matching is
+            # gone for good. The local-cache pass above is what still does
+            # substring matching, over every name already known — so once
+            # "PR-8CA" has been looked up once, typing "PR-8" finds it again.
             esi_tasks: list = [
-                client.get(
-                    "https://esi.evetech.net/latest/search/",
-                    params={"categories": "station", "search": q.strip(),
-                            "datasource": "tranquility", "strict": "false"},
-                    timeout=5.0,
-                ),
-                client.get(
-                    "https://esi.evetech.net/latest/search/",
-                    params={"categories": "solar_system", "search": q.strip(),
-                            "datasource": "tranquility", "strict": "false"},
+                client.post(
+                    "https://esi.evetech.net/latest/universe/ids/",
+                    params={"datasource": "tranquility"},
+                    json=[q.strip()],
                     timeout=5.0,
                 ),
             ]
@@ -221,13 +234,20 @@ async def suggest_station(request: Request, q: str = ""):
                 )
 
             results = await asyncio.gather(*esi_tasks, return_exceptions=True)
-            station_search = results[0]
-            system_search = results[1]
-            structure_search = results[2] if len(results) > 2 else None
+            ids_res = results[0]
+            structure_search = results[1] if len(results) > 1 else None
 
-            # NPC stations — direct result from the ESI search
-            if not isinstance(station_search, Exception) and station_search.status_code == 200:
-                npc_ids = station_search.json().get("station", [])[:20]
+            # A name matching nothing comes back as an empty object with a 200,
+            # so there is no error case to tell apart from "no such name".
+            npc_ids: list[int] = []
+            system_ids: list[int] = []
+            if not isinstance(ids_res, Exception) and ids_res.status_code == 200:
+                payload = ids_res.json() or {}
+                npc_ids = [e["id"] for e in (payload.get("stations") or [])][:20]
+                system_ids = [e["id"] for e in (payload.get("systems") or [])]
+
+            # NPC stations named outright
+            if npc_ids:
                 new_ids = [sid for sid in npc_ids if sid not in all_names]
                 if new_ids:
                     new_names = await _resolve_names(new_ids, None)
@@ -257,10 +277,6 @@ async def suggest_station(request: Request, q: str = ""):
                         other_ids.add(sid)
 
             # Systems — find structures in our cache + NPC stations in the system
-            system_ids: list[int] = []
-            if not isinstance(system_search, Exception) and system_search.status_code == 200:
-                system_ids = system_search.json().get("solar_system", [])
-
             for sys_id in system_ids[:10]:
                 for entry in _locations_in_system(sys_id):
                     lid = entry["location_id"]
