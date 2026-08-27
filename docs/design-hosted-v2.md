@@ -16,7 +16,7 @@ now lives in §11 where the steps are, and is summarised as:
 | 4 | Platform foundations | ✅ v0.9.76 |
 | 5 | Multi-tenancy | ⬜ next |
 | 6 | Groups + coordination MVP | ⬜ |
-| 7 | Feature buildout | 🟡 0 of 8 complete; reactions board in beta |
+| 7 | Feature buildout | 🟡 0 of 11 complete; reactions board in beta |
 
 **Step 3 is the one to read first.** It is the only ✅-adjacent step that is not real: the
 desktop app is deleted and the hosted deployment was never done, so everything built since
@@ -1209,6 +1209,120 @@ filled, and a dashboard built on the current refresh timing may need re-tuning a
 
 ---
 
+### 9.7 Contracts — alliance visibility, appraisal, whole-of-space index
+
+Added 2026-08-28 from the audit of the other line of development (see §11's note
+on the parallel `main`). Three items, and they are not equally interesting: the
+first changes what the product can *know*, the other two are features.
+
+Recorded here rather than acted on. Nothing below blocks Step 3 or Step 5.
+
+#### 9.7.1 Alliance contracts are reachable — and that is a design input, not a feature
+
+**The finding is about ESI, not about code.** `/corporations/{id}/contracts/`
+also returns every contract assigned to that corporation's **alliance**, issued
+by other member corporations. Measured on live data: two corps of the same
+alliance returned the identical **2,912** contracts, `assignee_id` = the alliance
+id, issuers spread across ~40 other corps — and `/characters/{id}/contracts/`
+returned none of them.
+
+**The marker is `assignee_id == alliance_id`.** It is *not* the `availability`
+field, which ESI reports as `"personal"` for all of them. Anything keying off
+`availability` will mis-file every one.
+
+Why it matters beyond a contracts tab: **§7 assumes less than this.** The
+"built vs delivered" problem there says *"do we have 200 Ravens" is a delivery
+question — observable via corp assets and corp contracts (scopes exist), but it
+is a second state machine.* This says alliance-wide contract visibility is
+available **today, through scopes already requested**, which makes that second
+state machine cheaper than it was costed. It is a genuine input to **Step 6**,
+whether or not a contracts tab is ever built for it.
+
+Consequences to design around:
+
+* **A contract seen by two member corps is one contract.** Sync per corporation
+  and the same 2,912 rows arrive N times; identity is `contract_id`, and the
+  store has to dedupe on it rather than on (corp, contract).
+* **Issuer ≠ the corp that fetched it.** Rows must be labelled by assignee and
+  issuer, or the tab shows other people's contracts under your corporation —
+  which is exactly the tester report that uncovered this.
+* **It is alliance data arriving through a corp scope.** Under Step 5's tenancy
+  model that needs deciding explicitly: whose account owns a contract issued by
+  another corp in the same alliance, and who may see it.
+
+#### 9.7.2 Contract appraisal — the price for things the market cannot hold
+
+**The problem it solves is one this project has already patched around.** A
+titan is never on a Jita sell order, so `sell_price` is `None`, so revenue is
+`None` — which in v0.9.82 was hiding the whole profit comparison on exactly
+those hulls. That fix made the table appear; it did not give the hull a price.
+A contract *is* the price for these items, and appraisal is what reads it.
+
+Price cascade, best source first:
+
+1. **Jita sell** — a real instant-buy price.
+2. **The cheapest single-item contract in the index** (alliance or public).
+   Single-item only: in a bundle the price also covers everything else, so it
+   says nothing about any one item.
+3. **CCP's adjusted price, labelled an estimate.** Measured on a titan: no Jita
+   sell, a ~450M lowball buy order, adjusted ~73b. Only the last is in the right
+   order of magnitude — which is the argument for keeping it *and* for labelling
+   it.
+
+**Do it locally, not via Janice.** Janice needs a per-user API key, and its own
+documentation warns against exactly what an open-source app would do with a
+shared one. We hold the prices already.
+
+**One trap, learned the expensive way on the other line:** do not exclude the
+contract being appraised from the contract-price lookup. It reads as obviously
+right — "don't compare a thing against itself" — and it means the *cheapest*
+contract cannot see itself and gets valued at the second-cheapest, while every
+other contract values the same hull at the real cheapest. Two prices for one
+hull, which is the one thing an appraisal must never produce. One price per
+item everywhere, self included; when a contract *is* the cheapest offer of what
+it holds, say so instead of printing a meaningless "+0% vs its price".
+
+Relationship to **§9.3's Janice-like appraisal**: same cascade, different input.
+That one appraises a pasted stack; this one appraises a contract's contents.
+Build the pricing cascade once and let both call it.
+
+#### 9.7.3 Whole-of-New-Eden public contract index
+
+Architecture rather than capability — we already have a public contract browser,
+but it makes the user pick a region and index it. The measurement that changes
+the design:
+
+* **Listing every region costs ~106 requests and about half a second** (~70
+  k-space regions, ~49,000 contracts). There is no global endpoint, so something
+  has to iterate — but it is cheap enough that the app should simply do it,
+  rather than asking the user which region they meant.
+* **Contents are the expensive half** — one call per contract — and the items
+  that need a contract price at all are capitals, which are the *biggest*
+  contracts there are. In The Forge, **84 of 33,243** priced item-exchange
+  contracts are ≥ 1,000,000 m³. So fetch contents **biggest-volume-first**:
+  ~1,500 calls in ~60s already covers every capital-sized contract in the game.
+
+The consequence is that **region stops being a gate and becomes a filter** in
+the browser. It also makes 9.7.2 useful, because appraisal is only as good as
+the index behind it.
+
+**Fits the Step 4 worker.** This is a background fill with a natural priority
+order, which is what `app/sync/worker.py` already is. It should be a worker task
+rather than a page-triggered stream — and note the cache-only rule in Step 4:
+a page must not wait on ESI, and today's `/contracts/public` index does.
+
+#### What we would not take
+
+`a57b388` on the other line fixes a contents reader that spun for ever on three
+contracts ESI answers with HTTP 200 and a zero-length body. **We are already
+immune**, and it is worth writing down why so nobody "fixes" it: our
+`fetch_public_contract_items` wraps the parse in `except Exception` and returns
+`[]`, so an unparseable body records as "no contents" and the counter still
+advances. We also have no repeating tail to spin. The broad `except` is doing
+real work there.
+
+---
+
 ## 10. Cross-cutting decisions
 
 * **Pricing model.** Three input bases (raw / intermediate / output, each buy-or-sell);
@@ -1575,9 +1689,19 @@ ledger; the coarse alliance read model. Joiners grant minimal scopes (identity +
 `read_character_jobs`). **Pilot in own corp and measure the match-correction rate before
 any alliance rollout.**
 
-**Step 7 — Feature buildout. 0 of 8 complete; 1 in beta.** Market BI rebuild on the group
-tree; refine calculator; mining ledger; appraisal; compression LP. Ordered by appetite — each
+**Step 7 — Feature buildout. 0 of 11 complete; 1 in beta.** Market BI rebuild on the group
+tree; refine calculator; mining ledger; appraisal; compression LP; Discord bot; dashboard
+widgets; and the three contracts items added 2026-08-28 (§9.7). Ordered by appetite — each
 is independent once Steps 1 and 4 exist.
+
+**Two of the eleven have a claim on being pulled out of Step 7.** §9.7.1 —
+alliance contracts being reachable through scopes already requested — is not a
+feature at all but a correction to what §7 assumed was available, so it belongs
+in **Step 6's** design rather than waiting behind it. And §9.7.3's background
+index is a `app/sync/worker.py` task by nature, which makes it cheaper to build
+while that machinery is fresh than to bolt on later; it also retires the last
+page in the app that waits on ESI while rendering, which Step 4 otherwise
+declared closed.
 
 **Reactions board — 🟡 beta, v0.9.29, `/reactions`.** Initial deployment, not a finished
 feature. Taken out of order, ahead of Steps 4-6, as a low-friction day rather than plan
@@ -1625,7 +1749,7 @@ calls**, **47 tables**.
 | 4 — Platform foundations | **3–5 sessions** | **Low** | The wall. 310 queries and 47 tables to move to Postgres, plus ~45 SQLite-specific statements (`INSERT OR REPLACE` ×25, `PRAGMA` ×12, `AUTOINCREMENT` ×4). Splitting a 7,413-line module is mechanical but large. Widest range of any step. |
 | 5 — Multi-tenancy | **2–3 sessions** | Medium | Touches every table and every read, but the pattern is uniform once the query layer exists. The leak tests are what make it slow to call done. |
 | 6 — Groups + coordination | **3–4 sessions** to MVP | Low-med | The flagship, and the least designed. Plus **weeks of calendar time** piloting in your own corp — the match-correction rate cannot be rushed. |
-| 7 — Feature buildout | **8–14 sessions** for all of it | Medium | A menu, not a step. Each item is independent and separately estimable (below). |
+| 7 — Feature buildout | **10–17 sessions** for all of it | Medium | A menu, not a step. Each item is independent and separately estimable (below). |
 
 **Step 7, itemised** — pick, do not commit to the total:
 
