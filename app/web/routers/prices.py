@@ -34,6 +34,7 @@ from sqlalchemy import bindparam, text
 
 from app.db.conn import connect as _connect
 from app.market import group_stats, tree
+from app.market import stats as market_stats
 from app.web.location_resolver import (
     get_region_for_location,
     load_location_names_from_db,
@@ -622,6 +623,7 @@ async def prices_groups(request: Request, g: int | None = None):
         "rows": rows,
         "path": path,
         "window_days": group_stats.VOLUME_WINDOW_DAYS,
+        "stat_days": market_stats.WINDOW_DAYS,
     })
 
 @router.get("/prices", response_class=HTMLResponse)

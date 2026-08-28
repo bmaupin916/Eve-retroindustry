@@ -60,6 +60,17 @@ SEED_PRICES = [
     (103, 10.0, None, 0, 5),         # priced, but no buy side and nothing traded
 ]
 
+#: (type_id, days, volatility_pct, trend_pct, avg_order_count)
+#:
+#: Type 106 has three trading days. It is below `stats.MIN_STAT_DAYS` and
+#: carries absurd figures precisely so a leak is visible: counted, Alpha's
+#: volatility median moves from 20 to 30.
+SEED_STATS = [
+    (100, 30, 10.0, 1.0, 4.0),
+    (102, 30, 30.0, 3.0, 8.0),
+    (106, 3, 999.0, 999.0, 999.0),
+]
+
 
 @pytest.fixture(params=["sqlite", "postgres"])
 def engine(request, tmp_path):
@@ -118,6 +129,13 @@ def _seed(eng) -> None:
                      " (type_id, sell_price, buy_price, volume, jita_available,"
                      "  cached_at) VALUES (:t, :s, :b, :v, :a, 0)"),
                 {"t": type_id, "s": sell, "b": buy, "v": volume, "a": available})
+        for type_id, days, volat, trend, orders in SEED_STATS:
+            c.execute(
+                text("INSERT INTO market_stats (region_id, type_id, days,"
+                     " volatility_pct, trend_pct, avg_order_count, computed_at)"
+                     " VALUES (:r, :t, :d, :v, :tr, :o, 0)"),
+                {"r": group_stats.JITA_REGION, "t": type_id, "d": days,
+                 "v": volat, "tr": trend, "o": orders})
         c.commit()
 
 
@@ -211,3 +229,54 @@ def test_the_volume_window_is_seven_days_and_says_so(conn):
     alpha = _by_id(group_stats.stats_for_children(conn, None))[ALPHA]
     # type 106 stores 210 over the window; 210/7 = 30 is the top of the three.
     assert alpha.median_daily_volume == pytest.approx(20.0)
+
+
+# ── the history-backed KPIs ──────────────────────────────────────────────────
+
+def test_the_history_medians_are_the_middle_of_the_qualifying_types(conn):
+    """Types 100 and 102 qualify; 106 has three days and does not."""
+    alpha = _by_id(group_stats.stats_for_children(conn, None))[ALPHA]
+    assert alpha.median_volatility_pct == pytest.approx(20.0)
+    assert alpha.median_trend_pct == pytest.approx(2.0)
+    assert alpha.median_competition == pytest.approx(6.0)
+
+
+def test_a_type_with_too_little_history_does_not_join_the_median(conn):
+    """The bar, asserted through its effect on a number.
+
+    Type 106 has three trading days and a volatility of 999. Counted, the
+    median moves from 20 to 30 — so this fails loudly rather than drifting.
+    """
+    alpha = _by_id(group_stats.stats_for_children(conn, None))[ALPHA]
+    assert alpha.median_volatility_pct == pytest.approx(20.0)
+    assert alpha.with_history == 2
+
+
+def test_history_coverage_is_reported_separately_from_price_coverage(conn):
+    """Price coverage is near total from day one; history coverage starts at
+    zero and grows twenty types a round. One number for both would hide
+    which of the two a blank column is missing."""
+    alpha = _by_id(group_stats.stats_for_children(conn, None))[ALPHA]
+    assert alpha.coverage == pytest.approx(1.0)             # 3 of 3 priced
+    assert alpha.history_coverage == pytest.approx(2 / 3)   # 2 of 3 measured
+
+
+def test_a_branch_with_no_history_reports_none_not_zero(conn):
+    """Beta has prices and no stats rows at all."""
+    beta = _by_id(group_stats.stats_for_children(conn, None))[BETA]
+    assert beta.with_history == 0
+    assert beta.median_volatility_pct is None
+    assert beta.median_trend_pct is None
+    assert beta.median_competition is None
+    assert beta.history_coverage == pytest.approx(0.0)
+
+
+def test_stats_from_another_region_are_not_counted(conn):
+    """The join is region-scoped; Amarr history is not Jita liquidity."""
+    conn.execute(
+        text("INSERT INTO market_stats (region_id, type_id, days,"
+             " volatility_pct, trend_pct, avg_order_count, computed_at)"
+             " VALUES (10000043, 103, 30, 5.0, 5.0, 5.0, 0)"))
+    conn.commit()
+    beta = _by_id(group_stats.stats_for_children(conn, None))[BETA]
+    assert beta.with_history == 0

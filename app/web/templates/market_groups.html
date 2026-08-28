@@ -28,9 +28,12 @@
    "daily volume" with no window is one nobody measured. #}
 <p class="text-muted small mb-3">
   Medians over every published type in each branch, from the cached Jita prices.
-  Volume is the <strong>{{ window_days }}-day</strong> average — the only window
-  currently stored. <em>Priced</em> says how much of the branch the medians
-  actually describe.
+  Volume is the <strong>{{ window_days }}-day</strong> average from the price
+  snapshot; volatility, trend and competition are <strong>{{ stat_days }}-day</strong>
+  figures from the daily history.
+  <em>Priced</em> and <em>Measured</em> say how much of the branch each half
+  actually describes — history is filled in the background, so Measured starts
+  low and grows.
 </p>
 
 {% if not rows %}
@@ -48,6 +51,10 @@
         <th class="text-end" title="(sell − buy) ÷ sell. Wide means illiquid or trader-controlled.">Spread</th>
         <th class="text-end" title="Units traded per day, averaged over {{ window_days }} days.">Volume / day</th>
         <th class="text-end" title="How long the standing sell wall would take to clear at recent velocity.">Days of supply</th>
+        <th class="text-end" title="Types with enough history to measure the three columns after this one.">Measured</th>
+        <th class="text-end" title="Standard deviation of the daily price over {{ stat_days }} days, as a share of its mean. High means the margin may be a spike.">Volatility</th>
+        <th class="text-end" title="Last 7 days against the {{ stat_days }}-day mean. Positive is rising into your build time.">Trend</th>
+        <th class="text-end" title="Average number of market orders per day — how contested the sell wall is.">Competition</th>
       </tr>
     </thead>
     <tbody>
@@ -79,6 +86,27 @@
         <td class="text-end">
           {% if r.median_days_of_supply is none %}<span class="text-muted" title="Nothing traded in the window — not the same as slow">—</span>
           {% else %}{{ "{:,.0f}".format(r.median_days_of_supply) }}{% endif %}
+        </td>
+        {# Measured is deliberately separate from Priced: price coverage is
+           near total from day one, history coverage starts at zero and grows
+           twenty types a round, so one number would hide which of the two a
+           blank column is missing. #}
+        <td class="text-end small {% if r.history_coverage is not none and r.history_coverage < 0.5 %}text-warning{% else %}text-muted{% endif %}">
+          {% if r.history_coverage is none %}—
+          {% else %}{{ "{:,}".format(r.with_history) }} / {{ "{:,}".format(r.group.type_count) }}{% endif %}
+        </td>
+        <td class="text-end">
+          {% if r.median_volatility_pct is none %}<span class="text-muted" title="Not enough history yet">—</span>
+          {% else %}{{ "%.1f"|format(r.median_volatility_pct) }}%{% endif %}
+        </td>
+        <td class="text-end">
+          {% if r.median_trend_pct is none %}<span class="text-muted" title="Not enough history yet">—</span>
+          {% else %}<span class="{% if r.median_trend_pct > 0 %}text-success{% elif r.median_trend_pct < 0 %}text-danger{% endif %}">
+            {{ "%+.1f"|format(r.median_trend_pct) }}%</span>{% endif %}
+        </td>
+        <td class="text-end">
+          {% if r.median_competition is none %}<span class="text-muted" title="Not enough history yet">—</span>
+          {% else %}{{ "{:,.0f}".format(r.median_competition) }}{% endif %}
         </td>
       </tr>
       {% endfor %}

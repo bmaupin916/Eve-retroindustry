@@ -86,3 +86,25 @@ def test_the_page_makes_no_esi_call_while_rendering(client):
     r = client.get("/prices/groups")
     assert r.status_code == 200
     assert "Market quality" in r.text
+
+
+def test_the_page_states_both_windows_it_mixes(client):
+    """Two different windows sit in one table and must both be named.
+
+    Volume is a 7-day figure from the price snapshot; volatility, trend and
+    competition are 30-day figures from the daily history. A reader who assumes
+    one window for the row is reading two of the columns wrong.
+    """
+    r = client.get("/prices/groups")
+    assert "7-day" in r.text
+    assert "30-day" in r.text
+
+
+def test_measured_is_reported_separately_from_priced(client):
+    """History arrives twenty types a round, so the two coverages diverge.
+
+    One number for both would hide which half a blank column is missing.
+    """
+    r = client.get("/prices/groups")
+    for heading in ("Priced", "Measured", "Volatility", "Trend", "Competition"):
+        assert f">{heading}<" in r.text, f"no {heading} column"

@@ -16,7 +16,7 @@ now lives in §11 where the steps are, and is summarised as:
 | 4 | Platform foundations | ✅ v0.9.76 |
 | 5 | Multi-tenancy | ⬜ next |
 | 6 | Groups + coordination MVP | ⬜ |
-| 7 | Feature buildout | 🟡 0 of 11 complete; reactions board in beta |
+| 7 | Feature buildout | 🟡 1 of 11 complete (market BI, v0.9.87); reactions board in beta |
 
 **Step 3 is the one to read first.** It is the only ✅-adjacent step that is not real: the
 desktop app is deleted and the hosted deployment was never done, so everything built since
@@ -1430,9 +1430,30 @@ one rather than presented as the thirty-day figure this section specifies.
    exactly **one writer** of the table — the chart path was rerouted through
    it — because the reader and writer of this series disagreed about a key
    name from v0.8.70 to v0.9.85, and two writers is how that returns.
-5. **The materialised stats table**, and the four KPIs that need the series.
+5. ~~**The materialised stats table**, and the four KPIs that need the series.~~
+   **Done, v0.9.87** — `market_stats` (migration 0011) and
+   `app/market/stats.py`. Three KPIs, not four: **depth stays out**, because
+   units within 5% of best price is an order-book question and belongs on
+   expand rather than in a materialised row.
 
-Depth stays out of the stats table permanently; it is a live read on expand.
+   **The window is thirty calendar days anchored on the series, not the
+   clock.** ESI omits days with no trades, so "the last thirty records" can
+   span half a year for an illiquid item and calling that a thirty-day figure
+   would be false. Anchoring on the series' own newest date also means a
+   recompute never moves a figure nobody's data changed.
+
+   **`days` is the honesty column** and `MIN_STAT_DAYS` is what it buys: an
+   item that traded three days out of thirty keeps its per-type figure but
+   does not join a group median beside one computed from thirty. `Measured`
+   is reported separately from `Priced` on the page for the same reason —
+   price coverage is near total from day one, history coverage starts at zero
+   and grows twenty types a round, and one number for both would hide which
+   half a blank column is missing.
+
+**§9.4 is complete.** Seven of the eight KPIs ship; depth is deliberately not
+one of them, and the eighth — regional edge — still wants a freight number
+the app does not have. Both are recorded above rather than left blank on the
+page.
 
 #### References for the market work
 
@@ -2085,7 +2106,7 @@ The slot board is the cheap part, because the arithmetic already exists on `/job
 materials and blueprints are the two that decide whether the pilot is usable at all, and
 payment is what stops it reverting to a spreadsheet. Re-estimated below.
 
-**Step 7 — Feature buildout. 0 of 11 complete; 1 in beta.** Market BI rebuild on the group
+**Step 7 — Feature buildout. 1 of 11 complete; 1 in beta.** Market BI rebuild on the group
 tree; refine calculator; mining ledger; appraisal; compression LP; Discord bot; dashboard
 widgets; and the three contracts items added 2026-08-28 (§9.7). Ordered by appetite — each
 is independent once Steps 1 and 4 exist.
@@ -2155,7 +2176,7 @@ calls**, **47 tables**.
 | Refine calculator | 0.5–1 |
 | Reactions board | 🟡 **beta v0.9.29** — 1 session spent, as estimated; finishing it is a second |
 | Appraisal tool | 1 |
-| Market BI rebuild (§9.4) | 1–2 |
+| Market BI rebuild (§9.4) | ✅ **done, v0.9.83–87** — 1 session, as estimated |
 | Mining ledger (§9.3) | 1–2 |
 | Compression LP | 1–2 |
 | Contract appraisal (§9.7.2) | 1 — the cascade is the work; share it with the §9.3 appraiser |

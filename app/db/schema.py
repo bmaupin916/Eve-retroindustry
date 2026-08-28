@@ -325,6 +325,26 @@ price_history_cache = Table(
     Column("cached_at", Float),
 )
 
+market_stats = Table(
+    "market_stats", metadata,
+    # §9.4's KPIs that need the daily series, materialised rather than
+    # recomputed from `price_history_cache.data_json` on every page load.
+    #
+    # `days` is the honesty column: it records how many trading days the
+    # window actually contained. An item that traded three days out of
+    # thirty has a volatility figure computed from three observations, and a
+    # consumer that cannot see that will present it beside one computed from
+    # thirty as though they were the same measurement.
+    Column("region_id", Integer, primary_key=True, autoincrement=False),
+    Column("type_id", Integer, primary_key=True, autoincrement=False),
+    Column("days", Integer, nullable=False),
+    Column("avg_daily_volume", Float),
+    Column("volatility_pct", Float),
+    Column("trend_pct", Float),
+    Column("avg_order_count", Float),
+    Column("computed_at", Float, nullable=False),
+)
+
 station_volume_cache = Table(
     "station_volume_cache", metadata,
     Column("location_id", BigInteger, primary_key=True, autoincrement=False),

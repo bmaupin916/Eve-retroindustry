@@ -46,11 +46,14 @@ from dataclasses import dataclass
 
 from sqlalchemy import text
 
-from app.market import tree
+from app.market import stats as type_stats, tree
 
 #: The stored `volume` column is a sum over this many days, not a daily figure
 #: and not the 30-day mean §9.4 specifies. Exported so the UI can label it.
 VOLUME_WINDOW_DAYS = 7
+
+#: The Forge. Every KPI in §9.4 is quoted against Jita.
+JITA_REGION = 10000002
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,14 @@ class GroupStats:
     median_spread_pct: float | None
     median_daily_volume: float | None
     median_days_of_supply: float | None
+    # History-backed. `with_history` counts types whose series cleared
+    # `stats.MIN_STAT_DAYS`, and is reported for the same reason `priced`
+    # is: a median over three of forty-seven types is not a fact about the
+    # branch, and the fill reaches types gradually rather than all at once.
+    with_history: int = 0
+    median_volatility_pct: float | None = None
+    median_trend_pct: float | None = None
+    median_competition: float | None = None
 
     @property
     def coverage(self) -> float | None:
@@ -73,6 +84,18 @@ class GroupStats:
             return None
         return self.priced / self.group.type_count
 
+    @property
+    def history_coverage(self) -> float | None:
+        """Fraction of the branch with enough history to measure.
+
+        Separate from `coverage` on purpose. Price coverage is near total
+        and history coverage starts at zero and grows twenty types a
+        round, so one number for both would hide which of the two a blank
+        column is missing."""
+        if not self.group.type_count:
+            return None
+        return self.with_history / self.group.type_count
+
 
 _ROWS = """
 WITH RECURSIVE sub(root_id, gid) AS (
@@ -84,10 +107,13 @@ WITH RECURSIVE sub(root_id, gid) AS (
       FROM sde_market_groups g
       JOIN sub s ON g.parent_group_id = s.gid
 )
-SELECT s.root_id, p.sell_price, p.buy_price, p.volume, p.jita_available
+SELECT s.root_id, p.sell_price, p.buy_price, p.volume, p.jita_available,
+       m.days, m.volatility_pct, m.trend_pct, m.avg_order_count
   FROM sub s
   JOIN sde_types t ON t.market_group_id = s.gid AND t.published = 1
   LEFT JOIN market_price_cache p ON p.type_id = t.type_id
+  LEFT JOIN market_stats m
+         ON m.type_id = t.type_id AND m.region_id = :region
 """
 
 
@@ -118,7 +144,8 @@ def _median(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
-def stats_for_children(conn, parent_id: int | None = None) -> list[GroupStats]:
+def stats_for_children(conn, parent_id: int | None = None,
+                       region_id: int = JITA_REGION) -> list[GroupStats]:
     """KPIs for every direct child of `parent_id`, or for the roots when None.
 
     One recursive pass for the tree shape and one for the numbers. Groups with
@@ -131,14 +158,20 @@ def stats_for_children(conn, parent_id: int | None = None) -> list[GroupStats]:
         return []
 
     where, params = tree.parent_clause(parent_id)
+    params = {**params, "region": region_id}
     rows = conn.execute(text(_ROWS.format(parent_clause=where)), params).fetchall()
 
     spreads: dict[int, list[float]] = {}
     volumes: dict[int, list[float]] = {}
     supply: dict[int, list[float]] = {}
     priced: dict[int, int] = {}
+    volatility: dict[int, list[float]] = {}
+    trend: dict[int, list[float]] = {}
+    competition: dict[int, list[float]] = {}
+    with_history: dict[int, int] = {}
 
-    for root_id, sell, buy, volume, available in rows:
+    for (root_id, sell, buy, volume, available,
+         days, volat, trend_val, orders) in rows:
         daily = (volume / VOLUME_WINDOW_DAYS) if volume else None
         if sell is not None and sell > 0:
             priced[root_id] = priced.get(root_id, 0) + 1
@@ -151,6 +184,18 @@ def stats_for_children(conn, parent_id: int | None = None) -> list[GroupStats]:
         if d is not None:
             supply.setdefault(root_id, []).append(d)
 
+        # A figure computed from three trading days is not the same
+        # measurement as one computed from thirty, so it does not join
+        # the same median.
+        if days is not None and days >= type_stats.MIN_STAT_DAYS:
+            with_history[root_id] = with_history.get(root_id, 0) + 1
+            if volat is not None:
+                volatility.setdefault(root_id, []).append(volat)
+            if trend_val is not None:
+                trend.setdefault(root_id, []).append(trend_val)
+            if orders is not None:
+                competition.setdefault(root_id, []).append(orders)
+
     return [
         GroupStats(
             group=g,
@@ -158,6 +203,10 @@ def stats_for_children(conn, parent_id: int | None = None) -> list[GroupStats]:
             median_spread_pct=_median(spreads.get(g.group_id, [])),
             median_daily_volume=_median(volumes.get(g.group_id, [])),
             median_days_of_supply=_median(supply.get(g.group_id, [])),
+            with_history=with_history.get(g.group_id, 0),
+            median_volatility_pct=_median(volatility.get(g.group_id, [])),
+            median_trend_pct=_median(trend.get(g.group_id, [])),
+            median_competition=_median(competition.get(g.group_id, [])),
         )
         for g in groups
     ]

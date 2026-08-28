@@ -277,6 +277,12 @@ class SyncWorker:
                     return 0
                 async with esi_client() as client:
                     stored = await history_fill.fill_history(client, conn)
+                # Recompute the KPIs whose history just moved. Same
+                # connection and same round, so a page never sees fresh
+                # history sitting behind stale stats.
+                from app.market import stats as market_stats
+
+                market_stats.refresh(conn, history_fill.JITA_REGION)
             if stored:
                 self.history_filled += stored
             return stored
