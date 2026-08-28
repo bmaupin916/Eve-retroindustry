@@ -15,6 +15,7 @@ Point `EVE_TEST_POSTGRES_URL` somewhere else to use a different one.
 """
 from __future__ import annotations
 
+import functools
 import os
 
 import pytest
@@ -25,7 +26,21 @@ DEFAULT_URL = "postgresql+psycopg://eve:eve@localhost:5433/eve_retroindustry"
 URL = os.environ.get("EVE_TEST_POSTGRES_URL", DEFAULT_URL)
 
 
+@functools.lru_cache(maxsize=None)
 def _reachable(url: str) -> bool:
+    """Is there a Postgres at `url`? Probed once per session, then cached.
+
+    **The cache is the point, not an optimisation.** 401 collected tests take
+    a Postgres fixture, and each one calls this. Uncached, a run with the
+    container down pays 401 two-second connect timeouts — measured at 12m27s
+    against 4m21s with it up, which reads as a hung suite rather than a
+    skipped one.
+
+    Caching a negative for the length of a run is deliberate: a container
+    that starts halfway through a run does not retroactively make the
+    already-skipped tests meaningful, and re-probing to find out costs the
+    thirteen minutes this exists to save.
+    """
     try:
         from sqlalchemy import create_engine, text
     except ImportError:                                  # pragma: no cover

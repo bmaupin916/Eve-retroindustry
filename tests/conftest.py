@@ -206,3 +206,72 @@ def anon_client(app_module):
     """A client with no session — for asserting the gate actually refuses."""
     from fastapi.testclient import TestClient
     return TestClient(app_module.app)
+
+
+# ── Postgres test schemas ───────────────────────────────────────────────────
+# Every `test_*_on_postgres.py` builds its own `pytest_*` schema and drops it
+# at *setup* rather than teardown, so a container accumulates one per module
+# and keeps it until that module runs again. Twenty-four were sitting in the
+# dev container when this was written.
+#
+# Sweeping at session end is the normal path. The setup-time drop stays where
+# it is: it is what makes the leak self-healing after a SIGKILL, which no
+# teardown can cover.
+
+
+#: Schemas this suite creates. The escape matters: in a LIKE pattern `_` is
+#: a single-character wildcard, so an unescaped `pytest_%` also matches, say,
+#: `pytestXfoo`. Nothing is named that today, which is exactly why it would
+#: not be noticed.
+TEST_SCHEMA_PATTERN = "pytest\\_%"
+
+
+def _matching_schemas(conn, pattern: str = TEST_SCHEMA_PATTERN) -> list[str]:
+    """Schema names the sweep would drop. Separated from the dropping so a
+    test can assert what the selector matches without destroying schemas a
+    concurrent module-scoped fixture is still using."""
+    from sqlalchemy import text
+
+    rows = conn.execute(
+        text("SELECT nspname FROM pg_namespace WHERE nspname LIKE :p ORDER BY nspname"),
+        {"p": pattern},
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _sweep_postgres_test_schemas(pattern: str = TEST_SCHEMA_PATTERN) -> list[str]:
+    """Drop every schema `pattern` matches. Returns the names actually dropped.
+
+    A concurrent run holds its own schema and `DROP ... CASCADE` blocks on it
+    rather than failing, so this sets a short `lock_timeout` and moves on —
+    that schema has a live owner who will drop it.
+    """
+    try:
+        from sqlalchemy import create_engine, text
+
+        from tests.test_postgres_schema import URL, _reachable
+    except Exception:                       # noqa: BLE001 — no sqlalchemy, no sweep
+        return []
+    if not _reachable(URL):
+        return []
+
+    dropped: list[str] = []
+    engine = create_engine(URL)
+    try:
+        with engine.connect() as conn:
+            for name in _matching_schemas(conn, pattern):
+                try:
+                    conn.execute(text("SET LOCAL lock_timeout = '2s'"))
+                    conn.execute(text(f'DROP SCHEMA IF EXISTS "{name}" CASCADE'))
+                    conn.commit()
+                    dropped.append(name)
+                except Exception:           # noqa: BLE001 — in use by a live run
+                    conn.rollback()
+    finally:
+        engine.dispose()
+    return dropped
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Leave the container as clean as the run found it."""
+    _sweep_postgres_test_schemas()
