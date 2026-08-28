@@ -115,6 +115,27 @@ _QUERY_TABLE = re.compile(
 # `ON CONFLICT ... DO UPDATE SET` puts there.
 _NOT_TABLES = {"sqlite_master", "sqlite_temp_master", "set"}
 
+# Names bound by a `WITH [RECURSIVE] name(cols) AS (...)` clause. These read
+# exactly like tables to the pattern above — `FROM sub` — and exist only for
+# the length of one statement, so they are collected per literal and never
+# pooled across files: a CTE called `sub` in one query must not exempt a real
+# undeclared table called `sub` in another.
+_CTE_NAME = re.compile(
+    r"(?:\bWITH\s+(?:RECURSIVE\s+)?|,\s*)([a-z_][a-z0-9_]*)\s*"
+    r"(?:\([^)]*\))?\s+AS\s*\(", re.I)
+
+
+def _table_names(sql: str) -> set[str]:
+    """Tables one SQL literal reads, with CTE names and non-tables removed."""
+    ctes = {m.lower() for m in _CTE_NAME.findall(sql)}
+    names = set()
+    for name in _QUERY_TABLE.findall(sql):
+        low = name.lower()
+        if low in _NOT_TABLES or low in ctes or low.startswith('pragma_'):
+            continue
+        names.add(low)
+    return names
+
 # A literal has to *begin* as SQL to be read as SQL. Merely containing the word
 # "update" is not enough: "pi-cache update failed: {exc}" and "last-update
 # timestamp" are both English, and both were read as table references by the
@@ -130,10 +151,7 @@ def _tables_referenced_in_sql():
         for lineno, value in _string_literals(path):
             if not _STARTS_SQL.match(value):
                 continue
-            for name in _QUERY_TABLE.findall(value):
-                low = name.lower()
-                if low in _NOT_TABLES or low.startswith("pragma_"):
-                    continue
+            for low in sorted(_table_names(value)):
                 seen.setdefault(low, f"{rel}:{lineno}")
     return seen
 
@@ -164,6 +182,34 @@ def test_every_table_the_app_queries_is_declared():
         "queried but never declared: "
         + ", ".join(f"{n} ({w})" for n, w in sorted(undeclared.items()))
     )
+
+
+def test_a_cte_name_is_not_read_as_a_table():
+    """`WITH RECURSIVE sub(...) AS` binds a name for one statement only.
+
+    `app/market/tree.py` walks the market tree with recursive CTEs, which is
+    the first time this scan met the construct. It reported `sub` and `up` as
+    undeclared tables.
+    """
+    sql = (
+        "WITH RECURSIVE sub(gid) AS ("
+        " SELECT market_group_id FROM sde_market_groups WHERE market_group_id = :gid"
+        " UNION ALL"
+        " SELECT g.market_group_id FROM sde_market_groups g JOIN sub s"
+        "   ON g.parent_group_id = s.gid)"
+        " SELECT gid FROM sub"
+    )
+    assert _table_names(sql) == {"sde_market_groups"}
+
+
+def test_the_cte_exemption_does_not_leak_between_statements():
+    """The half that keeps the scan honest.
+
+    Pooling CTE names across the codebase would let one query's `WITH sub`
+    hide an undeclared table called `sub` queried anywhere else. Same
+    statement text, minus the binding: it must be reported.
+    """
+    assert _table_names("SELECT gid FROM sub") == {"sub"}
 
 
 def test_a_fresh_database_gets_every_declared_table(tmp_path):

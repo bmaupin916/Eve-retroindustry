@@ -1327,6 +1327,77 @@ Practical: materialise these into a stats table on sync rather than computing fr
 too many to sweep blindly — prioritise watchlist items, active projects, and groups
 actually being browsed.
 
+#### Measured before starting, 2026-08-28 — four of the premises above are stale
+
+Everything above this line was written in the planning session and has aged. The
+plan survives; three of its four starting assumptions do not.
+
+**The market tree is already imported.** `sde_market_groups` holds **2,106
+groups, 19 roots**, with `parent_group_id`, `name`, `has_types` and `icon_id` —
+and **zero orphans in either direction**: no type points at a missing group, no
+group points at a missing parent. 19,667 types across 1,616 groups. What was
+missing was never the table; it was a **consumer**. Until `app/market/tree.py`
+nothing in `app/` read a single row of it, which is why the page is still a flat
+list. The first slice of this work is therefore smaller than costed.
+
+**`has_types` cannot be trusted, and the count has to be computed.** The SDE
+marks 1,665 groups as carrying types. Measured against the types themselves,
+**54 of them contain no published type**, and **2 groups that deny types do
+contain them**. Wrong in both directions. A browser keying off the flag offers 54
+empty branches and hides two real ones, so every count in the read model comes
+from `sde_types` and the flag is carried for reference only.
+
+**`price_history_cache` is empty — 0 rows.** The section above calls it the raw
+material for every KPI. It is written one `(region, type)` at a time by
+`get_price_history`, and only when somebody opens a price chart, so on a database
+with 19,579 priced types it has never held anything. The KPI spine has no
+material behind it today.
+
+**The history that does exist is somewhere else and is thinner.**
+`market_hist_etag.days_json` holds **31,455 `(region, type)` pairs**, all
+populated — but it is `{date: volume}` and nothing else, kept for
+`_ETAG_KEEP_DAYS` (**12**) so the moving 7-day volume window can be recomputed
+without re-downloading. It is a by-product of the volume phase, not a history
+store.
+
+**And `fetch_region_history` drops `order_count`.** It keeps `date`, `average`,
+`lowest`, `highest`, `volume`. ESI returns `order_count` in the same record. So
+the Competition KPI cannot be computed even after a fill, without a one-line
+change to the fetcher — worth making *before* the fill rather than re-fetching a
+year of history twice.
+
+##### What that does to the eight KPIs
+
+| KPI | Available today | Why |
+|---|---|---|
+| Spread | ✅ | `market_price_cache`, 19,579 rows with sell and buy |
+| Daily volume | ⚠️ **7-day, not 30** | 12 days in `market_hist_etag`, already summed |
+| **Days to clear** | ⚠️ **7-day, not 30** | same source; the headline KPI works now at a shorter window |
+| Regional edge | ⚠️ partial | hub prices exist via `get_all_hub_prices`; freight is an assumption |
+| Volatility | ❌ | needs 30 days of `average` |
+| Trend | ❌ | needs the `average` series |
+| Competition | ❌ | needs `order_count`, which the fetcher discards |
+| Depth | ❌ **and never cache-only** | units within 5% of best price is an order-book question, one live call per type. It belongs on expand, not in a materialised stats table |
+
+So **three of eight are computable from cache today**, and the headline one —
+days to clear — is among them, at a seven-day window that must be *labelled* as
+one rather than presented as the thirty-day figure this section specifies.
+
+##### Revised order
+
+1. **The tree read model.** `app/market/tree.py` — roots, children, breadcrumb,
+   subtree ids, subtree type ids, with counts computed rather than flagged.
+   *Done.*
+2. **Group-level aggregation on `/prices`**, carrying only the KPIs that are
+   honest today, each labelled with its window.
+3. **`order_count` into `fetch_region_history`**, before any bulk fill.
+4. **A worker task filling `price_history_cache`**, prioritised the way this
+   section already says — watchlist, active projects, groups actually browsed —
+   never a blind sweep of 19,667 types.
+5. **The materialised stats table**, and the four KPIs that need the series.
+
+Depth stays out of the stats table permanently; it is a live read on expand.
+
 #### References for the market work
 
 **The Oz Report** — <https://www.theoz.space/> · weekly market insights (Twitch/YouTube/
