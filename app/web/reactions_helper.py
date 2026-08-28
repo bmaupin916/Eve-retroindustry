@@ -102,6 +102,7 @@ _SORT_KEYS = {
     "cost_int":   lambda r: r["cost_int"],
     "cost_raw":   lambda r: r["cost_raw"],
     "export":     lambda r: r["export"],
+    "import_int": lambda r: r["import_int"],
     "net_int":    lambda r: r["net_int"],
     "net_raw":    lambda r: r["net_raw"],
     "sh_int":     lambda r: r["slot_hour_int"],
@@ -120,6 +121,7 @@ WIDE_COLUMNS: list[tuple[str, str, str]] = [
     ("gross",      "Gross",             "end"),
     ("cost_int",   "Job cost · int",    "end"),
     ("cost_raw",   "Job cost · raw",    "end"),
+    ("import_int", "Import · int",      "end"),
     ("export",     "Export",            "end"),
     ("net_int",    "Net · int",         "end"),
     ("net_raw",    "Net · raw",         "end"),
@@ -163,10 +165,16 @@ def list_reaction_products(conn: Connection) -> list[dict]:
 
 def _input_cost(resolver: BOMResolver, conn: Connection, type_id: int,
                 blueprint, prices: dict[int, float | None], ctx: dict,
-                ) -> tuple[float, float, list[str]]:
+                volumes: dict[int, float] | None = None,
+                ) -> tuple[float, float, list[str], float]:
     """Cost of ONE run priced on the reaction's **direct inputs**, at market.
 
-    Returns (material cost, install fee, names of unpriced inputs).
+    Returns (material cost, install fee, names of unpriced inputs, hauled m³).
+
+    Every direct input under this model is bought, so all of it is hauled —
+    which is the whole difference from the build-from-raw side, where only the
+    leaves are. Charging freight on one model and not the other would bias
+    Build Advantage, and Build Advantage is the delta between them.
 
     This — not a recursive resolve to raw — is what a reaction costs to run.
     You buy the moon goo and the intermediates and you react them; nobody makes
@@ -190,12 +198,15 @@ def _input_cost(resolver: BOMResolver, conn: Connection, type_id: int,
     mult = resolver._product_facility_multiplier(type_id, ctx["rxn_facility"])
     adjusted = resolver._adj_prices or {}
 
+    vols = volumes or {}
     cost = 0.0
     eiv = 0.0
+    hauled = 0.0
     unpriced: list[str] = []
     for mat in materials:
         mat_id = mat["material_type_id"]
         qty = resolver._apply_me(mat["quantity"], 1, 0.0, mult, runs_per_job=None)
+        hauled += qty * vols.get(mat_id, 0.0)
         unit = prices.get(mat_id)
         if unit is None:
             unpriced.append(mat["name"])
@@ -205,14 +216,41 @@ def _input_cost(resolver: BOMResolver, conn: Connection, type_id: int,
         # with CCP's adjusted prices — not the market price and not the reduced
         # quantity. Same formula the resolver uses for every other job.
         eiv += (adjusted.get(mat_id, 0.0) or 0.0) * mat["quantity"]
-    return cost, eiv * ctx["rate_rxn"], unpriced
+    return cost, eiv * ctx["rate_rxn"], unpriced, hauled
 
 
 def raw_unit_cost(resolver: BOMResolver, type_id: int, prices: dict[int, float | None],
-                  ctx: dict, memo: dict[int, float | None],
-                  unpriced: set[str], _visiting: frozenset[int] = frozenset(),
-                  ) -> float | None:
-    """Cost of ONE unit, building everything that can be built, down to raw.
+                  ctx: dict, memo: dict, unpriced: set[str],
+                  _visiting: frozenset[int] = frozenset()) -> float | None:
+    """Cost of ONE unit — the cost half of `raw_unit_cost_and_volume`.
+
+    A wrapper rather than a second recursion. Two walks of the same tree would
+    have to agree about ME, EVE's one-unit floor and the cycle rule, and this
+    codebase has twice been bitten by exactly that kind of pair drifting apart.
+    """
+    pair = raw_unit_cost_and_volume(resolver, type_id, prices, ctx, memo,
+                                    unpriced, _visiting=_visiting)
+    return None if pair is None else pair[0]
+
+
+def raw_unit_cost_and_volume(
+    resolver: BOMResolver, type_id: int, prices: dict[int, float | None],
+    ctx: dict, memo: dict, unpriced: set[str],
+    volumes: dict[int, float] | None = None,
+    _visiting: frozenset[int] = frozenset(),
+) -> tuple[float, float] | None:
+    """(cost, imported m³) for ONE unit, building everything that can be built.
+
+    **The volume is what you haul in, not what the tree contains.** A material
+    you *buy* contributes its own packaged m³; one you *build* contributes its
+    inputs' m³ instead, because you never haul the intermediate — you make it
+    where you are. Freight is charged at the boundary of the operation, never
+    between its own runs.
+
+    `volumes` may be omitted when only the cost is wanted, in which case the
+    volume half is zero throughout and costs nothing to carry.
+
+    Cost of ONE unit, building everything that can be built, down to raw.
 
     The counterpart to `_input_cost`: that one buys the intermediates, this one
     makes them. The difference between the two margins is the Build Advantage,
@@ -234,21 +272,29 @@ def raw_unit_cost(resolver: BOMResolver, type_id: int, prices: dict[int, float |
     cost is lower than the truth, and a Build Advantage computed from it would
     favour building for a reason that is purely missing data.
     """
+    vols = volumes or {}
+
+    def bought(tid: int) -> tuple[float, float] | None:
+        """What a purchased unit costs and what hauling it costs volume-wise."""
+        price = prices.get(tid)
+        return None if price is None else (price, vols.get(tid, 0.0))
+
     if type_id in memo:
         return memo[type_id]
     # A blueprint whose inputs eventually include its own product would recurse
     # forever. Treat the repeat as something you buy, which is what you would
-    # actually do, rather than unwinding the loop.
+    # actually do, rather than unwinding the loop. Bought means hauled, so it
+    # carries its own volume.
     if type_id in _visiting:
-        return prices.get(type_id)
+        return bought(type_id)
 
     blueprint = resolver.find_blueprint(type_id)
     if blueprint is None:
-        price = prices.get(type_id)
-        if price is None:
+        pair = bought(type_id)
+        if pair is None:
             unpriced.add(resolver.get_type_name(type_id))
-        memo[type_id] = price
-        return price
+        memo[type_id] = pair
+        return pair
 
     activity = blueprint["activity"]
     facility = ctx["rxn_facility"] if activity == "reaction" else ctx["mfg_facility"]
@@ -259,17 +305,24 @@ def raw_unit_cost(resolver: BOMResolver, type_id: int, prices: dict[int, float |
 
     total = 0.0
     eiv = 0.0
+    hauled = 0.0
     for mat in resolver.get_materials(blueprint["blueprint_type_id"], activity):
         qty = resolver._apply_me(mat["quantity"], 1, 0.0, mult, runs_per_job=None)
-        unit = raw_unit_cost(resolver, mat["material_type_id"], prices, ctx, memo,
-                             unpriced, _visiting | {type_id})
-        if unit is None:
+        pair = raw_unit_cost_and_volume(
+            resolver, mat["material_type_id"], prices, ctx, memo, unpriced,
+            volumes, _visiting | {type_id})
+        if pair is None:
             memo[type_id] = None
             return None
+        unit, unit_vol = pair
         total += qty * unit
+        # This node is built, so it contributes what its inputs weigh rather
+        # than what it weighs — nothing hauls an intermediate you make.
+        hauled += qty * unit_vol
         eiv += (adjusted.get(mat["material_type_id"], 0.0) or 0.0) * mat["quantity"]
 
-    memo[type_id] = (total + eiv * rate) / max(1, per_run)
+    runs = max(1, per_run)
+    memo[type_id] = ((total + eiv * rate) / runs, hauled / runs)
     return memo[type_id]
 
 
@@ -459,6 +512,7 @@ def build_board(conn: Connection, db_path: str,
     # overstated profit twice over for anyone selling that way.
     out_basis = "buy" if str(defaults.get("sales_method")) == "immediate" else "sell"
     export_rate = float(defaults.get("freight_export_isk_m3") or 0.0)
+    import_rate = float(defaults.get("freight_import_isk_m3") or 0.0)
     costs = selling_costs(defaults)
     local = _sell_venue(conn, defaults)
     venue_info = local
@@ -471,7 +525,10 @@ def build_board(conn: Connection, db_path: str,
     int_prices = _prices(conn, all_ids, int_basis, buying_costs(int_basis, defaults))
     out_prices = _prices(conn, all_ids, out_basis)
     volumes = _volumes(conn)
-    raw_memo: dict[int, float | None] = {}
+    # (cost, hauled m3) per unit, keyed by type. Pairs rather than a bare
+    # cost so one walk of the tree answers both, and the two can never
+    # disagree about ME or the one-unit floor.
+    raw_memo: dict = {}
 
     rows: list[dict] = []
     try:
@@ -482,12 +539,15 @@ def build_board(conn: Connection, db_path: str,
                 continue
             per_run = int(blueprint["product_qty"] or 1)
 
-            material_cost, job_fee, unpriced = _input_cost(
-                resolver, conn, type_id, blueprint, int_prices, ctx)
+            material_cost, job_fee, unpriced, in_vol_run = _input_cost(
+                resolver, conn, type_id, blueprint, int_prices, ctx, volumes)
 
             raw_unpriced: set[str] = set()
-            raw_per_unit = raw_unit_cost(
-                resolver, type_id, raw_prices, ctx, raw_memo, raw_unpriced)
+            raw_pair = raw_unit_cost_and_volume(
+                resolver, type_id, raw_prices, ctx, raw_memo, raw_unpriced,
+                volumes)
+            raw_per_unit = raw_pair[0] if raw_pair else None
+            raw_vol_unit = raw_pair[1] if raw_pair else None
 
             sell = out_prices.get(type_id)
             buy = _prices(conn, {type_id}, "buy").get(type_id)
@@ -506,8 +566,20 @@ def build_board(conn: Connection, db_path: str,
             # building and selling in the same station.
             export = units * volumes.get(type_id, 0.0) * export_rate
 
-            cost_int = (material_cost + job_fee) * jobs
-            cost_raw = (raw_per_unit * units) if raw_per_unit is not None else None
+            # Import is the mirror of export and charged the same flat way:
+            # what you haul in, times the rate. The two models haul different
+            # things — buying the intermediates means hauling intermediates,
+            # building from raw means hauling the moon goo — so each is charged
+            # on its own purchased set. Nothing is charged between runs: an
+            # intermediate you make never moves.
+            import_int = in_vol_run * jobs * import_rate
+            import_raw = ((raw_vol_unit * units * import_rate)
+                          if raw_vol_unit is not None else None)
+
+            cost_int = (material_cost + job_fee) * jobs + import_int
+            cost_raw = ((raw_per_unit * units + import_raw)
+                        if raw_per_unit is not None and import_raw is not None
+                        else None)
 
             net_int = gross - cost_int - selling - export
             net_raw = (gross - cost_raw - selling - export) if cost_raw is not None else None
@@ -548,6 +620,8 @@ def build_board(conn: Connection, db_path: str,
                 "cost_int": cost_int if jobs else None,
                 "cost_raw": cost_raw,
                 "export": export if jobs else None,
+                "import_int": import_int if jobs else None,
+                "import_raw": import_raw if jobs else None,
                 "net_int": net_int if jobs else None,
                 "net_raw": net_raw,
                 "margin_int": margin_int,

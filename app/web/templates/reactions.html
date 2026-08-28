@@ -141,6 +141,9 @@
           <td class="text-end rx-num">{{ r.gross | isk if r.gross is not none else '—' }}</td>
           <td class="text-end rx-num rx-thin">{{ r.cost_int | isk if r.cost_int is not none else '—' }}</td>
           <td class="text-end rx-num rx-thin">{{ r.cost_raw | isk if r.cost_raw is not none else '—' }}</td>
+          {# Import sits beside Export: the two legs of the same flat fee,
+             charged on what you haul in and what you send out. #}
+          <td class="text-end rx-num rx-thin">{{ r.import_int | isk if r.import_int is not none else '—' }}</td>
           <td class="text-end rx-num rx-thin">{{ r.export | isk if r.export is not none else '—' }}</td>
           <td class="text-end rx-num {% if r.net_int is not none %}{{ 'rx-up' if r.net_int > 0 else 'rx-down' }}{% endif %}">{{ r.net_int | isk if r.net_int is not none else '—' }}</td>
           <td class="text-end rx-num {% if r.net_raw is not none %}{{ 'rx-up' if r.net_raw > 0 else 'rx-down' }}{% endif %}">{{ r.net_raw | isk if r.net_raw is not none else '—' }}</td>
