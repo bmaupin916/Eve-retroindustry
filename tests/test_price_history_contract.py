@@ -157,3 +157,25 @@ def test_a_genuine_no_trade_day_still_counts_as_zero(conn):
     conn.commit()
 
     assert _avg_day_volume(conn, TYPE_ID) == pytest.approx(600.0)
+
+
+def test_only_one_place_writes_the_history_table():
+    """One writer, and this is what keeps it that way.
+
+    The key mismatch above survived because the reader and the writer were in
+    different files and nothing compared them. A second INSERT site is how that
+    returns — two writers drift, and the drift is silent until a KPI reads zero.
+    """
+    import pathlib
+    import re
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    sites = []
+    for path in sorted((repo / "app").rglob("*.py")):
+        src = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"INSERT\s+INTO\s+price_history_cache", src, re.I):
+            line = src[:m.start()].count("\n") + 1
+            sites.append(f"{path.relative_to(repo).as_posix()}:{line}")
+
+    assert len(sites) == 1, f"more than one writer of price_history_cache: {sites}"
+    assert sites[0].startswith("app/market/history_fill.py"), sites

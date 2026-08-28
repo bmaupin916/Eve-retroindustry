@@ -158,6 +158,8 @@ class SyncWorker:
         self._jobs_active: dict[int, set] = {}
         self._jobs_finished: dict[int, set] = {}
         self.rounds = 0
+        #: Daily series stored by the history phase, cumulative for this process.
+        self.history_filled = 0
         self.failures = 0
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -250,9 +252,37 @@ class SyncWorker:
             await self.sync_character(char_id, name)
             self._due[char_id] = self._clock() + self._next_delay()
 
+        # Market history, budgeted. Not per character — it is one shared
+        # regional series — so it runs once a round rather than inside the
+        # loop above, and it is last: a character sync that is due should
+        # not wait behind a fill that can always happen next round.
+        await self._fill_market_history()
+
         self.rounds += 1
         soonest = min(self._due.values()) if self._due else now + self.interval
         return max(0.0, min(soonest - self._clock(), self.interval))
+
+    async def _fill_market_history(self) -> int:
+        """Top up `price_history_cache` for the types that earn it.
+
+        Never raises. The fill is the least important thing the worker
+        does — every KPI it feeds degrades to "not enough history" — and
+        it must not be able to stop character syncing.
+        """
+        try:
+            from app.market import history_fill
+
+            with connect() as conn:
+                if not history_fill.types_needing_history(conn):
+                    return 0
+                async with esi_client() as client:
+                    stored = await history_fill.fill_history(client, conn)
+            if stored:
+                self.history_filled += stored
+            return stored
+        except Exception as exc:                # noqa: BLE001 — see docstring
+            print(f"[sync] market history fill failed: {exc}", flush=True)
+            return 0
 
     def _next_delay(self) -> float:
         spread = self.interval * self.jitter

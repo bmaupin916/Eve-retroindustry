@@ -654,15 +654,12 @@ async def get_price_history(conn: sqlite3.Connection, region_id: int, type_id: i
                 return []
         return []
 
-    conn.execute(
-        text("""INSERT INTO price_history_cache
-                 (region_id, type_id, data_json, cached_at)
-           VALUES (:rid, :tid, :data_json, :cached_at)
-           ON CONFLICT (region_id, type_id) DO UPDATE SET
-             data_json = excluded.data_json, cached_at = excluded.cached_at"""),
-        {"rid": region_id, "tid": type_id,
-         "data_json": _json.dumps(series), "cached_at": time.time()},
-    )
+    # One writer for this table, in `app/market/history_fill.py`. The reader
+    # and writer of this series disagreed about a key name for a year;
+    # a second INSERT site is how that comes back.
+    from app.market.history_fill import store_region_history
+
+    store_region_history(conn, region_id, type_id, series)
     conn.commit()
     return _densify_history(series, _today)
 

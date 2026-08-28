@@ -1410,9 +1410,26 @@ one rather than presented as the thirty-day figure this section specifies.
    the producer returned and reads it back through the consumer, so a key
    renamed on either side fails immediately. A hand-written fixture cannot
    catch this, which is what let it live.
-4. **A worker task filling `price_history_cache`**, prioritised the way this
+4. ~~**A worker task filling `price_history_cache`**, prioritised the way this
    section already says — watchlist, active projects, groups actually browsed —
-   never a blind sweep of 19,667 types.
+   never a blind sweep of 19,667 types.~~ **Done, v0.9.86** —
+   `app/market/history_fill.py`, twenty types per worker round, watchlist
+   first then project products then their inputs. Fresh types are not
+   re-fetched, so a settled install spends nothing and no ESI client is even
+   opened when nothing is due.
+
+   **"Groups actually being browsed" is deliberately not built.** Recording
+   what a user browsed is a tenth per-user table with no owner column, added
+   weeks before Step 5 re-keys the nine that already exist — cheap afterwards,
+   expensive now.
+
+   Two properties are load-bearing and pinned by tests. A **failed fetch
+   writes nothing**: an empty series under a fresh timestamp reads as "this
+   item has never traded" and suppresses the retry for twenty hours, which is
+   the same error as conflating a failed fetch with no jobs. And there is now
+   exactly **one writer** of the table — the chart path was rerouted through
+   it — because the reader and writer of this series disagreed about a key
+   name from v0.8.70 to v0.9.85, and two writers is how that returns.
 5. **The materialised stats table**, and the four KPIs that need the series.
 
 Depth stays out of the stats table permanently; it is a live read on expand.
