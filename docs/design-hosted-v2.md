@@ -1450,10 +1450,14 @@ one rather than presented as the thirty-day figure this section specifies.
    and grows twenty types a round, and one number for both would hide which
    half a blank column is missing.
 
-**§9.4 is complete.** Seven of the eight KPIs ship; depth is deliberately not
-one of them, and the eighth — regional edge — still wants a freight number
-the app does not have. Both are recorded above rather than left blank on the
-page.
+**§9.4 is complete.** Seven of the eight KPIs ship. Depth is deliberately not
+one of them — it is an order-book question and belongs on expand. The eighth,
+**regional edge, is blocked on `hub_price_cache`**, not on freight: the
+freight side already exists (`freight_export_isk_m3`, read by
+`reactions_helper`) and an earlier draft of this paragraph said otherwise.
+`hub_price_cache` has no background fill and only populates when somebody
+fetches a hub by hand on `/prices` — which is also why the reactions board's
+Sell Advantage column has never once shown a number. **One fill closes both.**
 
 #### References for the market work
 

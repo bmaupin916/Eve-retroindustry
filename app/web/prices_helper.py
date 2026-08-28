@@ -230,8 +230,17 @@ def _persist_bulk_orders(
     for tid in wanted:
         d = bulk.get(tid)
         if d is None:
-            # No order in the region → write None (explicitly no price)
-            rows.append((tid, None, None, None, now))
+            # No order in the region → write None (explicitly no price).
+            #
+            # A dict, like the branch below. This was a tuple, left from the
+            # `?` placeholders this statement used before Step 4's portable
+            # conversion, and SQLAlchemy refuses a list mixing the two:
+            # "List argument must consist only of dictionaries". Since one of
+            # ~19k types always has no order, the branch was taken on every
+            # refresh and every refresh raised — the cached prices in this
+            # database were last written 2026-08-18 and could not be renewed.
+            rows.append({"tid": tid, "sell": None, "buy": None,
+                         "avail": None, "now": now})
             continue
         sell = d.get("sell")
         buy  = d.get("buy")
@@ -410,7 +419,20 @@ def _persist_hub_bulk_orders(
     for tid in wanted:
         d = bulk.get(tid)
         if d is None:
-            rows.append((region_id, tid, None, None, None, now))
+            # A dict, like the branch below. This was a tuple — left over
+            # from the `?` placeholders this statement used before the
+            # portable conversion — and SQLAlchemy refuses a list that mixes
+            # the two: "List argument must consist only of dictionaries".
+            #
+            # `wanted` is the whole app's type set and most types have no
+            # orders in a secondary hub, so this branch is taken on nearly
+            # every refresh, which means every hub refresh raised. That is
+            # why `hub_price_cache` has zero rows — not because nobody
+            # fetched a hub, but because fetching one could not succeed.
+            # It is also why the reactions board's Sell Advantage column has
+            # never shown a number.
+            rows.append({"rid": region_id, "tid": tid, "sell": None,
+                         "buy": None, "avail": None, "now": now})
             continue
         sell = d.get("sell")
         buy = d.get("buy")
