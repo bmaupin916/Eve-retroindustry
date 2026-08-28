@@ -6,6 +6,11 @@
   <div class="col">
     <h4 class="mb-0"><i class="bi bi-currency-exchange me-2 text-primary"></i>Price Management</h4>
   </div>
+  <div class="col-auto">
+    {# This page answers "what is this worth"; that one answers "is this a market". #}
+    <a href="/prices/groups" class="btn btn-outline-secondary btn-sm">
+      <i class="bi bi-diagram-3 me-1"></i>Market quality</a>
+  </div>
 </div>
 
 {% if refreshed_count is not none %}

@@ -1388,8 +1388,13 @@ one rather than presented as the thirty-day figure this section specifies.
 1. **The tree read model.** `app/market/tree.py` — roots, children, breadcrumb,
    subtree ids, subtree type ids, with counts computed rather than flagged.
    *Done.*
-2. **Group-level aggregation on `/prices`**, carrying only the KPIs that are
-   honest today, each labelled with its window.
+2. ~~**Group-level aggregation on `/prices`**, carrying only the KPIs that are
+   honest today, each labelled with its window.~~ **Done, v0.9.84** —
+   `/prices/groups`, `app/market/group_stats.py`. Spread, daily volume and
+   days of supply, with `priced / total` on every row so a median over three
+   of forty-seven types says so. Measured on the live cache: Ships 8.6%
+   median spread against Ship SKINs at 90.5%, which is the market-quality
+   contrast this section exists to surface.
 3. **`order_count` into `fetch_region_history`**, before any bulk fill.
 4. **A worker task filling `price_history_cache`**, prioritised the way this
    section already says — watchlist, active projects, groups actually browsed —

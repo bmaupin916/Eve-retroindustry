@@ -33,6 +33,7 @@ from app.web.deps import (
 from sqlalchemy import bindparam, text
 
 from app.db.conn import connect as _connect
+from app.market import group_stats, tree
 from app.web.location_resolver import (
     get_region_for_location,
     load_location_names_from_db,
@@ -602,6 +603,26 @@ async def api_station_volume(request: Request):
     conn.close()
     return _fmt(result)
 
+
+@router.get("/prices/groups", response_class=HTMLResponse)
+async def prices_groups(request: Request, g: int | None = None):
+    """Market quality, browsed down the in-game market tree.
+
+    Every other screen answers *what is this worth*; this one answers *is
+    this a market* — so the columns are liquidity, not price. Cache-only:
+    two tables, no ESI, which is what lets it aggregate a whole branch.
+    """
+    conn = _connect()
+    try:
+        rows = group_stats.stats_for_children(conn, g)
+        path = tree.path(conn, g) if g else []
+    finally:
+        conn.close()
+    return _tr("market_groups.html", request, {
+        "rows": rows,
+        "path": path,
+        "window_days": group_stats.VOLUME_WINDOW_DAYS,
+    })
 
 @router.get("/prices", response_class=HTMLResponse)
 async def prices_page(request: Request):

@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Market quality — EVE Retroindustry{% endblock %}
+{% block content %}
+
+{# Every other screen answers "what is this worth". This one answers "is this a
+   market" — which is why the columns are liquidity, not price. #}
+<div class="d-flex align-items-baseline justify-content-between mb-2">
+  <h5 class="mb-0">Market quality</h5>
+  <a href="/prices" class="small text-muted">Price list →</a>
+</div>
+
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb small mb-2">
+    <li class="breadcrumb-item{% if not path %} active{% endif %}">
+      {% if path %}<a href="/prices/groups">All groups</a>{% else %}All groups{% endif %}
+    </li>
+    {% for node in path %}
+      <li class="breadcrumb-item{% if loop.last %} active{% endif %}">
+        {% if loop.last %}{{ node.name }}
+        {% else %}<a href="/prices/groups?g={{ node.group_id }}">{{ node.name }}</a>{% endif %}
+      </li>
+    {% endfor %}
+  </ol>
+</nav>
+
+{# The window is part of the number. The stored volume column is a seven-day
+   sum, not the thirty-day mean the design asks for, and a figure labelled
+   "daily volume" with no window is one nobody measured. #}
+<p class="text-muted small mb-3">
+  Medians over every published type in each branch, from the cached Jita prices.
+  Volume is the <strong>{{ window_days }}-day</strong> average — the only window
+  currently stored. <em>Priced</em> says how much of the branch the medians
+  actually describe.
+</p>
+
+{% if not rows %}
+  <div class="alert alert-secondary small">
+    No sub-groups here. This branch holds items rather than further groups —
+    use the <a href="/prices">price list</a> to see them.
+  </div>
+{% else %}
+<div class="table-responsive">
+  <table class="table table-sm table-hover align-middle">
+    <thead>
+      <tr class="text-muted small">
+        <th>Group</th>
+        <th class="text-end">Priced</th>
+        <th class="text-end" title="(sell − buy) ÷ sell. Wide means illiquid or trader-controlled.">Spread</th>
+        <th class="text-end" title="Units traded per day, averaged over {{ window_days }} days.">Volume / day</th>
+        <th class="text-end" title="How long the standing sell wall would take to clear at recent velocity.">Days of supply</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>
+          {% if r.group.child_count %}
+            <a href="/prices/groups?g={{ r.group.group_id }}">{{ r.group.name }}</a>
+          {% else %}
+            {{ r.group.name }}
+          {% endif %}
+          <span class="text-muted small">· {{ "{:,}".format(r.group.type_count) }} types</span>
+        </td>
+        {# Coverage is reported rather than implied: a median over 3 of 47 types
+           is not a fact about the branch. #}
+        <td class="text-end small {% if r.coverage is not none and r.coverage < 0.5 %}text-warning{% else %}text-muted{% endif %}">
+          {% if r.coverage is none %}—
+          {% else %}{{ "{:,}".format(r.priced) }} / {{ "{:,}".format(r.group.type_count) }}{% endif %}
+        </td>
+        <td class="text-end">
+          {% if r.median_spread_pct is none %}<span class="text-muted">—</span>
+          {% else %}{{ "%.1f"|format(r.median_spread_pct) }}%{% endif %}
+        </td>
+        <td class="text-end">
+          {% if r.median_daily_volume is none %}<span class="text-muted">—</span>
+          {% elif r.median_daily_volume < 1 %}<span class="text-muted" title="{{ "%.2f"|format(r.median_daily_volume) }} per day">&lt; 1</span>
+          {% else %}{{ "{:,.0f}".format(r.median_daily_volume) }}{% endif %}
+        </td>
+        <td class="text-end">
+          {% if r.median_days_of_supply is none %}<span class="text-muted" title="Nothing traded in the window — not the same as slow">—</span>
+          {% else %}{{ "{:,.0f}".format(r.median_days_of_supply) }}{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% endblock %}

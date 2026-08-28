@@ -92,6 +92,7 @@ EXPECTED: set[tuple[str, str]] = {
     ("GET", "/redoc"),
     ("GET", "/settings"),
     ("GET", "/setup"),
+    ("GET", "/prices/groups"),
     ("GET", "/setup/client-id"),
     ("GET", "/sync-health"),
     ("GET", "/wallet"),
@@ -113,7 +114,7 @@ def test_the_inventory_matches_the_running_app(app_module):
 
 
 def test_the_route_count_is_unchanged(app_module):
-    """81 routes: 80 at v0.9.30, plus /sync-health at v0.9.42.
+    """82 routes: 80 at v0.9.30, /sync-health at v0.9.42, /prices/groups at v0.9.84.
 
     The number is not the claim — "no route changed by accident" is. A split
     must not change it at all; a deliberate addition changes it here in the
@@ -123,8 +124,8 @@ def test_the_route_count_is_unchanged(app_module):
     same commit — the point is that it cannot change *silently*.
     """
     live = _inventory(app_module.app)
-    assert len(live) == 81, (
-        f"route count is {len(live)}, expected 81. "
+    assert len(live) == 82, (
+        f"route count is {len(live)}, expected 82. "
         "A split should move routes, not add or lose them."
     )
 

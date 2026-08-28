@@ -80,7 +80,7 @@ SELECT g.market_group_id, g.parent_group_id, g.name, g.has_types,
 """
 
 
-def _clause(parent_id: int | None, prefix: str = "") -> tuple[str, dict]:
+def parent_clause(parent_id: int | None, prefix: str = "") -> tuple[str, dict]:
     """`parent_group_id` compared against a value, or against NULL for roots.
 
     `= :pid` never matches NULL, so the 19 roots need `IS NULL` and there is no
@@ -102,13 +102,13 @@ def children(conn, parent_id: int | None = None) -> list[Group]:
     Alphabetical, because the SDE carries no display order for market groups —
     `iconID` is the only other presentational field and it does not imply one.
     """
-    listing, params = _clause(parent_id, "g.")
+    listing, params = parent_clause(parent_id, "g.")
     rows = conn.execute(
         text(_CHILD_ROWS.format(parent_clause=listing)), params,
     ).fetchall()
     if not rows:
         return []
-    cte, _ = _clause(parent_id)
+    cte, _ = parent_clause(parent_id)
     counts = dict(conn.execute(
         text(_SUBTREE_OF_CHILDREN.format(parent_clause=cte)), params,
     ).fetchall())
