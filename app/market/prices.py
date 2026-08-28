@@ -148,7 +148,13 @@ async def fetch_region_history(client: httpx.AsyncClient, region_id: int, type_i
             return [
                 {"d": e.get("date"), "avg": e.get("average"),
                  "low": e.get("lowest"), "high": e.get("highest"),
-                 "vol": e.get("volume", 0)}
+                 "vol": e.get("volume", 0),
+                 # ESI returns this in the same record and it was being
+                 # thrown away. Keeping it is what makes §9.4's Competition
+                 # KPI possible without re-fetching a year of history per
+                 # type — which is why it lands before the bulk fill, not
+                 # after it.
+                 "orders": e.get("order_count", 0)}
                 for e in hist
             ]
         except Exception:

@@ -159,7 +159,17 @@ def _avg_day_volume(conn: Connection, type_id: int, days: int = 30) -> float | N
             series = json.loads(row[0])
         except (ValueError, TypeError):
             series = []
-        recent = [d.get("volume") or 0 for d in series[-days:] if isinstance(d, dict)]
+        # `fetch_region_history` has stored this as "vol" since v0.8.70 and
+        # this asked for "volume", so every cached day read as 0 — and a
+        # list of zeros is truthy, so it returned 0.0 rather than falling
+        # through to the seven-day figure below. Invisible only because
+        # `price_history_cache` is empty until somebody opens a chart.
+        #
+        # Entries without the key are skipped rather than counted as zero:
+        # a day that traded nothing is a real 0 and belongs in the mean, a
+        # day we cannot read is not.
+        recent = [d["vol"] for d in series[-days:]
+                  if isinstance(d, dict) and d.get("vol") is not None]
         if recent:
             return sum(recent) / len(recent)
     fallback = conn.execute(

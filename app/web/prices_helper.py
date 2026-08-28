@@ -614,7 +614,11 @@ def _densify_history(series: list[dict], end_date: str | None = None) -> list[di
             out.append(e); last = e
         else:
             avg = last.get("avg")
-            out.append({"d": key, "avg": avg, "low": avg, "high": avg, "vol": 0})
+            # Every key a real day carries. A filler missing `orders` puts a
+            # hole in the series precisely on the quiet days a liquidity
+            # measure is asking about.
+            out.append({"d": key, "avg": avg, "low": avg, "high": avg,
+                        "vol": 0, "orders": 0})
         cur += step
     return out
 

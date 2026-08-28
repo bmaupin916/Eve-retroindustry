@@ -1395,7 +1395,21 @@ one rather than presented as the thirty-day figure this section specifies.
    of forty-seven types says so. Measured on the live cache: Ships 8.6%
    median spread against Ship SKINs at 90.5%, which is the market-quality
    contrast this section exists to surface.
-3. **`order_count` into `fetch_region_history`**, before any bulk fill.
+3. ~~**`order_count` into `fetch_region_history`**, before any bulk fill.~~
+   **Done, v0.9.85** — and it exposed a live defect in the same three lines.
+   `margins._avg_day_volume` asked the cached series for `volume`; the
+   writer has stored `vol` since v0.8.70, so every cached day read as zero —
+   and a list of zeros is truthy, so it returned `0.0` rather than falling
+   through to the seven-day figure it has a fallback for. Invisible because
+   `price_history_cache` is empty until somebody opens a chart, and because
+   the test covering it seeded `{date, volume}`, ESI's raw field names,
+   which no writer here produces. **Step 4 below is exactly what would have
+   activated it**, silently, across the whole margin tracker.
+
+   `tests/test_price_history_contract.py` now calls the producer, stores what
+   the producer returned and reads it back through the consumer, so a key
+   renamed on either side fails immediately. A hand-written fixture cannot
+   catch this, which is what let it live.
 4. **A worker task filling `price_history_cache`**, prioritised the way this
    section already says — watchlist, active projects, groups actually browsed —
    never a blind sweep of 19,667 types.

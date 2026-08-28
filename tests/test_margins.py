@@ -194,7 +194,12 @@ def test_day_volume_prefers_history_over_the_weekly_total(db):
     conn.commit()
     assert _avg_day_volume(conn, CRANE) == pytest.approx(100.0)   # 700 / 7
 
-    series = [{"date": "2026-08-0%d" % d, "volume": 40} for d in range(1, 8)]
+    # The shape `fetch_region_history` actually stores. This used to seed
+    # {date, volume} — ESI's field names — which made the assertion agree
+    # with a reader that was asking for the wrong key. See
+    # tests/test_price_history_contract.py, which ties the two together so
+    # a hand-written fixture cannot drift from the producer again.
+    series = [{"d": "2026-08-0%d" % d, "vol": 40} for d in range(1, 8)]
     conn.exec_driver_sql(
         "INSERT OR REPLACE INTO price_history_cache (region_id, type_id, data_json, cached_at) "
         "VALUES (?,?,?,?)", (JITA_REGION, CRANE, json.dumps(series), 0))
