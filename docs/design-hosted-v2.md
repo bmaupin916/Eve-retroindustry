@@ -2132,7 +2132,7 @@ been run against a real week of decisions, and three things it advertises do not
 | Gap | State |
 |---|---|
 | **Sell advantage** | Column exists and is always `—`. `hub_price_cache` is empty until a hub is fetched on /prices, so the comparison has never once produced a number. Untested against real data. |
-| **Import freight** | Setting is stored and never charged. Which inputs get hauled differs between the two costing models — the whole moon-goo chain under raw, only the intermediates under buy — and guessing would quietly bias every margin. |
+| **Import freight** | ✅ **Charged, v0.9.91–92.** The rule that resolved it: *you charge the import in or the export out, never between runs.* So the difference between the two costing models is the answer rather than the ambiguity — each charges freight on its own purchased set, and a material you **build** contributes its inputs' m³ rather than its own, because nothing hauls an intermediate you make. Also on `/plan`, where the market table hauls every material and the stock table only what is missing. Both rates default to 0 and the rows do not render at 0. |
 | **Player-owned structure as a sell venue** | Not wired. `fetch_structure_market` exists but needs a market fetch tied to a docked character; the venue picker offers the four NPC hubs only. |
 | **Layouts for the other five groups** | Only Composite has the two-model layout. The other 102 products use the generic one. |
 

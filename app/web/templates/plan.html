@@ -549,6 +549,22 @@ function switchPlanChar(charId) {
           <td class="text-muted">Job installation fee</td>
           <td class="text-end" style="color:#e3b341">{{ result.fees.total_job_fee | isk }}</td>
         </tr>
+        {% if result.fees.import_cost %}
+        <tr>
+          <td class="text-muted"
+              title="{{ '{:,.0f}'.format(result.fees.import_m3) }} m³ hauled in, at the import rate in Settings.">
+            Import freight</td>
+          <td class="text-end" style="color:#e3b341">{{ result.fees.import_cost | isk }}</td>
+        </tr>
+        {% endif %}
+        {% if result.fees.export_cost %}
+        <tr>
+          <td class="text-muted"
+              title="{{ '{:,.0f}'.format(result.fees.export_m3) }} m³ shipped out, at the export rate in Settings.">
+            Export freight</td>
+          <td class="text-end" style="color:#e3b341">{{ result.fees.export_cost | isk }}</td>
+        </tr>
+        {% endif %}
         <tr>
           <td class="text-muted"
               title="{{ '%.2f' % result.fees.sales_tax_pct }}% sales tax{% if result.fees.broker_fee_pct %} + {{ '%.2f' % result.fees.broker_fee_pct }}% broker's fee{% endif %}{% if result.fees.sales_method == 'immediate' %} (selling into buy orders, so no broker's fee){% endif %}. Set in Settings.">
@@ -601,6 +617,22 @@ function switchPlanChar(charId) {
           <td class="text-muted">Job installation fee</td>
           <td class="text-end" style="color:#e3b341">{{ result.fees.total_job_fee | isk }}</td>
         </tr>
+        {% if result.fees.import_cost_stock %}
+        <tr>
+          <td class="text-muted"
+              title="{{ '{:,.0f}'.format(result.fees.import_m3_stock) }} m³ hauled in, at the import rate in Settings.">
+            Import freight</td>
+          <td class="text-end" style="color:#e3b341">{{ result.fees.import_cost_stock | isk }}</td>
+        </tr>
+        {% endif %}
+        {% if result.fees.export_cost %}
+        <tr>
+          <td class="text-muted"
+              title="{{ '{:,.0f}'.format(result.fees.export_m3) }} m³ shipped out, at the export rate in Settings.">
+            Export freight</td>
+          <td class="text-end" style="color:#e3b341">{{ result.fees.export_cost | isk }}</td>
+        </tr>
+        {% endif %}
         <tr>
           <td class="text-muted"
               title="{{ '%.2f' % result.fees.sales_tax_pct }}% sales tax{% if result.fees.broker_fee_pct %} + {{ '%.2f' % result.fees.broker_fee_pct }}% broker's fee{% endif %}{% if result.fees.sales_method == 'immediate' %} (selling into buy orders, so no broker's fee){% endif %}. Set in Settings.">

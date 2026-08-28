@@ -943,6 +943,36 @@ async def plan_result(
         buy_cost = plan_data.get("total_buy") or 0.0
         rev = plan_data.get("revenue")
 
+        # Freight: a flat fee on what crosses the boundary of the operation.
+        # What you haul in, and what you send out — never anything moving
+        # between your own jobs, because an intermediate you build never
+        # travels. Both rates default to 0, which is right for anyone building
+        # and selling in one station.
+        _import_rate = float(_plan_defaults.get("freight_import_isk_m3") or 0.0)
+        _export_rate = float(_plan_defaults.get("freight_export_isk_m3") or 0.0)
+        import_m3 = import_m3_stock = export_m3 = 0.0
+        if _import_rate or _export_rate:
+            _mat_ids = [m["type_id"] for m in plan_data.get("materials", [])]
+            _vol_ids = _mat_ids + [plan_data.get("product_type_id")]
+            with _connect() as _vc:
+                _vols = {r[0]: (r[1] or 0.0) for r in _vc.execute(
+                    text("SELECT type_id, packaged_volume FROM sde_types"
+                         " WHERE type_id IN :ids")
+                    .bindparams(bindparam("ids", expanding=True)),
+                    {"ids": [i for i in _vol_ids if i]})}
+            for m in plan_data.get("materials", []):
+                unit_m3 = _vols.get(m["type_id"], 0.0)
+                # Two figures for the two profit lines below: buying every
+                # material, and buying only what you are short of.
+                import_m3 += (m.get("required") or 0) * unit_m3
+                import_m3_stock += (m.get("missing") or 0) * unit_m3
+            export_m3 = (plan_data.get("quantity") or 0) * _vols.get(
+                plan_data.get("product_type_id"), 0.0)
+
+        import_cost = import_m3 * _import_rate
+        import_cost_stock = import_m3_stock * _import_rate
+        export_cost = export_m3 * _export_rate
+
         # Selling is not free: sales tax always, broker's fee when listing an
         # order. Between 4.4% and 10.5% of revenue, which on a thin margin is
         # the whole margin — so it comes off both profit figures, not just the
@@ -950,10 +980,14 @@ async def plan_result(
         _sell_costs = selling_costs(_plan_defaults)
         selling_cost = _sell_costs.on(rev) if rev is not None else 0.0
 
-        # Market profit: revenue − all materials at market price − job fee − selling
-        profit_market = (rev - full_mat_cost - total_job_fee - selling_cost) if rev is not None else None
-        # Profit with stock: revenue − only missing materials − job fee − selling
-        profit_stock  = (rev - buy_cost - total_job_fee - selling_cost) if rev is not None else None
+        # Freight joins the job fee: both are costs of producing, not of the
+        # materials themselves, so they sit on the same side of the sum.
+        # Import differs between the two lines for the same reason the material
+        # cost does — you only haul what you actually buy.
+        profit_market = (rev - full_mat_cost - total_job_fee - selling_cost
+                         - import_cost - export_cost) if rev is not None else None
+        profit_stock = (rev - buy_cost - total_job_fee - selling_cost
+                        - import_cost_stock - export_cost) if rev is not None else None
 
         total_time_s = total_mfg_time_s + total_rxn_time_s
         plan_data["fees"] = {
@@ -967,6 +1001,15 @@ async def plan_result(
             "mfg_cost_bonus_pct":  round(mfg_cost_bonus * 100, 1),
             "rxn_cost_bonus_pct":  round(rxn_cost_bonus * 100, 1) if sep_rxn_station else None,
             "total_job_fee":       total_job_fee,
+            # Shown as their own lines rather than folded into materials: a
+            # cost you cannot see is one you cannot check, and freight is the
+            # one number here that comes from a setting rather than the market.
+            "import_m3":           import_m3,
+            "import_m3_stock":     import_m3_stock,
+            "import_cost":         import_cost,
+            "import_cost_stock":   import_cost_stock,
+            "export_m3":           export_m3,
+            "export_cost":         export_cost,
             "total_time_s":        total_time_s,
             "total_time":          format_duration(total_time_s) if total_time_s else None,
             "implant_mfg_pct":     implant_mfg_pct,
