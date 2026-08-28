@@ -166,7 +166,7 @@ async def contracts_page(request: Request, char: str = "", scope: str = "persona
         # single character
         plan_char_id = int(char) if char.isdigit() and character_row(int(char)) else None
         if plan_char_id is None:
-            plan_char_id = get_active_character_id(request, conn)
+            plan_char_id = get_active_character_id(request)
         ctx["contracts_char_id"] = plan_char_id
         token = await _valid_token_async(plan_char_id) if plan_char_id else None
         row = character_row(plan_char_id) if plan_char_id else None

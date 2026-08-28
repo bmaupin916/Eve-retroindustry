@@ -173,7 +173,7 @@ async def plan_form(request: Request, char: str = "", station: str = ""):
         if not character_row(plan_char_id):
             plan_char_id = None
     if plan_char_id is None:
-        plan_char_id = get_active_character_id(request, conn)
+        plan_char_id = get_active_character_id(request)
     char_row = character_row(plan_char_id) if plan_char_id else None
     token = await _valid_token_async(plan_char_id) if plan_char_id else None
 
@@ -399,7 +399,7 @@ async def plan_result(
         if character_row(candidate):
             plan_char_id_int = candidate
     if plan_char_id_int is None:
-        plan_char_id_int = get_active_character_id(request, conn)
+        plan_char_id_int = get_active_character_id(request)
 
     # Parse station — friendly error instead of 422 (if missing, raise ValueError below)
     try:

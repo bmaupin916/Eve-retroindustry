@@ -88,7 +88,7 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
         if match:
             selected_chars = [match]
     if not selected_chars:
-        active = get_active_character(request, conn)
+        active = get_active_character(request)
         if active:
             selected_chars = [active]
 
@@ -610,8 +610,8 @@ async def assets_page(request: Request, search: str = "", view: str = ""):
 async def assets_distances(request: Request):
     """Return the jump count from the character's current position to each location in assets."""
     conn = get_conn()
-    char = get_active_character(request, conn)
-    token = get_active_token(request, conn)
+    char = get_active_character(request)
+    token = get_active_token(request)
     if not char or not token:
         conn.close()
         return {"ok": False, "error": "Not signed in"}
@@ -966,7 +966,7 @@ async def blueprints_page(request: Request, search: str = "", view: str = ""):
         if match:
             selected_chars = [match]
     if not selected_chars:
-        active = get_active_character(request, conn)
+        active = get_active_character(request)
         if active:
             selected_chars = [active]
     show_char_badge = view == "all" and len(all_chars) > 1

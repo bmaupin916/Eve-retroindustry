@@ -375,7 +375,7 @@ async def _compute_dashboard(request: Request, conn, *, live: bool) -> dict:
         }
 
     chars = all_characters()
-    active_char_id = get_active_character_id(request, conn)
+    active_char_id = get_active_character_id(request)
     char_rows: dict[int, dict] = {cid: (character_row(cid) or {}) for cid, _ in chars}
 
     # Access tokens — fetched once per char, OFF the event loop (live only).

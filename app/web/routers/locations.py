@@ -156,8 +156,8 @@ async def suggest_station(request: Request, q: str = ""):
 
     conn = get_conn()
     ensure_schema(conn)
-    char = get_active_character(request, conn)
-    token = get_active_token(request, conn)
+    char = get_active_character(request)
+    token = get_active_token(request)
     pattern = q.strip().lower()
 
     # Locations where the character has assets (personal + corporate)
@@ -330,7 +330,7 @@ async def add_station(request: Request, raw: str = Form(...)):
     import re
     conn = get_conn()
     ensure_schema(conn)
-    token = get_active_token(request, conn)
+    token = get_active_token(request)
 
     raw = raw.strip()
     structure_id: int | None = None
@@ -420,7 +420,7 @@ async def location_rename(request: Request):
 async def location_resolve(request: Request, location_id: int):
     """Try to look up the structure name via ESI with the current token."""
     conn = get_conn()
-    token = get_active_token(request, conn)
+    token = get_active_token(request)
     if not token:
         conn.close()
         return {"ok": False, "error": "Not signed in"}
@@ -449,8 +449,8 @@ async def location_resolve(request: Request, location_id: int):
 async def my_location(request: Request):
     """Return the character's current location (structure_id if docked in a structure)."""
     conn = get_conn()
-    token = get_active_token(request, conn)
-    char = get_active_character(request, conn)
+    token = get_active_token(request)
+    char = get_active_character(request)
     if not token or not char:
         conn.close()
         return {"error": "Not signed in"}
@@ -525,7 +525,7 @@ async def my_location(request: Request):
 async def fetch_plan_sell_price(request: Request, location_id: int, type_id: int):
     """Fetch the best sell price of a specific product at the given station, save it to station_volume_cache."""
     conn = get_conn()
-    token = get_active_token(request, conn)
+    token = get_active_token(request)
 
     # Ensure the type_id is present in market_price_cache (the fetchers need it for filtering)
     with _connect() as _pc:
@@ -577,7 +577,7 @@ async def api_plan_contract_price(request: Request, location_id: int, type_id: i
     the given station's region. Requires the region to have been indexed first (Public browser)."""
     conn = get_conn()
     try:
-        token = get_active_token(request, conn)
+        token = get_active_token(request)
         region_id = await _region_for(location_id, token)
         if not region_id:
             return {"ok": False, "error": "Could not determine the station's region."}
@@ -608,7 +608,7 @@ async def suggest(request: Request, q: str = ""):
         return {"owned": [], "other": []}
 
     conn = get_conn()
-    char = get_active_character(request, conn)
+    char = get_active_character(request)
     pattern = f"%{q.strip().lower()}%"
     owned: list[dict] = []
     owned_product_ids: set[int] = set()

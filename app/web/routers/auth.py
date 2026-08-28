@@ -44,8 +44,7 @@ from sqlalchemy import text
 from app.db.conn import NO_SUCH_TABLE
 
 from app.web.deps import (ACTIVE_COOKIE, _tr, _valid_token_async,
-                          all_characters, any_character, character_row,
-                          get_conn)
+                          all_characters, any_character, character_row)
 from app.web.location_resolver import resolve_station_names_bulk
 
 router = APIRouter()
@@ -219,11 +218,7 @@ async def auth_callback(request: Request, code: str | None = None,
     # already added — and that difference decides whether a refusal is allowed
     # to delete the row. Getting it wrong would destroy a known alt whose owner's
     # session merely expired during the round trip to EVE.
-    conn = get_conn()
-    try:
-        known_before = {cid for cid, _name in all_characters()}
-    finally:
-        conn.close()
+    known_before = {cid for cid, _name in all_characters()}
 
     try:
         character_id, character_name = complete_login(code, state)
@@ -279,9 +274,7 @@ async def auth_callback(request: Request, code: str | None = None,
 
 async def _bg_initial_sync():
     """Fetch blueprints + personal + corp assets from ESI for every known char."""
-    conn = None
     try:
-        conn = get_conn()
         chars = all_characters()
         if not chars:
             return
@@ -354,11 +347,6 @@ async def _bg_initial_sync():
         traceback.print_exc()
         print(f"[sync] fatal: {exc}", flush=True)
     finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
         _sync_state["running"] = False
         _sync_state["done"] = True
 
@@ -369,12 +357,8 @@ async def auth_sync(request: Request):
     Authenticated like everything else — /callback has already set the cookie by
     the time the browser arrives here.
     """
-    conn = get_conn()
-    try:
-        if not any_character():
-            return RedirectResponse("/")
-    finally:
-        conn.close()
+    if not any_character():
+        return RedirectResponse("/")
 
     if not _sync_state["running"] and not _sync_state["done"]:
         _sync_reset()
@@ -448,12 +432,8 @@ async def api_sync_status():
 async def api_activate_character(char_id: int):
     """Set active_char cookie."""
     from fastapi.responses import JSONResponse
-    conn = get_conn()
-    try:
-        if not character_row(char_id):
-            return JSONResponse({"ok": False, "error": "Unknown character"}, status_code=404)
-    finally:
-        conn.close()
+    if not character_row(char_id):
+        return JSONResponse({"ok": False, "error": "Unknown character"}, status_code=404)
     resp = JSONResponse({"ok": True})
     resp.set_cookie(ACTIVE_COOKIE, str(char_id), max_age=60 * 60 * 24 * 365, samesite="lax")
     return resp
@@ -463,12 +443,8 @@ async def api_activate_character(char_id: int):
 async def api_delete_character(request: Request, char_id: int):
     """Remove a character (and its cached data)."""
     from fastapi.responses import JSONResponse
-    conn = get_conn()
-    try:
-        with _connect() as _tc:
-            delete_character(_tc, char_id)
-    finally:
-        conn.close()
+    with _connect() as _tc:
+        delete_character(_tc, char_id)
     resp = JSONResponse({"ok": True})
     if request.cookies.get(ACTIVE_COOKIE) == str(char_id):
         resp.delete_cookie(ACTIVE_COOKIE)
@@ -489,27 +465,18 @@ async def api_sync_start():
 async def settings_page(request: Request):
     from app.auth.token_store import get_client_id
     from app.auth.esi_oauth import callback_url, SCOPES
-    conn = get_conn()
-    try:
-        # `app_defaults` is converted; this router is not. It gets its own
-        # connection from the engine rather than the raw one — same database,
-        # same committed state, and both styles coexist deliberately
-        # (`test_both_connection_styles_work_on_one_database`).
-        from app.db.conn import connect
-        with connect() as _defaults_conn:
-            defaults = app_defaults.get_defaults(_defaults_conn)
-        with connect() as _st:
-            station_options = _industry_station_options(_st)
-        # Only the eight canonical decryptors: the faction-flavoured duplicates
-        # and the ancient-relic ones behave identically or belong to reverse
-        # engineering, and 64 entries would make the picker unusable.
-        from app.db.conn import connect
-        with connect() as _sde:
-            _decs = invention.list_decryptors(_sde)
-        decryptors = [d for d in _decs
-                      if d.name.endswith("Decryptor")]
-    finally:
-        conn.close()
+    from app.db.conn import connect
+
+    with connect() as _defaults_conn:
+        defaults = app_defaults.get_defaults(_defaults_conn)
+    with connect() as _st:
+        station_options = _industry_station_options(_st)
+    # Only the eight canonical decryptors: the faction-flavoured duplicates
+    # and the ancient-relic ones behave identically or belong to reverse
+    # engineering, and 64 entries would make the picker unusable.
+    with connect() as _sde:
+        _decs = invention.list_decryptors(_sde)
+    decryptors = [d for d in _decs if d.name.endswith("Decryptor")]
     return _tr("settings.html", request, {
         "client_id": get_client_id() or "",
         "callback_url": callback_url(),

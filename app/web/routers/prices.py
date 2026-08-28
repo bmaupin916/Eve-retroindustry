@@ -180,7 +180,7 @@ async def api_market_orders(request: Request, type_id: int, region_id: int = JIT
     structure market directly (otherwise the tab showed unrelated region orders
     and never matched the table's per-station sell / available)."""
     conn = _connect()
-    token = get_active_token(request, conn)
+    token = get_active_token(request)
     try:
         orders: list[dict] = []
         is_structure = bool(location_id) and location_id >= 1_000_000_000_000
@@ -483,7 +483,7 @@ async def prices_station_stream(request: Request, location_id: int):
     the client reads the now-cached data via /api/prices/station-volume/cached."""
     import json as _json
     conn = _connect()
-    token = get_active_token(request, conn)
+    token = get_active_token(request)
     ensure_price_table(conn)
     try:
         with _connect() as _lc:
@@ -552,7 +552,7 @@ async def api_station_volume(request: Request):
     location_id = int(body["location_id"])
 
     conn = _connect()
-    token = get_active_token(request, conn)
+    token = get_active_token(request)
     ensure_price_table(conn)
     # Region of this location — returned so the price-history chart can offer
     # "custom station" (history is region-wide; ESI has no per-structure history).

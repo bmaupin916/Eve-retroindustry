@@ -244,7 +244,7 @@ def any_character() -> bool:
 
 
 
-def get_active_character_id(request: Request, conn=None) -> int | None:
+def get_active_character_id(request: Request) -> int | None:
     """Return the active character id from cookie, or fall back to first char in DB.
 
     `conn` is accepted and ignored. `token_store` is on the portable query layer
@@ -267,7 +267,7 @@ def get_active_character_id(request: Request, conn=None) -> int | None:
         return chars[0][0] if chars else None
 
 
-def get_active_character(request: Request, conn=None) -> tuple[int, str] | None:
+def get_active_character(request: Request) -> tuple[int, str] | None:
     """Return (char_id, char_name) for the active character, or None.
 
     `conn` is accepted and ignored — see `get_active_character_id`.
@@ -282,7 +282,7 @@ def get_active_character(request: Request, conn=None) -> tuple[int, str] | None:
     return None
 
 
-def get_active_token(request: Request, conn=None) -> str | None:
+def get_active_token(request: Request) -> str | None:
     """Return a fresh access token for the active character.
 
     `conn` is accepted and ignored — see `get_active_character_id`.
@@ -294,7 +294,7 @@ def get_active_token(request: Request, conn=None) -> str | None:
         return _get_valid_token_for(c, cid)
 
 
-def get_token_for(character_id: int, conn=None) -> str | None:
+def get_token_for(character_id: int) -> str | None:
     """Return a fresh access token for a specific character.
 
     `conn` is accepted and ignored — see `get_active_character_id`.

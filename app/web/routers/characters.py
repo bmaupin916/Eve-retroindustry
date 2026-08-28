@@ -54,7 +54,7 @@ async def wallet_page(request: Request, char: str = "", scope: str = "personal",
     if char.isdigit() and character_row(int(char)):
         plan_char_id = int(char)
     if plan_char_id is None:
-        plan_char_id = get_active_character_id(request, conn)
+        plan_char_id = get_active_character_id(request)
 
     ctx: dict = {
         "scope": scope, "division": division,
@@ -431,7 +431,7 @@ async def orders_page(request: Request, char: str = "", scope: str = "personal",
     if char.isdigit() and character_row(int(char)):
         plan_char_id = int(char)
     if plan_char_id is None:
-        plan_char_id = get_active_character_id(request, conn)
+        plan_char_id = get_active_character_id(request)
 
     ctx: dict = {
         "scope": scope, "state": state, "orders_char_id": plan_char_id,
