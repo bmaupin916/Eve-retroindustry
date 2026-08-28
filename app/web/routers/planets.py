@@ -20,6 +20,7 @@ from app.web import pi_planner_helper
 from app.db.location import database_path
 from app.db.schema import ensure_schema as ensure_db_schema
 from sqlalchemy import bindparam, inspect as sa_inspect, text
+from sqlalchemy.engine import Connection
 
 from app.db.conn import connect as _connect
 from app.web.deps import _tr, all_characters, get_conn
@@ -387,7 +388,7 @@ def _resolve_planet_names(conn: sqlite3.Connection, planet_ids) -> dict[int, str
         return planets_api.load_planet_names(_pc, planet_ids)
 
 
-def _store_pi_cache_for_chars(conn: sqlite3.Connection, char_ids, entries) -> None:
+def _store_pi_cache_for_chars(conn: Connection, char_ids, entries) -> None:
     """Replace the cached extractors for the given characters (per-char, so a
     character whose ESI fetch failed keeps its last-known rows)."""
     _ensure_pi_cache_tables(conn)
@@ -435,7 +436,7 @@ def _store_pi_cache_for_chars(conn: sqlite3.Connection, char_ids, entries) -> No
         _pc.commit()
 
 
-def _pi_refresh_alerts(conn: sqlite3.Connection, chars) -> None:
+def _pi_refresh_alerts(conn: Connection, chars) -> None:
     """Rebuild the extractor-alert cache from the colony cache. No ESI.
 
     This used to fetch: a colony list per character plus a detail call per
@@ -500,7 +501,7 @@ def _pi_refresh_alerts(conn: sqlite3.Connection, chars) -> None:
     _store_pi_cache_for_chars(conn, ok_cids, entries)
 
 
-def _pi_alert_summary(conn: sqlite3.Connection, limit: int = 8) -> dict:
+def _pi_alert_summary(conn: Connection, limit: int = 8) -> dict:
     """Read the PI cache and compute, against the CURRENT time, how many
     extractors expire within 24h / are already expired, plus the soonest few."""
     _ensure_pi_cache_tables(conn)

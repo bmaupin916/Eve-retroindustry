@@ -179,3 +179,41 @@ def test_only_one_place_writes_the_history_table():
 
     assert len(sites) == 1, f"more than one writer of price_history_cache: {sites}"
     assert sites[0].startswith("app/market/history_fill.py"), sites
+
+
+def test_an_illiquid_item_does_not_report_inflated_daily_volume(conn):
+    """The window is thirty calendar days, not thirty records.
+
+    ESI omits days with no trades. Thirty records for an item that trades once
+    a week span seven months, and averaging them reports "avg units traded per
+    day" — the /margins column — as seven times what it is. This is the case
+    where the number decides something, so it is the case it must get right.
+    """
+    # One trade a week for thirty weeks, 700 units each. Only the trades inside
+    # the last thirty days may count: at weekly cadence that is five of them.
+    import datetime
+
+    # Volumes differ across the boundary on purpose: 25 quiet weeks at 100,
+    # then 5 busy ones at 1000. The calendar window sees only the busy five and
+    # answers 1000; averaging all thirty records answers 250. Equal volumes
+    # would give the same mean either way and prove nothing.
+    start = datetime.date(2026, 1, 5)
+    days = [dict(ESI_DAY, date=(start + datetime.timedelta(weeks=w)).isoformat(),
+                 volume=100 if w < 25 else 1000) for w in range(30)]
+    series = _produced(days)
+
+    conn.execute(
+        text("INSERT INTO price_history_cache (region_id, type_id, data_json,"
+             " cached_at) VALUES (:r, :t, :j, 0)"),
+        {"r": JITA_REGION, "t": TYPE_ID, "j": json.dumps(series)},
+    )
+    conn.commit()
+
+    from app.market.stats import window
+
+    inside = window(series, 30)
+    assert len(inside) == 5, f"expected five weekly trades in thirty days, got {len(inside)}"
+
+    # 1000 is the windowed answer. 250 is what averaging all thirty records
+    # gives, and is the number this test exists to reject.
+    assert _avg_day_volume(conn, TYPE_ID) == pytest.approx(1000.0)

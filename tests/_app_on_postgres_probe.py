@@ -57,7 +57,19 @@ PAGES = [
     "/api/suggest?q=trit", "/api/prices/search?q=tritanium",
 ]
 
-SERVED = {"200", "303", "307", "401", "404"}
+#: Status codes that count as "the page came back".
+#:
+#: **404 used to be in here**, and a 404 is not a served page — it is the
+#: single most likely symptom of a router that failed to register or a
+#: handler that raised on a backend it had never run against. A probe whose
+#: healthy result is indistinguishable from a broken one is the failure this
+#: project keeps re-finding, and this one cost real time: it is why a
+#: five-router Postgres bug looked plausible for an afternoon.
+#:
+#: 303 and 307 stay because several of these pages legitimately redirect when
+#: the SDE is absent, and 401 because the auth gate refusing is a working
+#: gate.
+SERVED = {"200", "303", "307", "401"}
 
 
 def _drop_schema() -> None:

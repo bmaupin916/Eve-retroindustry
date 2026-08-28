@@ -20,9 +20,9 @@ Two things here are easy to get wrong and are worth stating up front:
 from __future__ import annotations
 
 import datetime as dt
-import sqlite3
 
 from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 
 from app.bom.resolver import BOMResolver
 from app.db.conn import NO_SUCH_TABLE, connect, connect_to_path
@@ -88,7 +88,7 @@ def parse_me(raw: str) -> int:
         return DEFAULT_ME
 
 
-def target_choices(conn: sqlite3.Connection) -> list[str]:
+def target_choices(conn: Connection) -> list[str]:
     """Names for the type-ahead: PI commodities plus every blueprint product
     that consumes one.
 

@@ -19,6 +19,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
 from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 
 from app.bom.resolver import BOMResolver
 from app.cache.blueprint_cache import resolve_type
@@ -69,7 +70,7 @@ router = APIRouter()
 
 
 def _science_skill_mult(
-    conn: sqlite3.Connection,
+    conn: Connection,
     bp_type_id: int,
     activity: str,
     skills: dict[int, int],
@@ -1201,7 +1202,7 @@ async def _build_stock_station_options(
 
 
 def _derive_job_splits(
-    conn: sqlite3.Connection,
+    conn: Connection,
     root,
     *,
     max_days: float,
@@ -1330,7 +1331,7 @@ def _schedule_split_runs(total_runs: int, per_job: int | None) -> list[int]:
     return split_runs(total_runs, per_job)
 
 
-def _plan_group_ids(conn: sqlite3.Connection, steps: list[dict]) -> dict[int, int]:
+def _plan_group_ids(conn: Connection, steps: list[dict]) -> dict[int, int]:
     """type_id → SDE group_id for everything in the plan.
 
     Classification is by group, never by product name — a rename in a patch
@@ -1484,7 +1485,7 @@ def _build_manufacturing_steps(root, prices: dict, available: dict,
     return steps
 
 
-def _plan_to_dict(plan, prices, type_name: str, conn: sqlite3.Connection | None = None,
+def _plan_to_dict(plan, prices, type_name: str, conn: Connection | None = None,
                   input_basis: str = "sell") -> dict:
     price_idx = 1 if input_basis == "buy" else 0
     bp = plan.blueprint

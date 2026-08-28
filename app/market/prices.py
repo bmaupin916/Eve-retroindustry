@@ -12,6 +12,7 @@ import sqlite3
 import httpx
 from app.esi.client import esi_client
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 from app.db.conn import dbapi
 from app.db.schema import ensure_schema as ensure_db_schema
@@ -96,7 +97,7 @@ async def fetch_adjusted_prices(client: httpx.AsyncClient) -> dict[int, dict]:
 # Jita live prices (per type, cached)
 # ---------------------------------------------------------------------------
 
-def _get_cached_price(conn: sqlite3.Connection, type_id: int) -> tuple[float | None, float | None]:
+def _get_cached_price(conn: Connection, type_id: int) -> tuple[float | None, float | None]:
     row = conn.execute(
         text("SELECT sell_price, buy_price, cached_at FROM market_price_cache"
              " WHERE type_id=:tid"),
@@ -108,7 +109,7 @@ def _get_cached_price(conn: sqlite3.Connection, type_id: int) -> tuple[float | N
 
 
 def _save_cached_price(
-    conn: sqlite3.Connection,
+    conn: Connection,
     type_id: int,
     sell: float | None,
     buy: float | None,
@@ -194,7 +195,7 @@ def ensure_hist_etag_table(conn) -> None:
     ensure_db_schema(dbapi(conn))
 
 
-def load_hist_etags(conn: sqlite3.Connection, region_id: int) -> int:
+def load_hist_etags(conn: Connection, region_id: int) -> int:
     """Load a region's stored ETags into memory before a volume phase."""
     ensure_hist_etag_table(conn)
     n = 0
@@ -214,7 +215,7 @@ def load_hist_etags(conn: sqlite3.Connection, region_id: int) -> int:
     return n
 
 
-def flush_hist_etags(conn: sqlite3.Connection) -> int:
+def flush_hist_etags(conn: Connection) -> int:
     """Persist ETags collected during a volume phase (bulk, one transaction)."""
     if not _hist_etags_dirty:
         return 0
@@ -621,7 +622,7 @@ async def get_region_for_structure(structure_id: int) -> int | None:
         return None
 
 
-def _cached_region_volume(conn: sqlite3.Connection, region_id: int | None) -> dict[int, int] | None:
+def _cached_region_volume(conn: Connection, region_id: int | None) -> dict[int, int] | None:
     """Reuse an already-fetched 7-day *region* volume map so a custom station in a
     known region needn't re-fetch ~19k histories (the slow part of a station load).
     The Jita refresh stores The Forge volume in market_price_cache; hub refreshes
@@ -670,7 +671,7 @@ def _cached_region_volume(conn: sqlite3.Connection, region_id: int | None) -> di
 
 
 async def fetch_structure_market(
-    conn: sqlite3.Connection,
+    conn: Connection,
     structure_id: int,
     token: str,
     our_type_ids: set[int],
@@ -847,7 +848,7 @@ async def _fetch_orders_for_type(
 
 
 async def fetch_station_volumes(
-    conn: sqlite3.Connection,
+    conn: Connection,
     location_id: int,
     region_id: int,
     type_ids: list[int],
@@ -944,7 +945,7 @@ async def fetch_station_volumes(
 
 
 def get_cached_station_volumes(
-    conn: sqlite3.Connection,
+    conn: Connection,
     location_id: int,
 ) -> dict[int, tuple[int | None, float | None, int | None]] | None:
     """Returns cached data if it is fresh, otherwise None."""
@@ -967,7 +968,7 @@ def get_cached_station_volumes(
 
 
 def get_station_volumes_any_age(
-    conn: sqlite3.Connection,
+    conn: Connection,
     location_id: int,
 ) -> tuple[dict[int, tuple[int | None, float | None, int | None]], float] | None:
     """Cached station volumes regardless of age — for restoring a previously

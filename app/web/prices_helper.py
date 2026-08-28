@@ -10,6 +10,7 @@ import sqlite3
 import time
 import httpx
 from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 
 from app.esi.client import esi_client
 
@@ -23,7 +24,7 @@ from app.market.prices import (
 )
 
 
-def get_cached_jita_prices(conn: sqlite3.Connection, type_ids: list[int]) -> dict[int, tuple[float | None, float | None]]:
+def get_cached_jita_prices(conn: Connection, type_ids: list[int]) -> dict[int, tuple[float | None, float | None]]:
     """Returns all prices from the cache (last fetched Jita / The Forge sell).
 
     The cache does NOT expire — the last fetched value is always used. The real
@@ -47,7 +48,7 @@ def get_cached_jita_prices(conn: sqlite3.Connection, type_ids: list[int]) -> dic
     return result
 
 
-def get_price_cache_stats(conn: sqlite3.Connection) -> dict:
+def get_price_cache_stats(conn: Connection) -> dict:
     """Price cache statistics."""
     row = conn.execute(text(
         "SELECT COUNT(*), MAX(cached_at), MIN(cached_at) FROM market_price_cache"
@@ -74,7 +75,7 @@ def get_price_cache_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
-def _load_custom_overrides(conn: sqlite3.Connection, type_ids: list[int]) -> dict[int, float]:
+def _load_custom_overrides(conn: Connection, type_ids: list[int]) -> dict[int, float]:
     if not type_ids:
         return {}
     rows = conn.execute(
@@ -141,7 +142,7 @@ def get_cached_prices_for_ids(
 
 
 def get_all_price_items(
-    conn: sqlite3.Connection,
+    conn: Connection,
     relevant_ids: set[int] | None = None,
 ) -> list[dict]:
     """Returns items from the cache for the initial render.
@@ -194,7 +195,7 @@ def get_all_price_items(
     ]
 
 
-def set_custom_price(conn: sqlite3.Connection, type_id: int, price: float | None):
+def set_custom_price(conn: Connection, type_id: int, price: float | None):
     """Stores or deletes the custom price for the given type_id."""
     ensure_price_table(conn)
     if price is None:
@@ -213,7 +214,7 @@ def set_custom_price(conn: sqlite3.Connection, type_id: int, price: float | None
 
 
 def _persist_bulk_orders(
-    conn: sqlite3.Connection,
+    conn: Connection,
     bulk: dict[int, dict],
     wanted: set[int],
 ) -> tuple[int, list[int]]:
@@ -260,7 +261,7 @@ def _persist_bulk_orders(
 
 
 async def _fill_volumes(
-    conn: sqlite3.Connection,
+    conn: Connection,
     type_ids: list[int],
     progress_cb=None,
 ) -> int:
@@ -394,7 +395,7 @@ async def stream_jita_refresh(conn: sqlite3.Connection, type_ids: list[int]):
 # ---------------------------------------------------------------------------
 
 def _persist_hub_bulk_orders(
-    conn: sqlite3.Connection,
+    conn: Connection,
     region_id: int,
     bulk: dict[int, dict],
     wanted: set[int],
@@ -437,7 +438,7 @@ def _persist_hub_bulk_orders(
 
 
 async def _fill_hub_volumes(
-    conn: sqlite3.Connection,
+    conn: Connection,
     region_id: int,
     type_ids: list[int],
     progress_cb=None,
@@ -533,7 +534,7 @@ async def stream_hub_refresh(conn: sqlite3.Connection, type_ids: list[int], regi
     yield f"data: {_json.dumps({'pct': 100, 'done': True, 'refreshed': refreshed, 'total': len(wanted), 'volume_updated': updated_vol})}\n\n"
 
 
-def get_hub_cache_stats(conn: sqlite3.Connection, region_id: int) -> dict:
+def get_hub_cache_stats(conn: Connection, region_id: int) -> dict:
     """Row count + last-update timestamp for one hub's cache."""
     row = conn.execute(
         text("SELECT COUNT(*), MAX(cached_at) FROM hub_price_cache"
@@ -551,7 +552,7 @@ def get_hub_cache_stats(conn: sqlite3.Connection, region_id: int) -> dict:
 
 
 def get_all_hub_prices(
-    conn: sqlite3.Connection,
+    conn: Connection,
     type_ids: list[int],
 ) -> dict[int, dict[int, dict]]:
     """For the given type_ids, return {type_id: {region_id: {sell, buy, volume}}}
@@ -623,7 +624,7 @@ def _densify_history(series: list[dict], end_date: str | None = None) -> list[di
     return out
 
 
-async def get_price_history(conn: sqlite3.Connection, region_id: int, type_id: int) -> list[dict]:
+async def get_price_history(conn: Connection, region_id: int, type_id: int) -> list[dict]:
     """Daily market history (~1 year) for the price chart, cached per (region, type).
     Falls back to any stale cached copy if a fresh fetch fails."""
     import datetime

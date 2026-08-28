@@ -19,9 +19,15 @@ to stop:
 Declaring the schema through SQLAlchemy Core rather than as SQL strings fixes
 (3) properly instead of hedging it: one declaration emits `INTEGER PRIMARY
 KEY` on SQLite and `SERIAL` on Postgres, and Alembic can autogenerate against
-it. Nothing else in the app is being converted to the ORM — the ~316 queries
-stay as hand-written SQL on `sqlite3.Connection`. This module owns *shape*,
-not access.
+it. Nothing else in the app is being converted to the ORM — the queries stay
+as hand-written SQL. This module owns *shape*, not access.
+
+**That sentence used to read "the ~316 queries stay as hand-written SQL on
+`sqlite3.Connection`", and both halves stopped being true in Step 4.** The
+conversion took the count from roughly 316 raw statements to the handful in
+`test_sql_portability.STILL_RAW`, and everything else moved to `text()` with
+named binds on a SQLAlchemy connection. A docstring that names a number and a
+type is a claim about the world, and this one outlived both.
 
 Two scopes, because they have genuinely different lifecycles:
 

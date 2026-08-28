@@ -165,10 +165,20 @@ def _avg_day_volume(conn: Connection, type_id: int, days: int = 30) -> float | N
         # through to the seven-day figure below. Invisible only because
         # `price_history_cache` is empty until somebody opens a chart.
         #
+        # The window is `stats.window`, not `series[-days:]`. ESI omits days
+        # with no trades, so the last thirty *records* span thirty days for a
+        # liquid item and seven months for one that trades weekly — and this
+        # figure is rendered on /margins as "avg units traded per day". Taking
+        # the tail overstates liquidity for exactly the illiquid items where
+        # the number decides something. Two definitions of "thirty days" in
+        # one codebase is how they drift, so there is one.
+        #
         # Entries without the key are skipped rather than counted as zero:
         # a day that traded nothing is a real 0 and belongs in the mean, a
         # day we cannot read is not.
-        recent = [d["vol"] for d in series[-days:]
+        from app.market.stats import window
+
+        recent = [d["vol"] for d in window(series, days)
                   if isinstance(d, dict) and d.get("vol") is not None]
         if recent:
             return sum(recent) / len(recent)

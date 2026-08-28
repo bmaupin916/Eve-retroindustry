@@ -7,7 +7,6 @@ from app.web import security
 import asyncio
 import os
 import json
-import sqlite3
 import time as _time
 
 from app.esi.client import (
@@ -34,6 +33,7 @@ from app.web.industry_helper import populate_rig_bonuses
 from app.character.skills import fetch_skill_queue, fetch_location, fetch_ship
 from app.db import conn as db_conn
 from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 
 from app.db.conn import NO_SUCH_TABLE, connect as _connect
 from app.db.migrate import upgrade_to_head
@@ -246,7 +246,7 @@ _WALLET_CACHE_TTL = 300.0  # 5 minutes
 
 
 async def _fetch_wallet_balance(
-    conn: sqlite3.Connection, char_id: int, token: str | None
+    conn: Connection, char_id: int, token: str | None
 ) -> float | None:
     """Returns ISK wallet balance, using a 5-min SQLite cache."""
     now = _time.time()
